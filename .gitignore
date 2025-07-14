@@ -2,3 +2,4 @@ test/*
 graphs/*
 .vscode/*
 build/*
+build_asan/*

@@ -26,7 +26,7 @@
 #include <chrono>
 #include <regex>
 #include <cassert>
-
+#include <omp.h>
 
 #include "io/graph_io.hpp"
 #include "util/timer.hpp"
@@ -83,7 +83,7 @@ void readArgs(int argc, char** argv) {
 
 namespace solver {
     struct BlockData {
-        std::unique_ptr<ogdf::Graph> Gblk;
+        std::unique_ptr<Graph> Gblk;  
         ogdf::NodeArray<ogdf::node> toCc;
         ogdf::NodeArray<ogdf::node> toBlk;
         ogdf::NodeArray<ogdf::node> toOrig;
@@ -99,6 +99,9 @@ namespace solver {
 
         ogdf::NodeArray<int> inDeg;
         ogdf::NodeArray<int> outDeg;
+    
+        BlockData() {}
+        // BlockData(Graph& scratch) : Gblk(*scratch) {} 
     };
 
     struct CcData {
@@ -111,39 +114,51 @@ namespace solver {
 
 
 
+    // struct ScratchArrays {
+    //     ogdf::NodeArray<ogdf::node> toCc;
+    //     ogdf::NodeArray<ogdf::node> toBlk;
+    //     ogdf::NodeArray<ogdf::node> toOrig;
+    //     ogdf::NodeArray<int> inDeg;
+    //     ogdf::NodeArray<int> outDeg;
+    // };
+
+    // static ScratchArrays SCR;
+
+
+
     void printBlockEdges(std::vector<CcData> &comps) {
         auto& C = ctx();
 
-        std::cout << "Printing block edges:\n";
-        std::cout << "----------------------------------------\n";
+        // std::cout << "Printing block edges:\n";
+        // std::cout << "----------------------------------------\n";
         for (size_t cid = 0; cid < comps.size(); ++cid) {
             const CcData &cc = comps[cid];
 
-            std::cout << "Component #" << cid << " (" << cc.blocks.size() << "blocks)"  <<  '\n';
+            // std::cout << "Component #" << cid << " (" << cc.blocks.size() << "blocks)"  <<  '\n';
 
 
             for (size_t bid = 0; bid < cc.blocks.size(); ++bid) {
                 const BlockData &blk = cc.blocks[bid];
 
-                std::cout << "  Block #" << bid
-                        << "  edges (block-indices): ";
+                // std::cout << "  Block #" << bid
+                //         << "  edges (block-indices): ";
 
                 const Graph &Gb = *blk.Gblk;
                 for (edge eB : Gb.edges) {
                     node uB = eB->source();
                     node vB = eB->target();
-                    std::cout << uB->index() << "-" << vB->index() << ' ';
+                    // std::cout << uB->index() << "-" << vB->index() << ' ';
 
                     
                     node uG = cc.toOrig[ blk.toCc[uB] ];
                     node vG = cc.toOrig[ blk.toCc[vB] ];
-                    std::cout << '(' << C.node2name[uG] << "-" << C.node2name[vG] << ") ";
+                    // std::cout << '(' << C.node2name[uG] << "-" << C.node2name[vG] << ") ";
 
                 }
-                std::cout << '\n';
+                // std::cout << '\n';
             }
         }
-        std::cout << "----------------------------------------\n";
+        // std::cout << "----------------------------------------\n";
     }
 
 
@@ -355,7 +370,7 @@ namespace solver {
             GraphIO::drawGraph(Gp, "removed_input"+to_string(G.nodes.size()));
 
             if(!isAcyclic(Gp)) {
-                std::cout << "Graph without interval is not acylic, so there is no feedback set" << std::endl;
+                // std::cout << "Graph without interval is not acylic, so there is no feedback set" << std::endl;
                 return;
             }
         }
@@ -444,10 +459,10 @@ namespace solver {
 
                     if(dfsNum[v]<=dfsNum[z]) {
                         maxi[u] = std::max(maxi[u], dfsNum[v]);
-                        std::cout << dfsNum[v] << std::endl;
+                        // std::cout << dfsNum[v] << std::endl;
                     } else if(dfsNum[v]>dfsNum[z]) {
                         maxi[u] = std::max(maxi[u], maxi[v]);
-                        std::cout << maxi[v] << std::endl;
+                        // std::cout << maxi[v] << std::endl;
                     }
 
                 }
@@ -478,7 +493,7 @@ namespace solver {
         node v=y;
         int maxitest=-1;
         for (int i = 0; i < dfsNum[y]; i++) {
-            std::cout << dfsNumInverse[i] << std::endl;
+            // std::cout << dfsNumInverse[i] << std::endl;
             maxitest=std::max(maxitest, maxi[dfsNumInverse[i]]);
         }
 
@@ -486,7 +501,7 @@ namespace solver {
         // step 4
         while(true) {
             
-            std::cout << dfsNum[v] << " " << maxitest  << std::endl;
+            // std::cout << dfsNum[v] << " " << maxitest  << std::endl;
 
             if(loop[v] == true) {
                 break;
@@ -528,11 +543,11 @@ namespace solver {
         }
 
 
-        std::cout << "Feedback edges: ";
-        for(auto &w:result) {
-            std::cout << w->source() << " -> " << w->target() << ", ";
-        }
-        std::cout << std::endl;
+        // std::cout << "Feedback edges: ";
+        // for(auto &w:result) {
+        //     std::cout << w->source() << " -> " << w->target() << ", ";
+        // }
+        // std::cout << std::endl;
 
         return;
     }
@@ -589,258 +604,11 @@ namespace solver {
         C.isEntry[source] = true;
         C.isExit[sink] = true;
         C.superbubbles.emplace_back(source, sink);
-        std::cout << "added " << ctx().node2name[source] << "," << ctx().node2name[sink] << std::endl; 
+        // std::cout << "added " << ctx().node2name[source] << "," << ctx().node2name[sink] << std::endl; 
 
     }
 
 
-
-
-    // build whole decomposition of graph
-    // Graph -> weakly connected components -> biconnected components + spqr tree(if possible)
-    static std::vector<CcData> buildDecomposition(Graph &G) {
-        logger::info("Building graph decomposition..");
-        NodeArray<int> compIdx(G);
-        int nCC = connectedComponents(G, compIdx);
-
-        std::vector<std::vector<node>> bucket(nCC);
-        for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
-
-        std::vector<CcData> out;
-        out.reserve(nCC);
-
-        logger::info(to_string(nCC) + " connected components");
-        
-        for (int cid = 0; cid < nCC; ++cid) {
-            std::cout << cid << std::endl;
-            auto Gcc = std::make_unique<Graph>();
-            NodeArray<node> toOrig(*Gcc, nullptr);
-            NodeArray<node> toCopy(G, nullptr);
-
-            for (node vOrig : bucket[cid]) {
-                node vCopy       = Gcc->newNode();
-                toCopy[vOrig]    = vCopy;
-                toOrig[vCopy]    = vOrig;
-            }
-
-            for (edge e : G.edges) {
-                node u = e->source(), v = e->target();
-                if (compIdx[u] != cid || compIdx[v] != cid) continue;
-                Gcc->newEdge(toCopy[u], toCopy[v]);
-            }
-
-            std::unique_ptr<BCTree> bc(new BCTree(*Gcc));
-
-            std::vector<BlockData> blkVec;
-
-
-            std::cout << "aaa" << std::endl;
-
-            for (node b : bc->bcTree().nodes) {
-                std::cout << b << "/" << bc->bcTree().nodes.size() << std::endl;
-                if (bc->typeOfBNode(b) == BCTree::BNodeType::BComp) {
-                    std::unordered_set<ogdf::node> nodeSet;
-
-                    for (ogdf::edge hE : bc->hEdges(b)) {
-                        ogdf::edge eCc = bc->original(hE);
-                        nodeSet.insert(eCc->source());
-                        nodeSet.insert(eCc->target());
-                    }
-
-                    std::unique_ptr<ogdf::Graph>  Gblk(new ogdf::Graph);
-                    ogdf::NodeArray<ogdf::node>   toCcBlk(*Gblk, nullptr);
-                    ogdf::NodeArray<ogdf::node>   toBlk(*Gcc, nullptr);
-                    ogdf::NodeArray<ogdf::node>   toOrigBlk(*Gblk, nullptr); 
-
-
-
-
-                    for (ogdf::node vCc : nodeSet) {
-                        ogdf::node vB = Gblk->newNode();
-                        toBlk[vCc] = vB;
-                        toCcBlk[vB] = vCc;
-                        toOrigBlk[vB] = toOrig[vCc];
-                    }
-
-                    for (ogdf::edge hE : bc->hEdges(b)) {
-                        ogdf::edge eCc = bc->original(hE);
-                        Gblk->newEdge(toBlk[eCc->source()], toBlk[eCc->target()]);
-                    }
-
-
-                    std::unique_ptr<ogdf::StaticSPQRTree> spqr;
-                    if(Gblk->numberOfNodes()>=3) {
-                        spqr.reset(new ogdf::StaticSPQRTree(*Gblk));
-                    }
-
-
-                    ogdf::NodeArray<int> inDeg (*Gblk, 0);
-                    ogdf::NodeArray<int> outDeg(*Gblk, 0);
-
-                    for (ogdf::edge e : Gblk->edges) {
-                        ++outDeg[e->source()];
-                        ++inDeg [e->target()];
-                    }
-
-                    
-                    std::unordered_map<ogdf::edge, ogdf::edge> localMap;
-                    ogdf::NodeArray<ogdf::node> parentTmp;
-
-                    if (spqr) {
-                        const auto &T = spqr->tree();
-                        for (ogdf::edge te : T.edges) {
-                            ogdf::edge eSrc = spqr->skeletonEdgeSrc(te);
-                            ogdf::edge eTgt = spqr->skeletonEdgeTgt(te);
-
-                            localMap[eSrc] = te;
-                            localMap[eTgt] = te;
-                        }
-                        
-                        parentTmp.init(T, nullptr);
-
-                        ogdf::node root = spqr->rootNode();
-                        std::stack<ogdf::node> S;
-                        parentTmp[root] = root;
-                        S.push(root);
-
-                        while (!S.empty()) {
-                            ogdf::node u = S.top(); S.pop();
-                            for (ogdf::adjEntry adj : u->adjEntries) {
-                                ogdf::node v = adj->twinNode();
-                                if (parentTmp[v] == nullptr) {
-                                    parentTmp[v] = u;
-                                    S.push(v);
-                                }
-                            }
-                        }
-                    }
-
-
-                    
-                    blkVec.push_back({ std::move(Gblk),
-                                    std::move(toCcBlk),
-                                    std::move(toBlk),
-                                    std::move(toOrigBlk),
-                                    std::move(spqr),
-                                    std::move(localMap),
-                                    std::move(parentTmp),
-                                    std::move(b),
-                                    std::move(inDeg),
-                                    std::move(outDeg) });
-                }
-            }
-
-            out.push_back({ std::move(Gcc),
-                            std::move(toOrig),
-                            std::move(toCopy),
-                            std::move(bc),
-                            std::move(blkVec) });
-        }
-
-        logger::info("Graph decomposition finished");
-
-
-        return out;
-    }
-
-
-
-    // Check if whole block node is superbubble
-    // void checkWholeBlockSuperbubble(const BlockData &blk, const CcData &cc) {
-    //     auto& C = ctx();
-
-    //     std::vector<ogdf::node> sources, sinks;
-
-    //     const NodeArray<int> &globIn  = C.inDeg;   // global arrays
-    //     const NodeArray<int> &globOut = C.outDeg;
-
-
-    //     for (node vB : blk.Gblk->nodes) {
-    //         node vG  = blk.toOrig[vB]; // global node
-
-    //         int inLocal  = blk.inDeg [vB];
-    //         int outLocal = blk.outDeg[vB];
-
-    //         int inGlobal  = globIn [vG];
-    //         int outGlobal = globOut[vG];
-
-    //         if (inLocal == 0 && outLocal == outGlobal) sources.push_back(vB);
-    //         if (outLocal == 0 && inLocal == inGlobal) sinks.push_back(vB);
-
-    //         if(inLocal != 0 && outLocal != 0 && (outLocal != outGlobal || inLocal != inGlobal)) return;
-    //     }
-
-    //     if(sources.size() != 1 || sinks.size() != 1) return;
-        
-
-    //     ogdf::node source = sources[0];
-    //     ogdf::node sink   = sinks[0];
-
-    //     ogdf::node sourceG = blk.toOrig[source];
-    //     ogdf::node sinkG   = blk.toOrig[sink];
-
-    //     if(isAcyclic(*blk.Gblk)) {
-    //         addSuperbubble(sourceG, sinkG);
-    //     }
-
-    // }
-
-    void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)    
-{
-    auto &C      = ctx();
-    const Graph &G = *blk.Gblk;
-
-    node src=nullptr, snk=nullptr;
-
-    /* ---------- 1. classify every vertex -------------------------------- */
-    for (node v : G.nodes) {
-        node vG   = blk.toOrig[v];
-        int inL   = blk.inDeg [v], outL = blk.outDeg[v];
-        int inG   = C.inDeg  [vG], outG = C.outDeg[vG];
-
-        bool isSrc = (inL  == 0 && outL == outG);
-        bool isSnk = (outL == 0 && inL == inG);
-
-        if (isSrc ^ isSnk) {               // pure role
-            if (isSrc) { if (src){ std::cout<<" second src → reject\n"; return;} src=v; }
-            else       { if (snk){ std::cout<<" second snk → reject\n"; return;} snk=v; }
-        }
-        else if (!(inL == inG && outL == outG)) {
-            std::cout << " leak at v="<<v->index()<<" → reject\n";
-            return;                         // rule ② failed
-        }
-    }
-
-    if (!src || !snk) { std::cout<<" need 1 src & 1 snk → reject\n"; return; }
-
-    /* ---------- 2. acyclicity ------------------------------------------- */
-    if (!isAcyclic(G)) { std::cout<<" cycle inside block → reject\n"; return; }
-
-    /* ---------- 3. reachability ----------------------------------------- */
-    NodeArray<bool> vis(G,false); std::stack<node> S; vis[src]=true; S.push(src);
-    bool reach=false;
-    while(!S.empty() && !reach){
-        node u=S.top();S.pop();
-        for(adjEntry a=u->firstAdj();a;a=a->succ())
-            if(a->isSource()){
-                node v=a->twinNode();
-                if(!vis[v]){ if(v==snk){reach=true;break;}
-                             vis[v]=true; S.push(v);}
-            }
-    }
-    if(!reach){ std::cout<<" src cannot reach snk → reject\n"; return; }
-
-    /* ---------- 4. success ---------------------------------------------- */
-    node srcG = blk.toOrig[src], snkG = blk.toOrig[snk];
-    if (C.isEntry[srcG] || C.isExit[snkG]) { std::cout<<" already reported\n"; return; }
-
-    std::cout<<" superbubble "<<C.node2name[srcG]<<" → "<<C.node2name[snkG]<<'\n';
-    addSuperbubble(srcG,snkG);                // marks isEntry/isExit
-}
-
-
-
-    // Part that solves for block node
     namespace SPQRsolve {
         struct EdgeDPState {
             node s{nullptr};      
@@ -1003,8 +771,8 @@ namespace solver {
             ogdf::node A = curr_edge->source();
             ogdf::node B = curr_edge->target();
             
-            std::cout << curr_edge->source() << " " << curr_edge->target() << std::endl;
-            std::cout << "Processing edge: " << A->index() << " -> " << B->index() << '\n';
+            // std::cout << curr_edge->source() << " " << curr_edge->target() << std::endl;
+            // std::cout << "Processing edge: " << A->index() << " -> " << B->index() << '\n';
             
             // std::tie(state.s, state.t) = getPoles(spqr, cc, A, B);
             // back_state.s = state.s;
@@ -1103,7 +871,7 @@ namespace solver {
 
 
             for(edge e : skelGraph.edges) {
-                printDegrees();
+                // printDegrees();
                 node u = e->source();
                 node v = e->target();
 
@@ -1112,13 +880,13 @@ namespace solver {
                 
 
                 if(!skel.isVirtual(e)) {
-                    std::cout << "real " << C.node2name[mapNewToGlobal(nU)] << " -> " << C.node2name[mapNewToGlobal(nV)] << std::endl;
+                    // std::cout << "real " << C.node2name[mapNewToGlobal(nU)] << " -> " << C.node2name[mapNewToGlobal(nV)] << std::endl;
 
                     newGraph.newEdge(nU, nV);
                     localOutDeg[nU]++;
                     localInDeg[nV]++;
 
-                    std::cout << "added" << std::endl;
+                    // std::cout << "added" << std::endl;
                     continue;
                 }
                 
@@ -1126,7 +894,7 @@ namespace solver {
                 
 
                 if(D == A) {
-                    std::cout << "virtual edge to parent" << std::endl;
+                    // std::cout << "virtual edge to parent" << std::endl;
                     ogdf::node vCc = skel.original(u);
                     ogdf::node uCc = skel.original(v);
                     
@@ -1137,7 +905,7 @@ namespace solver {
                     state.t = back_state.t = uG;
 
 
-                    std::cout << "found" << std::endl;
+                    // std::cout << "found" << std::endl;
 
                     continue;
                 }
@@ -1156,7 +924,7 @@ namespace solver {
                 ogdf::node nS = mapGlobalToNew(child.s);
                 ogdf::node nT = mapGlobalToNew(child.t);
 
-                std::cout << C.node2name[child.s] << " " << C.node2name[child.t] << ": " << dir << std::endl;
+                // std::cout << C.node2name[child.s] << " " << C.node2name[child.t] << ": " << dir << std::endl;
 
                 
 
@@ -1200,9 +968,9 @@ namespace solver {
                 state.hasLeakage |= child.hasLeakage;
             }
 
-            printDegrees();
+            // printDegrees();
 
-            GraphIO::drawGraph(newGraph, "newGraph"+to_string(A->index())+">"+to_string(B->index()));
+            // GraphIO::drawGraph(newGraph, "newGraph"+to_string(A->index())+">"+to_string(B->index()));
 
             // for(node &v:newGraph.nodes) {
             //     std::cout << v << ":   in: " << localInDeg[v] << ", out: " << localOutDeg[v] << std::endl;
@@ -1639,9 +1407,9 @@ namespace solver {
 
                     // std::cout << "Fas size: " << fas.size() << std::endl;
                     // std::cout << "fas: " << std::endl;
-                    for(edge e:fas) {
-                        std::cout << e << std::endl;
-                    }
+                    // for(edge e:fas) {
+                    //     std::cout << e << std::endl;
+                    // }
 
                     EdgeArray<bool> isFas(newGraph, 0);
                     for (edge e : fas) isFas[e] = true;
@@ -1663,7 +1431,7 @@ namespace solver {
 
 
 
-            std::cout << "Computing ingoing sources/sinks.. " << std::endl;
+            // std::cout << "Computing ingoing sources/sinks.. " << std::endl;
             // computing global sources/sinks
             if(curr_state.outgoingSourceSinkCount >= 2) {
                 // all ingoing have source
@@ -1717,7 +1485,7 @@ namespace solver {
             }
 
 
-            std::cout << "Computing ingoing leakage.. " << std::endl;
+            // std::cout << "Computing ingoing leakage.. " << std::endl;
             // computing leakage
             if(curr_state.outgoingLeakageCount >= 2) {
                 for(edge e : newGraph.edges) {
@@ -1767,7 +1535,7 @@ namespace solver {
             }
 
 
-            std::cout << "Computing local degrees of poles.." << std::endl;
+            // std::cout << "Computing local degrees of poles.." << std::endl;
             // updating local degrees of poles of states going into A
             for(edge e:newGraph.edges) {
                 if(!isVirtual[e]) continue;
@@ -1917,11 +1685,253 @@ namespace solver {
 
 
 
+    // // build whole decomposition of graph
+    // // Graph -> weakly connected components -> biconnected components + spqr tree(if possible)
+    // static std::vector<CcData> buildDecomposition(Graph &G) {
+    //     logger::info("Building graph decomposition..");
+    //     NodeArray<int> compIdx(G);
+    //     int nCC = connectedComponents(G, compIdx);
+
+    //     std::vector<std::vector<node>> bucket(nCC);
+    //     for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
+
+    //     std::vector<CcData> out;
+    //     out.reserve(nCC);
+
+    //     logger::info(to_string(nCC) + " connected components");
+        
+    //     for (int cid = 0; cid < nCC; ++cid) {
+    //         std::cout << cid << std::endl;
+    //         auto Gcc = std::make_unique<Graph>();
+    //         NodeArray<node> toOrig(*Gcc, nullptr);
+    //         NodeArray<node> toCopy(G, nullptr);
+
+    //         for (node vOrig : bucket[cid]) {
+    //             node vCopy       = Gcc->newNode();
+    //             toCopy[vOrig]    = vCopy;
+    //             toOrig[vCopy]    = vOrig;
+    //         }
+
+    //         for (edge e : G.edges) {
+    //             node u = e->source(), v = e->target();
+    //             if (compIdx[u] != cid || compIdx[v] != cid) continue;
+    //             Gcc->newEdge(toCopy[u], toCopy[v]);
+    //         }
+
+    //         std::unique_ptr<BCTree> bc(new BCTree(*Gcc));
+
+    //         std::vector<BlockData> blkVec;
+
+
+    //         std::cout << "aaa" << std::endl;
+
+    //         for (node b : bc->bcTree().nodes) {
+    //             std::cout << b << "/" << bc->bcTree().nodes.size() << std::endl;
+    //             if (bc->typeOfBNode(b) == BCTree::BNodeType::BComp) {
+    //                 std::unordered_set<ogdf::node> nodeSet;
+
+    //                 for (ogdf::edge hE : bc->hEdges(b)) {
+    //                     ogdf::edge eCc = bc->original(hE);
+    //                     nodeSet.insert(eCc->source());
+    //                     nodeSet.insert(eCc->target());
+    //                 }
+
+    //                 std::unique_ptr<ogdf::Graph>  Gblk(new ogdf::Graph);
+    //                 ogdf::NodeArray<ogdf::node>   toCcBlk(*Gblk, nullptr);
+    //                 ogdf::NodeArray<ogdf::node>   toBlk(*Gcc, nullptr);
+    //                 ogdf::NodeArray<ogdf::node>   toOrigBlk(*Gblk, nullptr); 
+
+
+
+
+    //                 for (ogdf::node vCc : nodeSet) {
+    //                     ogdf::node vB = Gblk->newNode();
+    //                     toBlk[vCc] = vB;
+    //                     toCcBlk[vB] = vCc;
+    //                     toOrigBlk[vB] = toOrig[vCc];
+    //                 }
+
+    //                 for (ogdf::edge hE : bc->hEdges(b)) {
+    //                     ogdf::edge eCc = bc->original(hE);
+    //                     Gblk->newEdge(toBlk[eCc->source()], toBlk[eCc->target()]);
+    //                 }
+
+
+    //                 std::unique_ptr<ogdf::StaticSPQRTree> spqr;
+    //                 if(Gblk->numberOfNodes()>=3) {
+    //                     spqr.reset(new ogdf::StaticSPQRTree(*Gblk));
+    //                 }
+
+
+    //                 ogdf::NodeArray<int> inDeg (*Gblk, 0);
+    //                 ogdf::NodeArray<int> outDeg(*Gblk, 0);
+
+    //                 for (ogdf::edge e : Gblk->edges) {
+    //                     ++outDeg[e->source()];
+    //                     ++inDeg [e->target()];
+    //                 }
+
+                    
+    //                 std::unordered_map<ogdf::edge, ogdf::edge> localMap;
+    //                 ogdf::NodeArray<ogdf::node> parentTmp;
+
+    //                 if (spqr) {
+    //                     const auto &T = spqr->tree();
+    //                     for (ogdf::edge te : T.edges) {
+    //                         ogdf::edge eSrc = spqr->skeletonEdgeSrc(te);
+    //                         ogdf::edge eTgt = spqr->skeletonEdgeTgt(te);
+
+    //                         localMap[eSrc] = te;
+    //                         localMap[eTgt] = te;
+    //                     }
+                        
+    //                     parentTmp.init(T, nullptr);
+
+    //                     ogdf::node root = spqr->rootNode();
+    //                     std::stack<ogdf::node> S;
+    //                     parentTmp[root] = root;
+    //                     S.push(root);
+
+    //                     while (!S.empty()) {
+    //                         ogdf::node u = S.top(); S.pop();
+    //                         for (ogdf::adjEntry adj : u->adjEntries) {
+    //                             ogdf::node v = adj->twinNode();
+    //                             if (parentTmp[v] == nullptr) {
+    //                                 parentTmp[v] = u;
+    //                                 S.push(v);
+    //                             }
+    //                         }
+    //                     }
+    //                 }
+
+
+                    
+    //                 blkVec.push_back({ std::move(Gblk),
+    //                                 std::move(toCcBlk),
+    //                                 std::move(toBlk),
+    //                                 std::move(toOrigBlk),
+    //                                 std::move(spqr),
+    //                                 std::move(localMap),
+    //                                 std::move(parentTmp),
+    //                                 std::move(b),
+    //                                 std::move(inDeg),
+    //                                 std::move(outDeg) });
+    //             }
+    //         }
+
+    //         out.push_back({ std::move(Gcc),
+    //                         std::move(toOrig),
+    //                         std::move(toCopy),
+    //                         std::move(bc),
+    //                         std::move(blkVec) });
+    //     }
+
+    //     logger::info("Graph decomposition finished");
+
+
+    //     return out;
+    // }
+
+
+
+    // Check if whole block node is superbubble
+    // void checkWholeBlockSuperbubble(const BlockData &blk, const CcData &cc) {
+    //     auto& C = ctx();
+
+    //     std::vector<ogdf::node> sources, sinks;
+
+    //     const NodeArray<int> &globIn  = C.inDeg;   // global arrays
+    //     const NodeArray<int> &globOut = C.outDeg;
+
+
+    //     for (node vB : blk.Gblk->nodes) {
+    //         node vG  = blk.toOrig[vB]; // global node
+
+    //         int inLocal  = blk.inDeg [vB];
+    //         int outLocal = blk.outDeg[vB];
+
+    //         int inGlobal  = globIn [vG];
+    //         int outGlobal = globOut[vG];
+
+    //         if (inLocal == 0 && outLocal == outGlobal) sources.push_back(vB);
+    //         if (outLocal == 0 && inLocal == inGlobal) sinks.push_back(vB);
+
+    //         if(inLocal != 0 && outLocal != 0 && (outLocal != outGlobal || inLocal != inGlobal)) return;
+    //     }
+
+    //     if(sources.size() != 1 || sinks.size() != 1) return;
+        
+
+    //     ogdf::node source = sources[0];
+    //     ogdf::node sink   = sinks[0];
+
+    //     ogdf::node sourceG = blk.toOrig[source];
+    //     ogdf::node sinkG   = blk.toOrig[sink];
+
+    //     if(isAcyclic(*blk.Gblk)) {
+    //         addSuperbubble(sourceG, sinkG);
+    //     }
+
+    // }
+
+    
+
+    void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)    
+    {
+        auto &C      = ctx();
+        const Graph &G = *blk.Gblk;
+
+        node src=nullptr, snk=nullptr;
+
+        for (node v : G.nodes) {
+            node vG   = blk.toOrig[v];
+            int inL   = blk.inDeg [v], outL = blk.outDeg[v];
+            int inG   = C.inDeg  [vG], outG = C.outDeg[vG];
+
+            bool isSrc = (inL  == 0 && outL == outG);
+            bool isSnk = (outL == 0 && inL == inG);
+
+            if (isSrc ^ isSnk) {               // pure role
+                if (isSrc) { if (src){ std::cout<<" second src → reject\n"; return;} src=v; }
+                else       { if (snk){ std::cout<<" second snk → reject\n"; return;} snk=v; }
+            }
+            else if (!(inL == inG && outL == outG)) {
+                return;
+            }
+        }
+
+        if (!src || !snk) { return; }
+
+        /* ---------- 2. acyclicity ------------------------------------------- */
+        if (!isAcyclic(G)) { return; }
+
+        /* ---------- 3. reachability ----------------------------------------- */
+        NodeArray<bool> vis(G,false); std::stack<node> S; vis[src]=true; S.push(src);
+        bool reach=false;
+        while(!S.empty() && !reach){
+            node u=S.top();S.pop();
+            for(adjEntry a=u->firstAdj();a;a=a->succ())
+                if(a->isSource()){
+                    node v=a->twinNode();
+                    if(!vis[v]){ if(v==snk){reach=true;break;}
+                                vis[v]=true; S.push(v);}
+                }
+        }
+        if(!reach) { return; }
+
+        /* ---------- 4. success ---------------------------------------------- */
+        node srcG = blk.toOrig[src], snkG = blk.toOrig[snk];
+        addSuperbubble(srcG,snkG);                // marks isEntry/isExit
+    }
+
+
+
+
 
 
     void solveSPQR(const BlockData &blk, const CcData &cc) {
         // using namespace SPQRsolve;
-        TIME_BLOCK("SPQR solving");
+        // TIME_BLOCK("SPQR solving");
         auto T = blk.spqr->tree();
 
         GraphIO::drawGraph(T, "spqrTree");
@@ -1973,7 +1983,7 @@ namespace solver {
 
         // SPQRsolve::printAllStates(dp, node_dp, T);
 
-        logger::info("Computed all dp states..");
+        // logger::info("Computed all dp states..");
 
         SPQRsolve::collectSuperbubbles(blk, dp);
 
@@ -1981,9 +1991,10 @@ namespace solver {
 
 
     void processBlock(BlockData &blk, const CcData &cc, size_t ccId, size_t  blkId) {
-        std::cout << "Component #" << ccId<< "  Block #" << blkId << "  |V|=" << blk.Gblk->numberOfNodes() << "  |E|=" << blk.Gblk->numberOfEdges() << '\n';
+        std::printf("[thr %02d] CC |V|=%d\n", omp_get_thread_num(), int(blk.Gblk->numberOfNodes()));
 
 
+        // std::cout << 12332131 << std::endl;
         // check if whole block is a superbubble
         // checkWholeBlockSuperbubble(blk, cc);
         checkBlockByCutVertices(blk, cc);
@@ -2000,9 +2011,11 @@ namespace solver {
     void runOnAllBlocks(std::vector<CcData> &comps) {
         for (size_t cid = 0; cid < comps.size(); ++cid) {
             CcData &cc = comps[cid];
-
+            #pragma omp parallel for schedule(dynamic)
             for (size_t bid = 0; bid < cc.blocks.size(); ++bid) {
+                std::cout << bid << "/" << cc.blocks.size() << std::endl;
                 processBlock(cc.blocks[bid], cc, cid, bid);
+                std::printf("[T%02d] finished  CC %zu / block %zu\n", omp_get_thread_num(), cid, bid);
             }
         }
     }
@@ -2044,20 +2057,1264 @@ namespace solver {
 
     }
 
+
+
+
+    // static void buildBlockData( const std::unordered_set<node>        &blockVerts,
+    //                         const CcData                         &cc,
+    //                         BlockData                             &blk )
+    // {
+    //     blk.Gblk = std::make_unique<Graph>();
+    //     blk.Gblk       = std::make_unique<Graph>();
+    //     blk.toCc       .init(*blk.Gblk,nullptr);
+    //     blk.toBlk      .init(*cc.Gcc  ,nullptr);
+    //     blk.toOrig     .init(*blk.Gblk,nullptr);
+    //     blk.inDeg      .init(*blk.Gblk,0);
+    //     blk.outDeg     .init(*blk.Gblk,0);
+
+    //     for (node vCc : blockVerts) {
+    //         node vB            = blk.Gblk->newNode();
+    //         blk.toBlk [vCc]    = vB;
+    //         blk.toCc  [vB]     = vCc;
+    //         blk.toOrig[vB]     = cc.toOrig[vCc];
+    //     }
+    //     for (edge hE : cc.bc->hEdges(blk.bNode)) {
+    //         edge eCc = cc.bc->original(hE);
+    //         blk.Gblk->newEdge( blk.toBlk[eCc->source()],
+    //                         blk.toBlk[eCc->target()] );
+    //     }
+
+    //     /* ------------- fill degree arrays ----------------------------- */
+    //     for (edge e : blk.Gblk->edges) {
+    //         ++blk.outDeg[e->source()];
+    //         ++blk.inDeg [e->target()];
+    //     }
+
+    //     /* ------------- optional SPQR ---------------------------------- */
+    //     if (blk.Gblk->numberOfNodes() >= 3) {
+    //         blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+
+    //         /* build     skel-edge  →  tree-edge  map  (needed later) */
+    //         const Graph &T = blk.spqr->tree();
+    //         for (edge te : T.edges) {
+    //             blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+    //             blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+    //         }
+
+    //         /* parent array in the rooted SPQR tree */
+    //         blk.parent.init(T,nullptr);
+    //         node root = blk.spqr->rootNode();
+    //         std::stack<node> S;  blk.parent[root]=root;  S.push(root);
+    //         while(!S.empty()){
+    //             node u=S.top();S.pop();
+    //             for(adjEntry a:u->adjEntries){
+    //                 node v=a->twinNode();
+    //                 if(!blk.parent[v]){ blk.parent[v]=u; S.push(v);}
+    //             }
+    //         }
+    //     }
+    // }
+
+    // static void buildBlockData(const std::vector<node> &verts,
+    //                        const CcData            &cc,
+    //                        BlockData               &blk) {
+    //     blk.Gblk    = std::make_unique<Graph>();
+    //     SCR.toCc   .init(*blk.Gblk , nullptr);
+    //     SCR.toBlk  .init(*cc.Gcc   , nullptr);
+    //     SCR.toOrig .init(*blk.Gblk , nullptr);
+    //     SCR.inDeg  .init(*blk.Gblk , 0);
+    //     SCR.outDeg .init(*blk.Gblk , 0);
+
+    //     for (node vCc : verts) {
+    //         node vB          = blk.Gblk->newNode();
+    //         SCR.toBlk[vCc]   = vB;
+    //         SCR.toCc [vB]    = vCc;
+    //         SCR.toOrig[vB]   = cc.toOrig[vCc];
+    //     }
+    //     for (edge hE : cc.bc->hEdges(blk.bNode)) {
+    //         edge eCc = cc.bc->original(hE);
+    //         blk.Gblk->newEdge(SCR.toBlk[eCc->source()],
+    //                         SCR.toBlk[eCc->target()]);
+    //     }
+    //     for (edge e : blk.Gblk->edges) {
+    //         ++SCR.outDeg[e->source()];
+    //         ++SCR.inDeg [e->target()];
+    //     }
+
+    //     blk.toCc   = std::move(SCR.toCc  );
+    //     blk.toBlk  = std::move(SCR.toBlk );
+    //     blk.toOrig = std::move(SCR.toOrig);
+    //     blk.inDeg  = std::move(SCR.inDeg );
+    //     blk.outDeg = std::move(SCR.outDeg);
+
+    //     if (blk.Gblk.numberOfNodes() >= 3) {
+    //         blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+    //         const Graph &T = blk.spqr->tree();
+    //         for (edge te : T.edges) {
+    //             blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+    //             blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+    //         }
+    //         blk.parent.init(T,nullptr);
+    //         node root = blk.spqr->rootNode();
+    //         std::stack<node> S;  blk.parent[root]=root;  S.push(root);
+    //         while(!S.empty()){
+    //             node u=S.top(); S.pop();
+    //             for(adjEntry a:u->adjEntries){
+    //                 node v=a->twinNode();
+    //                 if(!blk.parent[v]){ blk.parent[v]=u; S.push(v); }
+    //             }
+    //         }
+    //     }
+    // }
+
+
+
+    // WORKING SLOWER
+    // void solveStreaming()
+    // {
+    //     auto &C = ctx();
+    //     Graph &G = C.G;
+
+    //     NodeArray<int> compIdx(G);
+    //     const int nCC = connectedComponents(G, compIdx);
+
+    //     std::vector<std::vector<node>> bucket(nCC);
+    //     for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
+
+    //     logger::info("Streaming over {} components", nCC);
+
+    //     for (int cid = 0; cid < nCC; ++cid) {
+    //         CcData cc;
+    //         cc.Gcc   = std::make_unique<Graph>();
+    //         cc.toOrig.init(*cc.Gcc,nullptr);
+    //         cc.toCopy.init(G      ,nullptr);
+
+    //         for (node vG : bucket[cid]) {
+    //             node vC           = cc.Gcc->newNode();
+    //             cc.toCopy[vG]     = vC;
+    //             cc.toOrig[vC]     = vG;
+    //         }
+    //         for (edge e : G.edges) {
+    //             node u=e->source(), v=e->target();
+    //             if (compIdx[u]==cid && compIdx[v]==cid)
+    //                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+    //         }
+    //         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+    //         for (node bNode : cc.bc->bcTree().nodes)
+    //         if (cc.bc->typeOfBNode(bNode) == BCTree::BNodeType::BComp)
+    //         {
+    //             /* collect block vertices */
+    //             std::unordered_set<node> verts;
+    //             for (edge hE : cc.bc->hEdges(bNode)) {
+    //                 edge eC = cc.bc->original(hE);
+    //                 verts.insert(eC->source());
+    //                 verts.insert(eC->target());
+    //             }
+
+    //             /* build + solve block */
+    //             BlockData blk;
+    //             blk.bNode = bNode;                         // remember handle
+    //             buildBlockData(verts, cc, blk);            // (fills blk)
+
+    //             //------------------------------------------------------------------
+    //             //   === YOUR ANALYSIS PIPELINE ===
+    //             //------------------------------------------------------------------
+    //             checkBlockByCutVertices(blk, cc);  
+    //             if (blk.spqr) {
+    //                 solveSPQR(blk, cc);                     // your heavy part
+    //             }
+    //         }
+    //         if(cid%50 == 0) {
+    //             logger::info("{}/{}", cid, nCC);
+    //         }
+    //     }
+    // }
+
+
+    // // WORKING FASTER
+    // // FASTEST
+    // void solveStreaming()
+    // {
+    //     auto &C = ctx();
+    //     Graph &G = C.G;
+
+    //     /* 1 ─ weakly connected components */
+    //     NodeArray<int> compIdx(G);
+    //     const int nCC = connectedComponents(G, compIdx);
+
+    //     std::vector<std::vector<node>> bucket(nCC);
+    //     for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
+
+    //     logger::info("Streaming over {} components", nCC);
+
+    //     /* 2 ─ process components one after another */
+    //     for (int cid = 0; cid < nCC; ++cid)
+    //     {
+    //         /* build CcData on-the-fly */
+    //         CcData cc;
+    //         cc.Gcc   = std::make_unique<Graph>();
+    //         cc.toOrig.init(*cc.Gcc,nullptr);
+    //         cc.toCopy.init(G      ,nullptr);
+
+    //         for (node vG : bucket[cid]) {
+    //             node vC           = cc.Gcc->newNode();
+    //             cc.toCopy[vG]     = vC;
+    //             cc.toOrig[vC]     = vG;
+    //         }
+    //         for (edge e : G.edges) {
+    //             node u=e->source(), v=e->target();
+    //             if (compIdx[u]==cid && compIdx[v]==cid)
+    //                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+    //         }
+    //         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+    //         /* 3 ─ iterate over all B-nodes immediately */
+    //         for (node bNode : cc.bc->bcTree().nodes)
+    //         if (cc.bc->typeOfBNode(bNode) == BCTree::BNodeType::BComp)
+    //         {
+    //             /* collect vertices of this block */
+    //             std::vector<node> verts;
+    //             verts.reserve(16);
+    //             for (edge hE : cc.bc->hEdges(bNode)) {
+    //                 edge eC = cc.bc->original(hE);
+    //                 verts.push_back(eC->source());
+    //                 verts.push_back(eC->target());
+    //             }
+    //             std::sort(verts.begin(), verts.end());
+    //             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+    //             /* build + analyse the block */
+    //             BlockData blk;
+    //             blk.bNode = bNode;
+    //             buildBlockData(verts, cc, blk);
+
+    //             checkBlockByCutVertices(blk, cc);
+    //             if (blk.spqr) solveSPQR(blk, cc);
+    //             /* blk destroyed here → memory released */
+    //         }
+
+    //         if (cid % 50 == 0)
+    //             std::cout << cid << "/" << nCC << std::endl;
+    //             //logger::info("{}/{}\n", cid, nCC);
+    //         /* cc destroyed here → Gcc+BCTree memory released */
+    //     }
+    //     /* only ctx().superbubbles etc. stay alive */
+    // }
+
+
+
+
+static void buildBlockData(const std::vector<node>& verts,
+                         const CcData& cc,
+                         BlockData& blk) {
+    static Graph scratch;
+    scratch.clear();
+    
+    // Initialize arrays directly in scratch space
+    NodeArray<node> toCc(scratch, nullptr);
+    NodeArray<node> toOrig(scratch, nullptr);
+    NodeArray<int> inDeg(scratch, 0);
+    NodeArray<int> outDeg(scratch, 0);
+    NodeArray<node> toBlk(*cc.Gcc, nullptr);
+
+    // Build the block
+    for (node vCc : verts) {
+        node vB = scratch.newNode();
+        toBlk[vCc] = vB;
+        toCc[vB] = vCc;
+        toOrig[vB] = cc.toOrig[vCc];
+    }
+
+    for (edge hE : cc.bc->hEdges(blk.bNode)) {
+        edge eCc = cc.bc->original(hE);
+        edge e = scratch.newEdge(toBlk[eCc->source()], 
+                               toBlk[eCc->target()]);
+        outDeg[e->source()]++;
+        inDeg[e->target()]++;
+    }
+
+    // Move data to BlockData (no graph copy)
+    blk.Gblk = std::make_unique<Graph>(std::move(scratch));
+    blk.toCc = std::move(toCc);
+    blk.toBlk = std::move(toBlk);
+    blk.toOrig = std::move(toOrig);
+    blk.inDeg = std::move(inDeg);
+    blk.outDeg = std::move(outDeg);
+
+
+
+    // Build SPQR if needed
+    if (blk.Gblk->numberOfNodes() >= 3) {
+        blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+        
+        const Graph& T = blk.spqr->tree();
+        for (edge te : T.edges) {
+            // Map BOTH directions (source and target skeleton edges)
+            edge eSrc = blk.spqr->skeletonEdgeSrc(te);
+            if (eSrc) blk.skel2tree[eSrc] = te;
+            
+            edge eTgt = blk.spqr->skeletonEdgeTgt(te);
+            if (eTgt) blk.skel2tree[eTgt] = te;
+        }
+
+        // Initialize parent array
+        blk.parent.init(T, nullptr);
+        node root = blk.spqr->rootNode();
+        
+        // Non-recursive tree traversal
+        std::vector<node> stack;
+        stack.reserve(T.numberOfNodes());
+        blk.parent[root] = root;
+        stack.push_back(root);
+        
+        while (!stack.empty()) {
+            node u = stack.back();
+            stack.pop_back();
+            for (adjEntry adj : u->adjEntries) {
+                node v = adj->twinNode();
+                if (!blk.parent[v]) {
+                    blk.parent[v] = u;
+                    stack.push_back(v);
+                }
+            }
+        }
+
+    }
+}
+void solveStreaming() {
+    auto& C = ctx();
+    Graph& G = C.G;
+
+    // 1. Weakly connected components
+    NodeArray<int> compIdx(G);
+    const int nCC = connectedComponents(G, compIdx);
+    
+    std::vector<std::vector<node>> bucket(nCC);
+    for (node v : G.nodes) 
+        bucket[compIdx[v]].push_back(v);
+
+    logger::info("Streaming over {} components", nCC);
+
+    // 2. Process each component
+    #pragma omp parallel for schedule(dynamic)
+    for (int cid = 0; cid < nCC; ++cid) {
+        // 3. Build CC graph
+        CcData cc;
+        cc.Gcc = std::make_unique<Graph>();
+        cc.toOrig.init(*cc.Gcc, nullptr);
+        cc.toCopy.init(G, nullptr);
+
+        // Fast node mapping
+        std::unordered_map<node, node> orig_to_cc;
+        for (node vG : bucket[cid]) {
+            node vC = cc.Gcc->newNode();
+            cc.toCopy[vG] = vC;
+            cc.toOrig[vC] = vG;
+            orig_to_cc[vG] = vC;
+        }
+
+        // Fast edge creation
+        for (edge e : G.edges) {
+            if (compIdx[e->source()] == cid) {
+                cc.Gcc->newEdge(orig_to_cc[e->source()], 
+                              orig_to_cc[e->target()]);
+            }
+        }
+
+        cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+        NodeArray<node> cc_to_scratch(*cc.Gcc, nullptr);
+
+        // 4. Process blocks
+        for (node bNode : cc.bc->bcTree().nodes) {
+            if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
+                continue;
+
+            // Collect vertices
+            std::vector<node> verts;
+            std::unordered_set<node> verts_set;
+            for (edge hE : cc.bc->hEdges(bNode)) {
+                edge eC = cc.bc->original(hE);
+                if (verts_set.insert(eC->source()).second)
+                    verts.push_back(eC->source());
+                if (verts_set.insert(eC->target()).second)
+                    verts.push_back(eC->target());
+            }
+
+            // Initialize block data
+            BlockData blk;
+            blk.bNode = bNode;
+            buildBlockData(verts, cc, blk);
+
+            // Verify SPQR initialization
+            if (blk.spqr && blk.skel2tree.empty()) {
+                // logger::error("Empty skel2tree map for block with {} nodes", 
+                //             blk.Gblk->numberOfNodes());
+                continue;
+            }
+
+            // Process block
+            checkBlockByCutVertices(blk, cc);
+            
+            if (blk.Gblk->numberOfNodes() >= 3) {
+                try {
+                    solveSPQR(blk, cc);
+                } catch (const std::exception& e) {
+                    logger::error("SPQR processing failed: {}", e.what());
+                }
+            }
+
+            if (cid % 50 == 0) {
+                logger::debug("Processed block {}/{} in component {}", 
+                            bNode->index(), cc.bc->bcTree().numberOfNodes(), cid);
+            }
+        }
+    }
+}
+
+
+
+// void solveStreaming() {
+//     auto& C = ctx();
+//     Graph& G = C.G;
+
+//     // 1. Weakly connected components
+//     NodeArray<int> compIdx(G);
+//     const int nCC = connectedComponents(G, compIdx);
+    
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for (node v : G.nodes) 
+//         bucket[compIdx[v]].push_back(v);
+
+//     // 2. Reusable memory pools
+//     Graph scratch;  // Single reusable graph
+//     NodeArray<node> scratch_toOrig(scratch, nullptr);
+//     NodeArray<node> scratch_toCC(scratch, nullptr);
+//     std::vector<node> verts;
+//     verts.reserve(1024);  // Preallocate large buffer
+
+//     for (int cid = 0; cid < nCC; ++cid) {
+//         // 3. Build CC without unnecessary copies
+//         CcData cc;
+//         cc.Gcc = std::make_unique<Graph>();
+//         cc.toOrig.init(*cc.Gcc, nullptr);
+//         cc.toCopy.init(G, nullptr);
+
+//         // 4. Node creation optimization
+//         std::unordered_map<node, node> orig_to_cc;
+//         for (node vG : bucket[cid]) {
+//             node vC = cc.Gcc->newNode();
+//             cc.toCopy[vG] = vC;
+//             cc.toOrig[vC] = vG;
+//             orig_to_cc[vG] = vC;
+//         }
+
+//         // 5. Edge creation with direct mapping
+//         for (edge e : G.edges) {
+//             if (compIdx[e->source()] == cid && compIdx[e->target()] == cid) {
+//                 cc.Gcc->newEdge(
+//                     orig_to_cc[e->source()],
+//                     orig_to_cc[e->target()]
+//                 );
+//             }
+//         }
+
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+//         NodeArray<node> cc_to_scratch(*cc.Gcc, nullptr);  // Single array per CC
+
+//         // 6. Process blocks with memory reuse
+//         for (node bNode : cc.bc->bcTree().nodes) {
+//             if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
+//                 continue;
+
+//             // 7. Fast deduplication using hash set
+//             std::unordered_set<node> verts_set;
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 verts_set.insert(eC->source());
+//                 verts_set.insert(eC->target());
+//             }
+
+//             // 8. Reuse vertex vector memory
+//             verts.clear();
+//             verts.insert(verts.end(), verts_set.begin(), verts_set.end());
+
+//             // 9. Reset scratch graph efficiently
+//             scratch.clear();
+//             scratch_toOrig.init(scratch, nullptr);
+//             scratch_toCC.init(scratch, nullptr);
+
+//             // 10. Build block with direct mapping
+//             for (node vCc : verts) {
+//                 node vScratch = scratch.newNode();
+//                 cc_to_scratch[vCc] = vScratch;
+//                 scratch_toCC[vScratch] = vCc;
+//                 scratch_toOrig[vScratch] = cc.toOrig[vCc];
+//             }
+
+//             // 11. Create edges using precomputed mapping
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 scratch.newEdge(
+//                     cc_to_scratch[eC->source()],
+//                     cc_to_scratch[eC->target()]
+//                 );
+//             }
+
+//             // 12. Pass scratch graph directly (NO COPY)
+//             BlockData blk;
+//             blk.bNode = bNode;
+//             blk.Gblk = &scratch;  // Use existing memory
+//             blk.toOrig = scratch_toOrig;
+//             blk.toCc = scratch_toCC;
+//             blk.toBlk = cc_to_scratch;
+
+//             // 13. Compute degrees on demand
+//             blk.inDeg.init(scratch, 0);
+//             blk.outDeg.init(scratch, 0);
+//             for (node v : scratch.nodes) {
+//                 blk.inDeg[v] = v->indeg();
+//                 blk.outDeg[v] = v->outdeg();
+//             }
+
+//             // 14. Process block without graph ownership
+//             checkBlockByCutVertices(blk, cc);
+//             if (scratch.numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(scratch);
+//                 // ... (rest of SPQR setup)
+//                 solveSPQR(blk, cc);
+//             }
+//         }
+//     }
+// }
+
+// Working solution
+// void solveStreaming()
+// {
+//     auto &C = ctx();
+//     Graph &G = C.G;
+
+//     // 1) Compute connected components
+//     NodeArray<int> compIdx(G);
+//     int nCC = connectedComponents(G, compIdx);
+
+//     // 2) Bucket nodes by component
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for(node v : G.nodes) {
+//         bucket[compIdx[v]].push_back(v);
+//     }
+//     logger::info("Streaming over {} components", nCC);
+
+//     // Scratch‐graph + arrays for all blocks
+//     Graph           scratch;
+//     NodeArray<node> toCc   (scratch, nullptr);
+//     NodeArray<node> toOrig (scratch, nullptr);
+//     NodeArray<int>  inDeg  (scratch, 0);
+//     NodeArray<int>  outDeg (scratch, 0);
+
+//     // 3) Process each CC
+//     for(int cid = 0; cid < nCC; ++cid) {
+//         // Build CcData on the fly
+//         CcData cc;
+//         cc.Gcc    = std::make_unique<Graph>();
+//         cc.toOrig .init(*cc.Gcc, nullptr);
+//         cc.toCopy .init( G,      nullptr);
+
+//         // Copy nodes
+//         for(node vG : bucket[cid]) {
+//             node vC = cc.Gcc->newNode();
+//             cc.toCopy[vG] = vC;
+//             cc.toOrig[vC] = vG;
+//         }
+//         // Copy edges
+//         for(edge e : G.edges) {
+//             node u = e->source(), v = e->target();
+//             if(compIdx[u]==cid && compIdx[v]==cid) {
+//                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+//             }
+//         }
+//         // Build BCTree
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+//         // Now that cc.Gcc is ready, init toBlk array for CC→scratch mapping
+//         NodeArray<node> toBlk(*cc.Gcc, nullptr);
+
+//         // 4) For each B-component in this CC
+//         for(node bNode : cc.bc->bcTree().nodes) {
+//             if(cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp) continue;
+
+//             // Collect and dedupe vertices
+//             std::vector<node> verts;
+//             verts.reserve(16);
+//             for(edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 verts.push_back(eC->source());
+//                 verts.push_back(eC->target());
+//             }
+//             std::sort(verts.begin(), verts.end());
+//             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+//             // Reset scratch and its arrays
+//             scratch.clear();
+//             toCc  .init(scratch, nullptr);
+//             toOrig.init(scratch, nullptr);
+//             inDeg .fill(0);
+//             outDeg.fill(0);
+
+//             // Build the block in scratch
+//             for(node vCc : verts) {
+//                 node vB = scratch.newNode();
+//                 toBlk [vCc]  = vB;
+//                 toCc  [vB]   = vCc;
+//                 toOrig[vB]   = cc.toOrig[vCc];
+//             }
+//             for(edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 node sB = toBlk[eC->source()],
+//                      tB = toBlk[eC->target()];
+//                 scratch.newEdge(sB, tB);
+//                 ++outDeg[sB];
+//                 ++inDeg [tB];
+//             }
+
+//             // Package into BlockData (using a cheap copy of scratch)
+//             BlockData blk;
+//             blk.bNode  = bNode;
+//             blk.Gblk   = std::make_unique<Graph>(scratch);
+//             blk.toCc   = toCc;
+//             blk.toBlk  = toBlk;
+//             blk.toOrig = toOrig;
+//             blk.inDeg  = inDeg;
+//             blk.outDeg = outDeg;
+
+//             // If large enough, build SPQR
+//             if(blk.Gblk->numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+//                 const auto &T = blk.spqr->tree();
+//                 blk.parent.init(T, nullptr);
+//                 for(edge te : T.edges) {
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+//                 }
+//                 std::stack<node> S;
+//                 node root = blk.spqr->rootNode();
+//                 blk.parent[root] = root;
+//                 S.push(root);
+//                 while(!S.empty()) {
+//                     node u = S.top(); S.pop();
+//                     for(adjEntry a : u->adjEntries) {
+//                         node v = a->twinNode();
+//                         if(!blk.parent[v]) {
+//                             blk.parent[v] = u;
+//                             S.push(v);
+//                         }
+//                     }
+//                 }
+//             }
+
+//             // Run your analyses exactly as before
+//             checkBlockByCutVertices(blk, cc);
+//             if(blk.spqr) solveSPQR(blk, cc);
+//         }
+
+//         if(cid % 50 == 0) logger::info("{}/{}", cid, nCC);
+//     }
+
+//     // Only ctx().superbubbles etc. remain afterwards
+// }
+
+
+// void solveStreaming() {
+//     auto &C = ctx();
+//     Graph &G = C.G;
+
+//     // 1. compute CCs
+//     NodeArray<int> compIdx(G);
+//     const int nCC = connectedComponents(G, compIdx);
+
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for (node v : G.nodes) {
+//         bucket[compIdx[v]].push_back(v);
+//     }
+
+//     logger::info("Streaming over {} components", nCC);
+
+//     // 2. reusable “scratch” graph + its maps + degree arrays
+//     std::unique_ptr<Graph> scratch = std::make_unique<Graph>();
+//     NodeArray<node>   toCc   (*scratch, nullptr);
+//     NodeArray<node>   toBlk  (*scratch, nullptr);
+//     NodeArray<node>   toOrig (*scratch, nullptr);
+//     NodeArray<int>    inDeg  (*scratch, 0);
+//     NodeArray<int>    outDeg (*scratch, 0);
+
+//     // 3. process each CC
+//     for (int cid = 0; cid < nCC; ++cid) {
+//         // build CC‐graph once
+//         CcData cc;
+//         cc.Gcc      = std::make_unique<Graph>();
+//         cc.toOrig   .init(*cc.Gcc, nullptr);
+//         cc.toCopy   .init(G,       nullptr);
+
+//         // copy nodes & edges into cc.Gcc
+//         for (node vG : bucket[cid]) {
+//             node vC = cc.Gcc->newNode();
+//             cc.toCopy[vG] = vC;
+//             cc.toOrig[vC] = vG;
+//         }
+//         for (edge e : G.edges) {
+//             node u = e->source(), v = e->target();
+//             if (compIdx[u] == cid && compIdx[v] == cid) {
+//                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+//             }
+//         }
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+//         // 4. process each biconnected‐component
+//         for (node bNode : cc.bc->bcTree().nodes) {
+//             if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp) {
+//                 continue;
+//             }
+
+//             // collect the subgraph’s vertices
+//             std::vector<node> verts;
+//             verts.reserve(16);
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 auto eC = cc.bc->original(hE);
+//                 verts.push_back(eC->source());
+//                 verts.push_back(eC->target());
+//             }
+//             std::sort(verts.begin(), verts.end());
+//             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+//             // reset scratch graph (keeps its internal buffers)
+//             scratch->clear();
+//             toCc   .init(*scratch, nullptr);
+//             toBlk  .init(*scratch, nullptr);
+//             toOrig .init(*scratch, nullptr);
+//             inDeg  .fill(0);
+//             outDeg .fill(0);
+
+//             // rebuild this block *in* scratch
+//             for (node vCc : verts) {
+//                 node vB = scratch->newNode();
+//                 toCc  [vB] = vCc;
+//                 toOrig[vB] = cc.toOrig[vCc];
+//                 toBlk [vCc] = vB;
+//             }
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 auto eC = cc.bc->original(hE);
+//                 node sB = toBlk[eC->source()];
+//                 node tB = toBlk[eC->target()];
+//                 scratch->newEdge(sB, tB);
+//                 ++outDeg[sB];
+//                 ++inDeg [tB];
+//             }
+
+//             // *move* scratch into blk.Gblk—no copy of internal Array’s!
+//             BlockData blk;
+//             blk.bNode  = bNode;
+//             blk.Gblk   = std::move(scratch);     // ← O(1) pointer swap
+//             blk.toCc   = toCc;                   // these arrays still refer to the old scratch
+//             blk.toBlk  = toBlk;
+//             blk.toOrig = toOrig;
+//             blk.inDeg  = inDeg;
+//             blk.outDeg = outDeg;
+
+//             // prepare fresh scratch for next iteration
+//             scratch = std::make_unique<Graph>();
+//             toCc   .init(*scratch, nullptr);
+//             toBlk  .init(*scratch, nullptr);
+//             toOrig .init(*scratch, nullptr);
+//             inDeg  .init(*scratch, 0);
+//             outDeg .init(*scratch, 0);
+
+//             // optional SPQR on blk.Gblk…
+//             if (blk.Gblk->numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+//                 // …build skel2tree and parent exactly as before…
+//                 const Graph &T = blk.spqr->tree();
+//                 for (edge te : T.edges) {
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+//                 }
+//                 blk.parent.init(T, nullptr);
+//                 std::stack<node> st;
+//                 node root = blk.spqr->rootNode();
+//                 blk.parent[root] = root;
+//                 st.push(root);
+//                 while (!st.empty()) {
+//                     node u = st.top(); st.pop();
+//                     for (auto a : u->adjEntries) {
+//                         node v = a->twinNode();
+//                         if (!blk.parent[v]) {
+//                             blk.parent[v] = u;
+//                             st.push(v);
+//                         }
+//                     }
+//                 }
+//             }
+
+//             // finally, run your analysis
+//             checkBlockByCutVertices(blk, cc);
+//             if (blk.spqr) {
+//                 solveSPQR(blk, cc);
+//             }
+//             // blk and its Graph (the old scratch) now own the memory
+//         }
+
+//         if ((cid % 50) == 0) {
+//             logger::info("{}/{}", cid, nCC);
+//         }
+//     }
+// }
+
+
+
+    
+// //--------------------------------------------------------------------
+// //  stream over the graph, build each block once, analyse, forget it
+// //--------------------------------------------------------------------
+// void solveStreaming()
+// {
+//     auto &C = ctx();
+//     Graph &G = C.G;
+
+//     /* 1. weakly-connected components -------------------------------- */
+//     NodeArray<int> compIdx(G);
+//     const int nCC = connectedComponents(G, compIdx);
+
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
+
+//     logger::info("Streaming over {} components", nCC);
+
+//     /* 2. process every component in turn ---------------------------- */
+//     for (int cid = 0; cid < nCC; ++cid)
+//     {
+//         //----------------- build CC (once) ---------------------------
+//         CcData cc;
+//         cc.Gcc = std::make_unique<Graph>();
+//         cc.toOrig.init(*cc.Gcc, nullptr);
+//         cc.toCopy.init(G,        nullptr);
+
+//         for (node vG : bucket[cid]) {
+//             node vC            = cc.Gcc->newNode();
+//             cc.toCopy[vG]      = vC;
+//             cc.toOrig[vC]      = vG;
+//         }
+//         for (edge e : G.edges) {
+//             node u = e->source(), v = e->target();
+//             if (compIdx[u] == cid && compIdx[v] == cid)
+//                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+//         }
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+//         //---------------- scratch objects (reused) -------------------
+//         Graph           scratch;
+//         NodeArray<node> sc_toCc   (scratch,nullptr);
+//         NodeArray<node> sc_toOrig (scratch,nullptr);
+//         NodeArray<int>  sc_inDeg  (scratch,0);
+//         NodeArray<int>  sc_outDeg (scratch,0);
+//         NodeArray<node> comp2scr (*cc.Gcc,nullptr);   // CC→scratch
+
+//         std::vector<node> verts;
+
+//         //---------------- iterate over the blocks --------------------
+//         for (node bNode : cc.bc->bcTree().nodes)
+//         if (cc.bc->typeOfBNode(bNode) == BCTree::BNodeType::BComp)
+//         {
+//             /* 2.1 collect vertices in a vector (faster than set) ---- */
+//             verts.clear();
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 verts.push_back(eC->source());
+//                 verts.push_back(eC->target());
+//             }
+//             std::sort(verts.begin(), verts.end());
+//             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+//             /* 2.2 reset scratch graph (keeps capacity) -------------- */
+//             scratch.clear();
+//             sc_toCc  .init(scratch,nullptr);
+//             sc_toOrig.init(scratch,nullptr);
+//             sc_inDeg .fill(0);
+//             sc_outDeg.fill(0);
+
+//             /* 2.3 build block in scratch ---------------------------- */
+//             for (node vC : verts) {
+//                 node vS          = scratch.newNode();
+//                 comp2scr[vC]     = vS;
+//                 sc_toCc  [vS]    = vC;
+//                 sc_toOrig[vS]    = cc.toOrig[vC];
+//             }
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 node sS = comp2scr[eC->source()];
+//                 node tS = comp2scr[eC->target()];
+//                 scratch.newEdge(sS, tS);
+//                 ++sc_outDeg[sS]; ++sc_inDeg[tS];
+//             }
+
+//             /* 2.4 copy graph; rebuild NodeArrays so they fit -------- */
+//             auto   gblk      = std::make_unique<Graph>(scratch); // nodes/edges copied
+//             NodeArray<node> blk_toCc  (*gblk,nullptr);
+//             NodeArray<node> blk_toOrig(*gblk,nullptr);
+//             NodeArray<int>  blk_inDeg (*gblk,0);
+//             NodeArray<int>  blk_outDeg(*gblk,0);
+
+//             auto itS = scratch.nodes.begin();
+//             auto itB = gblk->nodes.begin();
+//             for ( ; itS != scratch.nodes.end(); ++itS, ++itB) {
+//                 node s = *itS;
+//                 node b = *itB;
+//                 blk_toCc  [b] = sc_toCc  [s];
+//                 blk_toOrig[b] = sc_toOrig[s];
+//                 blk_inDeg [b] = sc_inDeg [s];
+//                 blk_outDeg[b] = sc_outDeg[s];
+//             }
+
+//             /* 2.5 fill BlockData ------------------------------------ */
+//             BlockData blk;
+//             blk.bNode   = bNode;
+//             blk.Gblk    = std::move(gblk);
+//             blk.toCc    = std::move(blk_toCc);
+//             blk.toBlk   = comp2scr;          // still valid for this block
+//             blk.toOrig  = std::move(blk_toOrig);
+//             blk.inDeg   = std::move(blk_inDeg);
+//             blk.outDeg  = std::move(blk_outDeg);
+
+//             /* optional SPQR ---------------------------------------- */
+//             if (blk.Gblk->numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+//                 const Graph &T = blk.spqr->tree();
+//                 for (edge te : T.edges) {
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+//                 }
+//                 blk.parent.init(T,nullptr);
+//                 node root = blk.spqr->rootNode();
+//                 std::stack<node> S;  blk.parent[root]=root;  S.push(root);
+//                 while(!S.empty()){
+//                     node u=S.top();S.pop();
+//                     for(adjEntry a:u->adjEntries){
+//                         node v=a->twinNode();
+//                         if(!blk.parent[v]){ blk.parent[v]=u; S.push(v); }
+//                     }
+//                 }
+//             }
+
+//             /* 2.6 analyse & forget ---------------------------------- */
+//             checkBlockByCutVertices(blk, cc);
+//             if (blk.spqr) solveSPQR(blk, cc);
+//         }
+
+//         if (cid % 50 == 0) logger::info("{}/{}", cid, nCC);
+//         /* cc (and its memory) is released here */
+//     }
+// }
+
+
+// // ---------------------------------------------------------------------------
+// //  streaming, memory-friendly, low-allocation version
+// // ---------------------------------------------------------------------------
+// void solveStreaming()
+// {
+//     auto &C = ctx();
+//     Graph &G = C.G;
+
+//     /* ------------------------------------------------------------------ */
+//     /* 1. weakly-connected components                                    */
+//     NodeArray<int> compIdx(G);
+//     const int nCC = connectedComponents(G, compIdx);
+
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for (node v : G.nodes) bucket[compIdx[v]].push_back(v);
+
+//     logger::info("Streaming over {} components", nCC);
+
+//     /* ------------------------------------------------------------------ */
+//     /* scratch objects that live for the whole run                        */
+//     Graph           scratch;
+//     NodeArray<node> toCc   (scratch,nullptr);   // scratch  -> CC
+//     NodeArray<node> toOrig (scratch,nullptr);   // scratch  -> global
+//     NodeArray<int>  inDeg  (scratch,0);
+//     NodeArray<int>  outDeg (scratch,0);
+//     NodeArray<node> toBlk  (G,nullptr);         // CC       -> scratch
+
+//     std::vector<node> verts;                    // vertex bucket
+//     verts.reserve(128);                         // small default; grows as needed
+
+//     std::unordered_map<edge,edge> skel2treeScratch;
+//     skel2treeScratch.reserve(256);              // will grow automatically
+
+//     /* ------------------------------------------------------------------ */
+//     /* 2. component loop                                                  */
+//     for (int cid = 0; cid < nCC; ++cid)
+//     {
+//         /* -- build CC once ------------------------------------------- */
+//         CcData cc;
+//         cc.Gcc    = std::make_unique<Graph>();
+//         cc.toOrig .init(*cc.Gcc , nullptr);
+//         cc.toCopy .init(G       , nullptr);
+
+//         for (node vG : bucket[cid]) {
+//             node vC       = cc.Gcc->newNode();
+//             cc.toCopy[vG] = vC;
+//             cc.toOrig[vC] = vG;
+//         }
+//         for (edge e : G.edges) {
+//             node u = e->source(), v = e->target();
+//             if (compIdx[u]==cid && compIdx[v]==cid)
+//                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+//         }
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+//         /* -- iterate its B-blocks immediately ------------------------ */
+//         for (node bNode : cc.bc->bcTree().nodes)
+//         if (cc.bc->typeOfBNode(bNode) == BCTree::BNodeType::BComp)
+//         {
+//             /* 3.1 collect vertices (vector + sort/unique) ------------ */
+//             verts.clear();
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 verts.push_back(eC->source());
+//                 verts.push_back(eC->target());
+//             }
+//             std::sort(verts.begin(), verts.end());
+//             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+//             /* 3.2 reset scratch graph -------------------------------- */
+//             scratch.clear();                     // nodes/edges gone, memory kept
+//             toCc   .init(scratch,nullptr);
+//             toOrig .init(scratch,nullptr);
+//             inDeg .fill(0);
+//             outDeg.fill(0);
+
+//             /* 3.3 rebuild block inside scratch ----------------------- */
+//             for (node vCc : verts) {
+//                 node vB         = scratch.newNode();
+//                 toBlk [vCc]     = vB;
+//                 toCc  [vB]      = vCc;
+//                 toOrig[vB]      = cc.toOrig[vCc];
+//             }
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 node sB = toBlk[eC->source()];
+//                 node tB = toBlk[eC->target()];
+//                 scratch.newEdge(sB, tB);
+//                 ++outDeg[sB]; ++inDeg[tB];
+//             }
+
+//             /* 3.4 package into BlockData ----------------------------- */
+//             BlockData blk;
+//             blk.bNode  = bNode;
+
+//             /* cheap (O(1)) copy of scratch → blk.Gblk
+//                uses scratch’s already-allocated buffers                */
+//             blk.Gblk   = std::make_unique<Graph>(scratch);
+
+//             blk.toCc   = toCc;        // shallow copy of NodeArray header
+//             blk.toBlk  = toBlk;       // (shares underlying storage)
+//             blk.toOrig = toOrig;
+//             blk.inDeg  = inDeg;
+//             blk.outDeg = outDeg;
+
+//             /* 3.5 optional SPQR -------------------------------------- */
+//             if (blk.Gblk->numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+
+//                 /* reuse one hash map for all blocks ---------------- */
+//                 skel2treeScratch.clear();
+//                 skel2treeScratch.reserve(
+//                     blk.Gblk->numberOfEdges() * 2u);   // heuristic
+
+//                 const Graph &T = blk.spqr->tree();
+//                 for (edge te : T.edges) {
+//                     skel2treeScratch[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+//                     skel2treeScratch[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+//                 }
+//                 blk.skel2tree.swap(skel2treeScratch);   // O(1) pointer swap
+
+//                 /* build parent[] once per SPQR -------------------- */
+//                 blk.parent.init(T,nullptr);
+//                 node root = blk.spqr->rootNode();
+//                 std::stack<node> S; blk.parent[root]=root; S.push(root);
+//                 while(!S.empty()){
+//                     node u=S.top(); S.pop();
+//                     for(adjEntry a:u->adjEntries){
+//                         node v=a->twinNode();
+//                         if(!blk.parent[v]){ blk.parent[v]=u; S.push(v); }
+//                     }
+//                 }
+//             }
+
+//             /* 3.6 run analysis -------------------------------------- */
+//             checkBlockByCutVertices(blk, cc);
+//             if (blk.spqr) solveSPQR(blk, cc);
+
+//             /* 3.7 give the hash map back to the scratch object ------ */
+//             blk.skel2tree.swap(skel2treeScratch);       // empty blk, keep mem
+//         }
+
+//         if (cid % 50 == 0) logger::info("{}/{}", cid, nCC);
+//     }
+// }
+
+
+//    //--------------------------------------------------------------------------
+// //  Serial, memory-efficient streaming traversal
+// //--------------------------------------------------------------------------
+// void solveStreaming()
+// {
+//     auto &C = ctx();
+//     Graph &G = C.G;
+
+//     /* 1. connected components ----------------------------------------- */
+//     NodeArray<int> compIdx(G);
+//     const int nCC = connectedComponents(G, compIdx);
+
+//     std::vector<std::vector<node>> bucket(nCC);
+//     for (node v : G.nodes)
+//         bucket[compIdx[v]].push_back(v);
+
+//     logger::info("Streaming over {} components", nCC);
+
+//     /* 2. per component ------------------------------------------------- */
+//     for (int cid = 0; cid < nCC; ++cid)
+//     {
+//         /* 2-A  materialise CC ----------------------------------------- */
+//         CcData cc;
+//         cc.Gcc    = std::make_unique<Graph>();
+//         cc.toOrig .init(*cc.Gcc , nullptr);
+//         cc.toCopy .init(G       , nullptr);
+
+//         for (node vG : bucket[cid]) {
+//             node vC        = cc.Gcc->newNode();
+//             cc.toCopy[vG]  = vC;
+//             cc.toOrig[vC]  = vG;
+//         }
+//         for (edge e : G.edges) {
+//             node u=e->source(), v=e->target();
+//             if (compIdx[u]==cid && compIdx[v]==cid)
+//                 cc.Gcc->newEdge(cc.toCopy[u], cc.toCopy[v]);
+//         }
+//         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+
+//         /* 2-B  scratch objects reused for every block ----------------- */
+//         auto scratch     = std::make_unique<Graph>();            // <-- ptr!
+//         NodeArray<node> toCc   (*scratch,nullptr);
+//         NodeArray<node> toOrig (*scratch,nullptr);
+//         NodeArray<int>  inDeg  (*scratch,0);
+//         NodeArray<int>  outDeg (*scratch,0);
+//         NodeArray<node> toBlk(*cc.Gcc,nullptr);   // CC-node → scratch
+
+//         std::vector<node> verts;  verts.reserve(32);
+
+//         /* 2-C  iterate blocks directly ------------------------------- */
+//         for (node bNode : cc.bc->bcTree().nodes)
+//         if (cc.bc->typeOfBNode(bNode) == BCTree::BNodeType::BComp)
+//         {
+//             /* 3.1 collect vertices (unique) -------------------------- */
+//             verts.clear();
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 verts.push_back(eC->source());
+//                 verts.push_back(eC->target());
+//             }
+//             std::sort(verts.begin(), verts.end());
+//             verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
+
+//             /* 3.2 reset scratch graph – keeps capacity --------------- */
+//             scratch->clear();
+//             toCc  .init(*scratch,nullptr);
+//             toOrig.init(*scratch,nullptr);
+//             inDeg .fill(0);
+//             outDeg.fill(0);
+
+//             /* 3.3 rebuild block inside scratch ---------------------- */
+//             for (node vCc : verts) {
+//                 node vB     = scratch->newNode();
+//                 toBlk [vCc] = vB;
+//                 toCc  [vB]  = vCc;
+//                 toOrig[vB]  = cc.toOrig[vCc];
+//             }
+//             for (edge hE : cc.bc->hEdges(bNode)) {
+//                 edge eC = cc.bc->original(hE);
+//                 node sB = toBlk[eC->source()];
+//                 node tB = toBlk[eC->target()];
+//                 scratch->newEdge(sB, tB);
+//                 ++outDeg[sB]; ++inDeg[tB];
+//             }
+
+//             /* 3.4 hand ownership of scratch to BlockData ------------- */
+//             BlockData blk;
+//             blk.bNode  = bNode;
+//             blk.Gblk   = std::move(scratch);   // <-- transfer ptr, zero-copy
+//             blk.toCc   = toCc;
+//             blk.toBlk  = toBlk;       // shares storage with CC arrays
+//             blk.toOrig = toOrig;
+//             blk.inDeg  = inDeg;
+//             blk.outDeg = outDeg;
+
+//             /* create a *fresh* scratch for next block ---------------- */
+//             scratch   = std::make_unique<Graph>();
+//             toCc.init   (*scratch,nullptr);
+//             toOrig.init (*scratch,nullptr);
+//             inDeg.init(*scratch,0);
+//             outDeg.init(*scratch,0);
+
+//             /* optional SPQR tree ------------------------------------ */
+//             if (blk.Gblk->numberOfNodes() >= 3) {
+//                 blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+//                 const Graph &T = blk.spqr->tree();
+//                 for (edge te : T.edges) {
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeSrc(te) ] = te;
+//                     blk.skel2tree[ blk.spqr->skeletonEdgeTgt(te) ] = te;
+//                 }
+//                 blk.parent.init(T,nullptr);
+//                 node root = blk.spqr->rootNode();
+//                 std::stack<node> S;  blk.parent[root]=root; S.push(root);
+//                 while(!S.empty()){
+//                     node u=S.top();S.pop();
+//                     for(adjEntry a:u->adjEntries){
+//                         node v=a->twinNode();
+//                         if(!blk.parent[v]){ blk.parent[v]=u; S.push(v); }
+//                     }
+//                 }
+//             }
+
+//             /* 3.5 analyse ------------------------------------------- */
+//             checkBlockByCutVertices(blk, cc);
+//             if (blk.spqr) solveSPQR(blk, cc);
+//         } // end blocks
+
+//         if (cid % 50 == 0)
+//             logger::info("{}/{}", cid, nCC);
+//     } // end components
+// }
+
+
+
+
+
+
     void solve() {                
         TIME_BLOCK("Finding superbubbles");
         auto& C = ctx();
 
+
         findMiniSuperbubbles();
 
-        std::vector<CcData> comps = buildDecomposition(C.G);
-        std::cout << "Found " << comps.size() << " connected components.\n";
+        solveStreaming();
 
-        printBlockEdges(comps);
-        runOnAllBlocks(comps);
+        // std::vector<CcData> comps = buildDecomposition(C.G);
+        // // std::cout << "Found " << comps.size() << " connected components.\n";
 
+        // // printBlockEdges(comps);
+        // runOnAllBlocks(comps);
 
-
+        // decomposeAndRun();
+        // runBlocksOnePass();
 
 
     }
