@@ -22,6 +22,7 @@ void readStandard()
     int n, m;
     if (!C.graphPath.empty()) {
         std::ifstream in(C.graphPath);
+
         if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
         if (!(in >> n >> m))
@@ -104,8 +105,7 @@ void readGFA()
 }
 
 // ---------- readGraph (wrapper) -------------------------------------------
-void readGraph()
-{
+void readGraph() {
     auto &C = ctx();
     TIME_BLOCK("Graph read");
 
@@ -128,7 +128,7 @@ void readGraph()
 }
 
 // ---------- drawGraph ------------------------------------------------------
-void drawGraph(Graph &G, const std::string &file)
+void drawGraph(const Graph &G, const std::string &file)
 {
     return;
     using namespace ogdf;
@@ -247,16 +247,16 @@ void drawGraph(Graph &G, const std::string &file)
 
 void writeSuperbubbles() {
     if(ctx().outputPath == "") {
-        std::cout << ctx().superbubbles.size() << std::endl;
+        std::cout << ctx().superbubbles.size() << "\n";
         for(auto &p:ctx().superbubbles) {
-            std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << std::endl;
+            std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
         }
 
     } else {
         std::ofstream out(ctx().outputPath);
-        out << ctx().superbubbles.size() << std::endl;
+        out << ctx().superbubbles.size() << "\n";
         for(auto &p:ctx().superbubbles) {
-            out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << std::endl;
+            out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
         }
     }
 }

@@ -85,7 +85,7 @@ namespace solver {
     struct BlockData {
         std::unique_ptr<Graph> Gblk;  
         ogdf::NodeArray<ogdf::node> toCc;
-        ogdf::NodeArray<ogdf::node> toBlk;
+        // ogdf::NodeArray<ogdf::node> toBlk;
         ogdf::NodeArray<ogdf::node> toOrig;
 
         std::unique_ptr<ogdf::StaticSPQRTree> spqr;
@@ -108,6 +108,8 @@ namespace solver {
         std::unique_ptr<ogdf::Graph> Gcc;
         ogdf::NodeArray<ogdf::node> toOrig;
         ogdf::NodeArray<ogdf::node> toCopy;
+        ogdf::NodeArray<ogdf::node> toBlk;
+
         std::unique_ptr<ogdf::BCTree> bc;
         std::vector<BlockData> blocks;
     };
@@ -830,7 +832,7 @@ namespace solver {
                 if (!vComp) return nullptr;
 
                 // component -> block
-                ogdf::node vBlk  = blk.toBlk[vComp];
+                ogdf::node vBlk  = cc.toBlk[vComp];
                 if (!vBlk)  return nullptr;
 
                 // block -> skeleton
@@ -1106,7 +1108,7 @@ namespace solver {
                 ogdf::node vComp = cc.toCopy[vG];
                 if (!vComp) return nullptr;
                 // component -> block
-                ogdf::node vBlk  = blk.toBlk[vComp];
+                ogdf::node vBlk  = cc.toBlk[vComp];
                 if (!vBlk)  return nullptr;
                 // block -> skeleton
                 ogdf::node vSkel = compToSkel[vBlk];
@@ -1876,15 +1878,19 @@ namespace solver {
 
     
 
+    // int j=0;
     void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)    
     {
         auto &C      = ctx();
         const Graph &G = *blk.Gblk;
+        // GraphIO::drawGraph(G, "lololo"+to_string(++j));
 
+        // std::cout << "nodes in block " << ++j << ": ";
         node src=nullptr, snk=nullptr;
 
         for (node v : G.nodes) {
             node vG   = blk.toOrig[v];
+            // std::cout << C.node2name[vG] << ", ";
             int inL   = blk.inDeg [v], outL = blk.outDeg[v];
             int inG   = C.inDeg  [vG], outG = C.outDeg[vG];
 
@@ -1899,11 +1905,14 @@ namespace solver {
                 return;
             }
         }
+        // std::cout << std::endl;
 
         if (!src || !snk) { return; }
 
         /* ---------- 2. acyclicity ------------------------------------------- */
-        if (!isAcyclic(G)) { return; }
+        if (!isAcyclic(G)) { 
+            return;
+        }
 
         /* ---------- 3. reachability ----------------------------------------- */
         NodeArray<bool> vis(G,false); std::stack<node> S; vis[src]=true; S.push(src);
@@ -1971,6 +1980,7 @@ namespace solver {
         }
 
 
+        // SPQRsolve::printAllStates(dp, node_dp, blk.spqr->tree());
 
         // return;
         // std::cout << "SPQR tree node order:\n";
@@ -2305,172 +2315,413 @@ namespace solver {
 
 
 
-static void buildBlockData(const std::vector<node>& verts,
-                         const CcData& cc,
-                         BlockData& blk) {
-    static Graph scratch;
-    scratch.clear();
-    
-    // Initialize arrays directly in scratch space
-    NodeArray<node> toCc(scratch, nullptr);
-    NodeArray<node> toOrig(scratch, nullptr);
-    NodeArray<int> inDeg(scratch, 0);
-    NodeArray<int> outDeg(scratch, 0);
-    NodeArray<node> toBlk(*cc.Gcc, nullptr);
-
-    // Build the block
-    for (node vCc : verts) {
-        node vB = scratch.newNode();
-        toBlk[vCc] = vB;
-        toCc[vB] = vCc;
-        toOrig[vB] = cc.toOrig[vCc];
-    }
-
-    for (edge hE : cc.bc->hEdges(blk.bNode)) {
-        edge eCc = cc.bc->original(hE);
-        edge e = scratch.newEdge(toBlk[eCc->source()], 
-                               toBlk[eCc->target()]);
-        outDeg[e->source()]++;
-        inDeg[e->target()]++;
-    }
-
-    // Move data to BlockData (no graph copy)
-    blk.Gblk = std::make_unique<Graph>(std::move(scratch));
-    blk.toCc = std::move(toCc);
-    blk.toBlk = std::move(toBlk);
-    blk.toOrig = std::move(toOrig);
-    blk.inDeg = std::move(inDeg);
-    blk.outDeg = std::move(outDeg);
 
 
+        // BEST
+        static void buildBlockData(const std::vector<node>& verts,
+                CcData& cc,
+                BlockData& blk) {
+            // 1. Scratch graph reset
+            static Graph scratch;
+            scratch.clear();
 
-    // Build SPQR if needed
-    if (blk.Gblk->numberOfNodes() >= 3) {
-        blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
-        
-        const Graph& T = blk.spqr->tree();
-        for (edge te : T.edges) {
-            // Map BOTH directions (source and target skeleton edges)
-            edge eSrc = blk.spqr->skeletonEdgeSrc(te);
-            if (eSrc) blk.skel2tree[eSrc] = te;
-            
-            edge eTgt = blk.spqr->skeletonEdgeTgt(te);
-            if (eTgt) blk.skel2tree[eTgt] = te;
-        }
+            // 2. Initialize arrays (toCc, toOrig, inDeg, outDeg)
+            NodeArray<node> toCc(scratch, nullptr);
+            NodeArray<node> toOrig(scratch, nullptr);
+            NodeArray<int> inDeg(scratch, 0);
+            NodeArray<int> outDeg(scratch, 0);
 
-        // Initialize parent array
-        blk.parent.init(T, nullptr);
-        node root = blk.spqr->rootNode();
-        
-        // Non-recursive tree traversal
-        std::vector<node> stack;
-        stack.reserve(T.numberOfNodes());
-        blk.parent[root] = root;
-        stack.push_back(root);
-        
-        while (!stack.empty()) {
-            node u = stack.back();
-            stack.pop_back();
-            for (adjEntry adj : u->adjEntries) {
-                node v = adj->twinNode();
-                if (!blk.parent[v]) {
-                    blk.parent[v] = u;
-                    stack.push_back(v);
-                }
-            }
-        }
-
-    }
-}
-void solveStreaming() {
-    auto& C = ctx();
-    Graph& G = C.G;
-
-    // 1. Weakly connected components
-    NodeArray<int> compIdx(G);
-    const int nCC = connectedComponents(G, compIdx);
-    
-    std::vector<std::vector<node>> bucket(nCC);
-    for (node v : G.nodes) 
-        bucket[compIdx[v]].push_back(v);
-
-    logger::info("Streaming over {} components", nCC);
-
-    // 2. Process each component
-    #pragma omp parallel for schedule(dynamic)
-    for (int cid = 0; cid < nCC; ++cid) {
-        // 3. Build CC graph
-        CcData cc;
-        cc.Gcc = std::make_unique<Graph>();
-        cc.toOrig.init(*cc.Gcc, nullptr);
-        cc.toCopy.init(G, nullptr);
-
-        // Fast node mapping
-        std::unordered_map<node, node> orig_to_cc;
-        for (node vG : bucket[cid]) {
-            node vC = cc.Gcc->newNode();
-            cc.toCopy[vG] = vC;
-            cc.toOrig[vC] = vG;
-            orig_to_cc[vG] = vC;
-        }
-
-        // Fast edge creation
-        for (edge e : G.edges) {
-            if (compIdx[e->source()] == cid) {
-                cc.Gcc->newEdge(orig_to_cc[e->source()], 
-                              orig_to_cc[e->target()]);
-            }
-        }
-
-        cc.bc = std::make_unique<BCTree>(*cc.Gcc);
-        NodeArray<node> cc_to_scratch(*cc.Gcc, nullptr);
-
-        // 4. Process blocks
-        for (node bNode : cc.bc->bcTree().nodes) {
-            if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
-                continue;
-
-            // Collect vertices
-            std::vector<node> verts;
-            std::unordered_set<node> verts_set;
-            for (edge hE : cc.bc->hEdges(bNode)) {
-                edge eC = cc.bc->original(hE);
-                if (verts_set.insert(eC->source()).second)
-                    verts.push_back(eC->source());
-                if (verts_set.insert(eC->target()).second)
-                    verts.push_back(eC->target());
+            // 3. Build block nodes using cc.toBlk
+            for (node vCc : verts) {
+                node vB = scratch.newNode();
+                cc.toBlk[vCc] = vB;
+                toCc[vB] = vCc;
+                toOrig[vB] = cc.toOrig[vCc];
             }
 
-            // Initialize block data
-            BlockData blk;
-            blk.bNode = bNode;
-            buildBlockData(verts, cc, blk);
-
-            // Verify SPQR initialization
-            if (blk.spqr && blk.skel2tree.empty()) {
-                // logger::error("Empty skel2tree map for block with {} nodes", 
-                //             blk.Gblk->numberOfNodes());
-                continue;
+            // 4. Build block edges and degree counts
+            for (edge hE : cc.bc->hEdges(blk.bNode)) {
+                edge eCc = cc.bc->original(hE);
+                auto src = cc.toBlk[eCc->source()];
+                auto tgt = cc.toBlk[eCc->target()];
+                edge e = scratch.newEdge(src, tgt);
+                outDeg[e->source()]++;
+                inDeg[e->target()]++;
             }
 
-            // Process block
-            checkBlockByCutVertices(blk, cc);
-            
+            // 5. Move to BlockData
+            blk.Gblk   = std::make_unique<Graph>(std::move(scratch));
+            blk.toCc   = std::move(toCc);
+            blk.toOrig = std::move(toOrig);
+            blk.inDeg  = std::move(inDeg);
+            blk.outDeg = std::move(outDeg);
+
+            // 6. SPQR decomposition and skeleton-to-tree mapping
             if (blk.Gblk->numberOfNodes() >= 3) {
-                try {
-                    solveSPQR(blk, cc);
-                } catch (const std::exception& e) {
-                    logger::error("SPQR processing failed: {}", e.what());
+                // 6a. SPQR init
+                blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+
+                // 6b. Map skeleton edges to tree edges
+                const Graph& T = blk.spqr->tree();
+                for (edge te : T.edges) {
+                    if (auto eSrc = blk.spqr->skeletonEdgeSrc(te)) {
+                        blk.skel2tree[eSrc] = te;
+                    }
+                    if (auto eTgt = blk.spqr->skeletonEdgeTgt(te)) {
+                        blk.skel2tree[eTgt] = te;
+                    }
+                }
+
+                // 6c. Build parent tree
+                blk.parent.init(T, nullptr);
+                node root = blk.spqr->rootNode();
+                std::vector<node> stack;
+                stack.reserve(T.numberOfNodes());
+                blk.parent[root] = root;
+                stack.push_back(root);
+                while (!stack.empty()) {
+                    node u = stack.back(); stack.pop_back();
+                    for (adjEntry adj : u->adjEntries) {
+                        node v = adj->twinNode();
+                        if (!blk.parent[v]) {
+                            blk.parent[v] = u;
+                            stack.push_back(v);
+                        }
+                    }
                 }
             }
+        }
 
-            if (cid % 50 == 0) {
-                logger::debug("Processed block {}/{} in component {}", 
-                            bNode->index(), cc.bc->bcTree().numberOfNodes(), cid);
+        // BEST NOW
+        void solveStreaming() {
+            auto& C = ctx();
+            Graph& G = C.G;
+
+            // 1. Weakly connected components
+            NodeArray<int> compIdx(G);
+            const int nCC = connectedComponents(G, compIdx);
+
+            // 2. Bucket creation
+            std::vector<std::vector<node>> bucket(nCC);
+            for (node v : G.nodes) {
+                bucket[compIdx[v]].push_back(v);
+            }
+
+            logger::info("Streaming over {} components", nCC);
+            CcData cc;
+            cc.toCopy.init(G, nullptr);
+
+            // 3. Process each component
+            // #pragma omp parallel for schedule(dynamic)
+            for (int cid = 0; cid < nCC; ++cid) {
+
+                // 3a. Init CC data
+                cc.Gcc = std::make_unique<Graph>();
+                cc.toOrig.init(*cc.Gcc, nullptr);
+
+                // 3b. Node mapping
+                std::unordered_map<node, node> orig_to_cc;
+                for (node vG : bucket[cid]) {
+                    node vC = cc.Gcc->newNode();
+                    cc.toCopy[vG] = vC;
+                    cc.toOrig[vC] = vG;
+                    orig_to_cc[vG] = vC;
+                }
+
+                // 3c. Edge creation
+                for (edge e : G.edges) {
+                    if (compIdx[e->source()] == cid) {
+                        cc.Gcc->newEdge(orig_to_cc[e->source()], 
+                                        orig_to_cc[e->target()]);
+                    }
+                }
+
+                // 4. Build BC tree
+                cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+                
+                NodeArray<node> toBlk(*cc.Gcc, nullptr);
+                cc.toBlk = toBlk;
+
+                for (node bNode : cc.bc->bcTree().nodes) {
+                    if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
+                        continue;
+
+                    std::vector<node> verts;
+                    std::unordered_set<node> verts_set;
+                    for (edge hE : cc.bc->hEdges(bNode)) {
+                        edge eC = cc.bc->original(hE);
+                        if (verts_set.insert(eC->source()).second)
+                            verts.push_back(eC->source());
+                        if (verts_set.insert(eC->target()).second)
+                            verts.push_back(eC->target());
+                    }
+
+                    BlockData blk;
+                    blk.bNode = bNode;
+
+                    buildBlockData(verts, cc, blk);
+
+
+
+
+                    // if (blk.spqr && blk.skel2tree.empty()) {
+                    //     continue;
+                    // }
+
+                    checkBlockByCutVertices(blk, cc);
+
+                    if (blk.Gblk->numberOfNodes() >= 3) {
+                        try {
+                            solveSPQR(blk, cc);
+                        } catch (const std::exception& e) {
+                            logger::error("SPQR processing failed: {}", e.what());
+                        }
+                    }
+
+                    logger::debug("Processed block {}/{} in component {}", 
+                                  bNode->index(), cc.bc->bcTree().numberOfNodes(), cid);
+                }
+                logger::info("Processed component {}/{}", cid, nCC);
             }
         }
-    }
-}
+
+
+
+
+        // static void buildBlockData(const std::vector<node>& verts,
+        //         CcData& cc,
+        //         BlockData& blk) {
+        //     auto _bt_start_total = std::chrono::steady_clock::now();
+
+        //     // 1. Scratch graph reset
+        //     auto _bt_start = std::chrono::steady_clock::now();
+        //     static Graph scratch;
+        //     scratch.clear();
+        //     auto _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [1] scratch reset: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     // 2. Initialize arrays (toCc, toOrig, inDeg, outDeg)
+        //     _bt_start = std::chrono::steady_clock::now();
+        //     NodeArray<node> toCc(scratch, nullptr);
+        //     NodeArray<node> toOrig(scratch, nullptr);
+        //     NodeArray<int> inDeg(scratch, 0);
+        //     NodeArray<int> outDeg(scratch, 0);
+        //     _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [2] arrays init: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     // 3. Build block nodes using cc.toBlk
+        //     _bt_start = std::chrono::steady_clock::now();
+        //     for (node vCc : verts) {
+        //         node vB = scratch.newNode();
+        //         cc.toBlk[vCc] = vB;
+        //         toCc[vB] = vCc;
+        //         toOrig[vB] = cc.toOrig[vCc];
+        //     }
+        //     _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [3] build block nodes: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     // 4. Build block edges and degree counts
+        //     _bt_start = std::chrono::steady_clock::now();
+        //     for (edge hE : cc.bc->hEdges(blk.bNode)) {
+        //         edge eCc = cc.bc->original(hE);
+        //         auto src = cc.toBlk[eCc->source()];
+        //         auto tgt = cc.toBlk[eCc->target()];
+        //         edge e = scratch.newEdge(src, tgt);
+        //         outDeg[e->source()]++;
+        //         inDeg[e->target()]++;
+        //     }
+        //     _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [4] build edges & deg: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     // 5. Move to BlockData
+        //     _bt_start = std::chrono::steady_clock::now();
+        //     blk.Gblk   = std::make_unique<Graph>(std::move(scratch));
+        //     blk.toCc   = std::move(toCc);
+        //     blk.toOrig = std::move(toOrig);
+        //     blk.inDeg  = std::move(inDeg);
+        //     blk.outDeg = std::move(outDeg);
+        //     _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [5] move to BlockData: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     // 6. SPQR decomposition and skeleton-to-tree mapping
+        //     _bt_start = std::chrono::steady_clock::now();
+        //     if (blk.Gblk->numberOfNodes() >= 3) {
+        //         // 6a. SPQR init
+        //         blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+
+        //         // 6b. Map skeleton edges to tree edges
+        //         const Graph& T = blk.spqr->tree();
+        //         for (edge te : T.edges) {
+        //             if (auto eSrc = blk.spqr->skeletonEdgeSrc(te)) {
+        //                 blk.skel2tree[eSrc] = te;
+        //             }
+        //             if (auto eTgt = blk.spqr->skeletonEdgeTgt(te)) {
+        //                 blk.skel2tree[eTgt] = te;
+        //             }
+        //         }
+
+        //         // 6c. Build parent tree
+        //         blk.parent.init(T, nullptr);
+        //         node root = blk.spqr->rootNode();
+        //         std::vector<node> stack;
+        //         stack.reserve(T.numberOfNodes());
+        //         blk.parent[root] = root;
+        //         stack.push_back(root);
+        //         while (!stack.empty()) {
+        //             node u = stack.back(); stack.pop_back();
+        //             for (adjEntry adj : u->adjEntries) {
+        //                 node v = adj->twinNode();
+        //                 if (!blk.parent[v]) {
+        //                     blk.parent[v] = u;
+        //                     stack.push_back(v);
+        //                 }
+        //             }
+        //         }
+        //     }
+        //     _bt_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData [6] SPQR & mapping: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_end - _bt_start).count());
+
+        //     auto _bt_total_end = std::chrono::steady_clock::now();
+        //     logger::info("buildBlockData total: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_bt_total_end - _bt_start_total).count());
+        // }
+
+
+        // void solveStreaming() {
+        //     auto _ss_total_start = std::chrono::steady_clock::now();
+
+        //     auto& C = ctx();
+        //     Graph& G = C.G;
+
+        //     // 1. Weakly connected components
+        //     auto _ss_start = std::chrono::steady_clock::now();
+        //     NodeArray<int> compIdx(G);
+        //     const int nCC = connectedComponents(G, compIdx);
+        //     auto _ss_end = std::chrono::steady_clock::now();
+        //     logger::info("solveStreaming [1] connectedComponents: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_ss_end - _ss_start).count());
+
+        //     // 2. Bucket creation
+        //     _ss_start = std::chrono::steady_clock::now();
+        //     std::vector<std::vector<node>> bucket(nCC);
+        //     for (node v : G.nodes) {
+        //         bucket[compIdx[v]].push_back(v);
+        //     }
+        //     _ss_end = std::chrono::steady_clock::now();
+        //     logger::info("solveStreaming [2] bucket creation: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_ss_end - _ss_start).count());
+
+        //     logger::info("Streaming over {} components", nCC);
+        //     CcData cc;
+        //     cc.toCopy.init(G, nullptr);
+
+        //     // 3. Process each component
+        //     _ss_start = std::chrono::steady_clock::now();
+        //     for (int cid = 0; cid < nCC; ++cid) {
+
+        //         auto _comp_start = std::chrono::steady_clock::now();
+
+        //         // 3a. Init CC data
+        //         auto _ss3_start = std::chrono::steady_clock::now();
+        //         cc.Gcc = std::make_unique<Graph>();
+        //         cc.toOrig.init(*cc.Gcc, nullptr);
+        //         auto _ss3_end = std::chrono::steady_clock::now();
+        //         logger::info("solveStreaming [3a] comp {} init data: {} μs", cid,
+        //                     std::chrono::duration_cast<std::chrono::microseconds>(_ss3_end - _ss3_start).count());
+
+        //         // 3b. Node mapping
+        //         _ss3_start = std::chrono::steady_clock::now();
+        //         std::unordered_map<node, node> orig_to_cc;
+        //         for (node vG : bucket[cid]) {
+        //             node vC = cc.Gcc->newNode();
+        //             cc.toCopy[vG] = vC;
+        //             cc.toOrig[vC] = vG;
+        //             orig_to_cc[vG] = vC;
+        //         }
+        //         _ss3_end = std::chrono::steady_clock::now();
+        //         logger::info("solveStreaming [3b] comp {} node mapping: {} μs", cid,
+        //                     std::chrono::duration_cast<std::chrono::microseconds>(_ss3_end - _ss3_start).count());
+
+        //         // 3c. Edge creation
+        //         _ss3_start = std::chrono::steady_clock::now();
+        //         for (edge e : G.edges) {
+        //             if (compIdx[e->source()] == cid) {
+        //                 cc.Gcc->newEdge(orig_to_cc[e->source()],
+        //                                 orig_to_cc[e->target()]);
+        //             }
+        //         }
+        //         _ss3_end = std::chrono::steady_clock::now();
+        //         logger::info("solveStreaming [3c] comp {} edge creation: {} μs", cid,
+        //                     std::chrono::duration_cast<std::chrono::microseconds>(_ss3_end - _ss3_start).count());
+
+        //         // 4. Build BC tree
+        //         _ss3_start = std::chrono::steady_clock::now();
+        //         cc.bc = std::make_unique<BCTree>(*cc.Gcc);
+        //         NodeArray<node> toBlk(*cc.Gcc, nullptr);
+        //         cc.toBlk = toBlk;
+        //         _ss3_end = std::chrono::steady_clock::now();
+        //         logger::info("solveStreaming [4] comp {} build BC tree: {} μs", cid,
+        //         std::chrono::duration_cast<std::chrono::microseconds>(_ss3_end - _ss3_start).count());
+
+        //             for (node bNode : cc.bc->bcTree().nodes) {
+        //                 if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
+        //                     continue;
+
+        //                 std::vector<node> verts;
+        //                 std::unordered_set<node> verts_set;
+        //                 for (edge hE : cc.bc->hEdges(bNode)) {
+        //                     edge eC = cc.bc->original(hE);
+        //                     if (verts_set.insert(eC->source()).second)
+        //                         verts.push_back(eC->source());
+        //                     if (verts_set.insert(eC->target()).second)
+        //                         verts.push_back(eC->target());
+        //                 }
+
+        //                 BlockData blk;
+        //                 blk.bNode = bNode;
+
+        //                 buildBlockData(verts, cc, blk);
+
+
+
+
+        //                 // if (blk.spqr && blk.skel2tree.empty()) {
+        //                 //     continue;
+        //                 // }
+
+        //                 checkBlockByCutVertices(blk, cc);
+
+        //                 if (blk.Gblk->numberOfNodes() >= 3) {
+        //                     try {
+        //                         solveSPQR(blk, cc);
+        //                     } catch (const std::exception& e) {
+        //                         logger::error("SPQR processing failed: {}", e.what());
+        //                     }
+        //                 }
+
+        //                 logger::debug("Processed block {}/{} in component {}", 
+        //                             bNode->index(), cc.bc->bcTree().numberOfNodes(), cid);
+        //             }
+
+        //         auto _comp_end = std::chrono::steady_clock::now();
+        //         logger::info("solveStreaming comp {} total: {} μs", cid,
+        //                     std::chrono::duration_cast<std::chrono::microseconds>(_comp_end - _comp_start).count());
+        //     }
+        //     _ss_end = std::chrono::steady_clock::now();
+        //     logger::info("solveStreaming [3] all components loop: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_ss_end - _ss_start).count());
+
+        //     auto _ss_total_end = std::chrono::steady_clock::now();
+        //     logger::info("solveStreaming total: {} μs",
+        //                 std::chrono::duration_cast<std::chrono::microseconds>(_ss_total_end - _ss_total_start).count());
+        // }
+
 
 
 
@@ -3325,6 +3576,16 @@ void solveStreaming() {
 
 
 int main(int argc, char** argv) {
+    // static const int MYBUFSIZE = 1<<20;
+    // static char mybuf[MYBUFSIZE];
+    // std::streambuf* sb = std::cin.rdbuf();
+    // sb->pubsetbuf(mybuf, MYBUFSIZE);
+
+
+    // std::ios::sync_with_stdio(false);
+    // std::cin.tie(nullptr);
+
+
     TIME_BLOCK("Starting graph reading...");
     // auto& C = ctx();
     logger::init();
@@ -3346,7 +3607,9 @@ int main(int argc, char** argv) {
     // output all superbubbles
 
     std::cout << "Superbubbles found:\n";
-    if(true)
+    std::cout << ctx().superbubbles.size() << std::endl;
+    // return 0;
+    // if(true)
     std::sort(ctx().superbubbles.begin(), ctx().superbubbles.end(), [&](std::pair<node, node> &a, std::pair<node, node> &b) {
         if(std::stoi(ctx().node2name[a.first]) < std::stoi(ctx().node2name[b.first])) return true;
         else if(std::stoi(ctx().node2name[a.first]) == std::stoi(ctx().node2name[b.first])) {

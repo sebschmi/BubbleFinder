@@ -18,7 +18,7 @@ add_compile_options(
 # Release = fast but still symbolised
 # set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2")
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -fno-omit-frame-pointer -fno-optimize-sibling-calls")
 set(CMAKE_CXX_FLAGS_DEBUG    "-O2 -g -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -fno-omit-frame-pointer")
 
