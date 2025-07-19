@@ -1,16 +1,13 @@
 #pragma once
 #include <ogdf/basic/Graph.h>
-#include "util/context.hpp"        // ctx() accessor
+#include "util/context.hpp"
 
-namespace GraphIO
-{
-    // top-level entry
-    void readGraph();              // uses ctx() inside
+namespace GraphIO {
+    void readGraph();
 
-    // helpers you moved out of main.cpp
     void readStandard();
     void readGFA();
     void drawGraph(const ogdf::Graph& G, const std::string& file);
 
     void writeSuperbubbles();
-} // namespace GraphIO
+}

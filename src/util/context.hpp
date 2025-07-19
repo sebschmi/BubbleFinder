@@ -17,7 +17,6 @@ struct Context
 
     ogdf::Graph                       G;
 
-    // arrays that must be constructed **after** G
     ogdf::NodeArray<int>              inDeg;
     ogdf::NodeArray<int>              outDeg;
     ogdf::NodeArray<bool>             isEntry;
@@ -27,7 +26,7 @@ struct Context
     std::unordered_map<ogdf::node,std::string>  node2name;
     std::vector<std::pair<ogdf::node,ogdf::node>> superbubbles;
 
-    Context();                       // ctor defined in .cpp
+    Context();
     Context(const Context&) = delete;
 };
 

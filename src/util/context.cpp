@@ -1,6 +1,5 @@
 #include "context.hpp"
 
-/* Construct the NodeArrays with the graph reference. */
 Context::Context()
     : inDeg   (G, 0)
     , outDeg  (G, 0)
@@ -17,8 +16,7 @@ Context::Context()
 
 
 /* “Magic static” – initialised once, thread-safe since C++11.   */
-Context& ctx()
-{
-    static Context instance;         // C++11: guaranteed thread-safe
+Context& ctx() {
+    static Context instance;
     return instance;
 }

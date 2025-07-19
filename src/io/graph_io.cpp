@@ -1,8 +1,7 @@
-// ─── src/io/graph_io.cpp ────────────────────────────────────────────────────
-#include "graph_io.hpp"          // declarations
-#include "util/context.hpp"         // ctx()
+#include "graph_io.hpp"
+#include "util/context.hpp"
 #include "util/timer.hpp"
-#include <ogdf/energybased/FMMMLayout.h>   // drawGraph needs it
+#include <ogdf/energybased/FMMMLayout.h> 
 #include <ogdf/fileformats/GraphIO.h>
 #include <fstream>
 #include <regex>
@@ -10,11 +9,9 @@
 
 #include "util/logger.hpp"
 
-using namespace ogdf;               // exactly as in your old main.cpp
+using namespace ogdf;
 
 namespace GraphIO {
-
-// ---------- readStandard ---------------------------------------------------
 void readStandard()
 {
     auto &C = ctx();
@@ -27,6 +24,8 @@ void readStandard()
 
         if (!(in >> n >> m))
             throw std::runtime_error("expected: n m, then m lines u v");
+
+        C.node2name.reserve(n);
 
         for (int i = 0; i < m; ++i) {
             std::string u, v;
@@ -46,6 +45,8 @@ void readStandard()
         if (!(std::cin >> n >> m))
             throw std::runtime_error("expected: n m, then m lines u v");
 
+        C.node2name.reserve(n);
+
         for (int i = 0; i < m; ++i) {
             std::string u, v;
             if (!(std::cin >> u >> v)) throw std::runtime_error("edge line");
@@ -63,7 +64,6 @@ void readStandard()
     }
 }
 
-// ---------- readGFA --------------------------------------------------------
 void readGFA()
 {
     auto &C = ctx();
@@ -104,7 +104,6 @@ void readGFA()
     }
 }
 
-// ---------- readGraph (wrapper) -------------------------------------------
 void readGraph() {
     auto &C = ctx();
     TIME_BLOCK("Graph read");
@@ -127,7 +126,6 @@ void readGraph() {
     logger::info("Graph read");
 }
 
-// ---------- drawGraph ------------------------------------------------------
 void drawGraph(const Graph &G, const std::string &file)
 {
     return;
@@ -239,9 +237,6 @@ void drawGraph(const Graph &G, const std::string &file)
     out << in.rdbuf();
     in.close(); out.close();
     std::remove(tmp.c_str());
-
-    /*  … rest of your bending/bundling and SVG-writing
-        code copied unchanged … */
 }
 
 
@@ -261,4 +256,4 @@ void writeSuperbubbles() {
     }
 }
 
-} // namespace GraphIO
+}
