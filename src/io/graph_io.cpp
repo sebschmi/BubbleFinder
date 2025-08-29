@@ -734,9 +734,9 @@ void writeSuperbubbles() {
         }
     }
 
-    for(auto &p:ctx().superbubbles) {
-        std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
-    }
+        // for(auto &p:ctx().superbubbles) {
+        //     std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
+        // }
 
 
     if (ctx().outputPath.empty()) {
