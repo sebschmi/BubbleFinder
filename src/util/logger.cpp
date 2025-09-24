@@ -12,17 +12,18 @@ std::shared_ptr<spdlog::logger> make_default()
     auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     console->set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
 
-    auto file = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
-        ctx().outputPath.empty() ? "sbfind.log" : ctx().outputPath,
-        0, 0);
+    // Disable file logging for performance
+    // auto file = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
+    //     ctx().outputPath.empty() ? "sbfind.log" : ctx().outputPath,
+    //     0, 0);
 
     // one async queue shared by all loggers
     spdlog::init_thread_pool(8192, 1);
 
     auto lg = std::make_shared<spdlog::async_logger>(
-        "default", spdlog::sinks_init_list{console, file},
+        "default", spdlog::sinks_init_list{console},
         spdlog::thread_pool(),
-        spdlog::async_overflow_policy::block);
+        spdlog::async_overflow_policy::overrun_oldest);
 
     lg->set_level(static_cast<spdlog::level::level_enum>(ctx().logLevel));
     spdlog::set_default_logger(lg);

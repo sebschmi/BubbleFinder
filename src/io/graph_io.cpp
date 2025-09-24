@@ -335,6 +335,8 @@ void readGraph() {
         C.inDeg (e->target())++;
     }
 
+    C.superbubbles.reserve((int)C.G.nodes.size());
+
     logger::info("Graph read");
 }
 

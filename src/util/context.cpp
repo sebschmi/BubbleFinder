@@ -9,7 +9,7 @@ Context::Context()
     , outputPath("")
     , gfaInput(false)
     , doubleGraph(false)
-    , logLevel(Context::LOG_INFO)
+    , logLevel(Context::LOG_WARN)
     , timingEnabled(true)
 {}
 
