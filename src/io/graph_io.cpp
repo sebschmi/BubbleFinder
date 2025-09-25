@@ -335,7 +335,7 @@ void readGraph() {
         C.inDeg (e->target())++;
     }
 
-    C.superbubbles.reserve((int)C.G.nodes.size());
+    // C.superbubbles.reserve((int)C.G.nodes.size());
 
     logger::info("Graph read");
 }
@@ -502,123 +502,6 @@ std::vector<std::pair<std::string, std::string>> project_bubblegun_pairs_from_do
     return out;
 }
 
-
-// void writeSuperbubbles() {
-//     std::vector<std::pair<std::string, std::string>> res;
-
-//     if (ctx().gfaInput) {
-//         // res = project_bubblegun_pairs_from_doubled();
-
-//         auto has_orient = [](const std::string& s) {
-//             return !s.empty() && (s.back() == '+' || s.back() == '-');
-//         };
-//         auto strip = [](std::string s) {
-//             if (!s.empty()) {
-//                 char c = s.back();
-//                 if (c == '+' || c == '-') s.pop_back();
-//             }
-//             return s;
-//         };
-//         auto invert = [](std::string s) {
-//             if (!s.empty()) {
-//                 char& c = s.back();
-//                 if (c == '+') c = '-';
-//                 else if (c == '-') c = '+';
-//             }
-//             return s;
-//         };
-
-//         for (auto& w : ctx().superbubbles) {
-//             const std::string sa0 = ctx().node2name[w.first];   // oriented, e.g. "12345+"
-//             const std::string sb0 = ctx().node2name[w.second];  // oriented, e.g. "67890-"
-
-//             // Mirror suppression: keep exactly one representative.
-//             // If source ends with '-', flip to its mirror (!sb0, !sa0) using ORIGINALS (temporaries!).
-//             std::string sa = sa0, sb = sb0;
-//             if (has_orient(sa0) && sa0.back() == '-') {
-//                 const std::string sa_m = invert(sb0);  // !sb0
-//                 const std::string sb_m = invert(sa0);  // !sa0
-//                 sa = sa_m;
-//                 sb = sb_m;
-//             }
-
-//             // Project to segment IDs (drop +/-).
-//             std::string a = strip(sa);
-//             std::string b = strip(sb);
-
-//             if (a == b) continue; // safety: BG won't report self-bubbles
-
-//             // If your output is UNORDERED, keep one canonical ordering:
-//             if (b < a) std::swap(a, b);
-
-//             // IMPORTANT: do NOT dedupe on (a,b); preserve multiplicity.
-//             res.emplace_back(std::move(a), std::move(b));
-//         }
-
-
-
-//         // auto strip = [](std::string s) {
-//         //     if (!s.empty() && (s.back() == '+' || s.back() == '-')) s.pop_back();
-//         //     return s;
-//         // };
-
-//         // auto pair_hash = [](const std::pair<std::string,std::string>& p) -> std::size_t {
-//         //     return std::hash<std::string>{}(p.first) ^ (std::hash<std::string>{}(p.second) << 1);
-//         // };
-
-//         // std::unordered_set<std::pair<std::string,std::string>, decltype(pair_hash)> seen(0, pair_hash);
-
-//         // for (auto &w : ctx().superbubbles) {
-//         //     std::string a = strip(ctx().node2name[w.first]);
-//         //     std::string b = strip(ctx().node2name[w.second]);
-
-//         //     // Canonicalize to unordered pair
-//         //     if (b < a) std::swap(a, b);
-
-//         //     if (seen.insert({a, b}).second) {
-//         //         res.emplace_back(a, b);
-//         //     }
-//         // }
-//     } else {
-//         for(auto &w:ctx().superbubbles) {
-//             res.push_back({ctx().node2name[w.first], ctx().node2name[w.second]});
-//         }
-//     }
-
-
-//     // std::cout << ctx().superbubbles.size() << "\n";
-//     // for(auto &p:ctx().superbubbles) {
-//     //     std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
-//     // }
-
-
-
-//     if(ctx().outputPath == "") {
-//         std::cout << res.size() << "\n";
-//         for(auto &p:res) {
-//             std::cout << p.first << " " << p.second << "\n";
-//         }
-
-//         // std::cout << ctx().superbubbles.size() << "\n";
-//         // for(auto &p:ctx().superbubbles) {
-//         //     std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
-//         // }
-
-
-
-//     } else {
-//         std::ofstream out(ctx().outputPath);
-//         out << res.size() << "\n";
-//         for(auto &p:res) {
-//             out << p.first << " " << p.second << "\n";
-//         }
-//         // std::ofstream out(ctx().outputPath);
-//         // out << ctx().superbubbles.size() << "\n";
-//         // for(auto &p:ctx().superbubbles) {
-//         //     out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
-//         // }
-//     }
-// }
 
 void writeSuperbubbles() {
     std::vector<std::pair<std::string, std::string>> res;

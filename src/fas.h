@@ -30,7 +30,7 @@ class FeedbackArcSet {
 private:
     ogdf::Graph &G;
     enum EdgeType { TREE, BACK, FORWARD, CROSS };
-    void run_fas(ogdf::Graph G, std::vector<ogdf::edge> &result); 
+    void run_fas(const ogdf::Graph &G, std::vector<ogdf::edge> &result); 
     void find_feedback_arcs(std::vector<ogdf::edge> &result, const ogdf::NodeArray<bool> &toRemove);
 public:
     FeedbackArcSet(ogdf::Graph &graph) : G(graph) {}

@@ -5,3 +5,7 @@ build/*
 build_asan/*
 log.log
 src/mainBad.cpp
+debug.out
+diff.py
+dist.py
+out

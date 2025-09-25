@@ -3,6 +3,7 @@
 #include <spdlog/async.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/cfg/env.h> // support SPDLOG_LEVEL env var
 #include <memory>
 
 namespace {
@@ -27,6 +28,8 @@ std::shared_ptr<spdlog::logger> make_default()
 
     lg->set_level(static_cast<spdlog::level::level_enum>(ctx().logLevel));
     spdlog::set_default_logger(lg);
+    // Allow overriding levels via environment, e.g. SPDLOG_LEVEL=off
+    spdlog::cfg::load_env_levels();
     return lg;
 }
 

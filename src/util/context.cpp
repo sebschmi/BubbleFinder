@@ -11,6 +11,7 @@ Context::Context()
     , doubleGraph(false)
     , logLevel(Context::LOG_WARN)
     , timingEnabled(true)
+    , threads(1)
 {}
 
 

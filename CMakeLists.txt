@@ -10,19 +10,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ─────────────────────────── 1. per-config flags ──────────────────────────────
-#set(BASE_FLAGS "-fno-omit-frame-pointer")
+# Global base flags kept minimal for performance; per-config below controls FP
 set(BASE_FLAGS "")
 
-#set(RELEASE_FLAGS      "-O3 -march=native")
-set(RELEASE_FLAGS "-O2 -DNDEBUG -march=native -flto")
+# Highest performance for Release
+set(RELEASE_FLAGS "-O3 -DNDEBUG -DENABLE_PROFILING -march=native -flto")
 
 
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DENABLE_PROFILING -pg" CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS_RELWITHDEBINFO   "-O2 -g -DENABLE_PROFILING -pg" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DENABLE_PROFILING -fno-omit-frame-pointer" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELWITHDEBINFO   "-O2 -g -DENABLE_PROFILING -fno-omit-frame-pointer" CACHE STRING "" FORCE)
 
 
-set(RELWITHDEBINFO_FLAGS "-O2 -g -DENABLE_PROFILING -pg")
-set(DEBUG_FLAGS        "-O0 -g")
+set(RELWITHDEBINFO_FLAGS "-O2 -g -DENABLE_PROFILING -fno-omit-frame-pointer")
+set(DEBUG_FLAGS        "-O0 -g -fno-omit-frame-pointer")
 
 foreach(cfg RELEASE RELWITHDEBINFO DEBUG)
     string(TOUPPER "${cfg}" CFG_UP)
@@ -79,8 +79,11 @@ else()
     message(FATAL_ERROR "No OGDF library target available.")
 endif()
 
-# 3.3 OpenMP
-find_package(OpenMP REQUIRED)
+# 3.3 OpenMP (not used; kept optional if needed later)
+# option(SB_ENABLE_OPENMP "Enable OpenMP" OFF)
+# if(SB_ENABLE_OPENMP)
+#     find_package(OpenMP REQUIRED)
+# endif()
 
 # ─────────────────────────── 4. sub-projects (your libs) ──────────────────────
 add_subdirectory(src/util)   # ⇒ target sbutil
@@ -94,13 +97,13 @@ target_link_libraries(sbfind PRIVATE
     sbio sbutil
     ${OGDF_LIB}
     spdlog::spdlog_header_only
-    OpenMP::OpenMP_CXX
 )
 
 # ─────────────────────────── 6. enable LTO if supported ───────────────────────
+option(SB_ENABLE_LTO "Enable Link Time Optimization (IPO)" ON)
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ipo_ok OUTPUT ipo_err)
-if(ipo_ok AND NOT SB_ENABLE_SANITIZERS)          # LTO + ASan = pain
+if(SB_ENABLE_LTO AND ipo_ok AND NOT SB_ENABLE_SANITIZERS)          # LTO + ASan = pain
     foreach(t sbfind sbio sbutil ${OGDF_LIB})
         set_property(TARGET ${t} PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     endforeach()

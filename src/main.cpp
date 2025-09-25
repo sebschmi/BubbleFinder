@@ -26,8 +26,11 @@
 #include <chrono>
 #include <regex>
 #include <cassert>
-#include <omp.h>
 #include <typeinfo>
+#include <thread>
+#include <mutex>
+#include <cstdlib>
+#include <numeric>
 
 #include "io/graph_io.hpp"
 #include "util/timer.hpp"
@@ -72,8 +75,10 @@ void readArgs(int argc, char** argv) {
             C.gfaInput = true;
 
         } else if (s == "-h" || s == "--help") {
-            usage(argv[0]);            // exits
+            usage(argv[0]);
 
+        } else if(s == "-j") {
+            C.threads = std::stoi(nextArgOrDie(args, i, "-j"));
         } else {
             std::cerr << "Unknown argument: " << s << "\n";
             usage(argv[0]);
@@ -122,9 +127,11 @@ namespace solver {
         ogdf::node bNode {nullptr};
 
 
-        ogdf::NodeArray<int> isCutNode;
         ogdf::NodeArray<int> inDeg;
         ogdf::NodeArray<int> outDeg;
+        // Cached global degrees (per block node) to avoid random access into global NodeArrays
+        ogdf::NodeArray<int> globIn;
+        ogdf::NodeArray<int> globOut;
     
         BlockData() {}
     };
@@ -177,8 +184,8 @@ namespace solver {
         // If a thread-local collector is active, defer committing and just record the candidate
         if (tls_superbubble_collector) {
             tls_superbubble_collector->emplace_back(source, sink);
-            return;
-        }
+                return;
+            }
         // Otherwise, commit directly to global state (sequential behavior)
         tryCommitSuperbubble(source, sink);
 
@@ -362,7 +369,7 @@ namespace solver {
             node parent = nullptr,
             edge e = nullptr 
         ) {
-            PROFILE_FUNCTION();
+            //PROFILE_FUNCTION();
             if(curr == nullptr) {
                 curr = spqr.rootNode();
                 parent = curr;
@@ -387,7 +394,7 @@ namespace solver {
         // process edge in the direction of parent to child
         // Computing A->B (curr_edge)
         void processEdge(ogdf::edge curr_edge, ogdf::EdgeArray<EdgeDP> &dp, NodeArray<NodeDPState> &node_dp, const CcData &cc, BlockData &blk) {
-            PROFILE_FUNCTION();
+            //PROFILE_FUNCTION();
             auto& C = ctx();
 
             const ogdf::NodeArray<int> &globIn  = C.inDeg;
@@ -419,9 +426,12 @@ namespace solver {
             for (node v : skelGraph.nodes) newToSkel[skelToNew[v]] = v;
 
 
+            {
+                //PROFILE_BLOCK("processNode:: map block to skeleton nodes");
             for (ogdf::node h : skelGraph.nodes) {
-                ogdf::node vCc = skel.original(h);
-                blk.blkToSkel[vCc] = h;
+                    ogdf::node vB = skel.original(h);
+                    blk.blkToSkel[vB] = h;
+                }
             }
 
             
@@ -544,31 +554,31 @@ namespace solver {
                 // ogdf::node nS = mapGlobalToNew(child.s);
                 // ogdf::node nT = mapGlobalToNew(child.t);
 
-                ogdf::node nS = skelToNew[blk.blkToSkel[child.s]];
-                ogdf::node nT = skelToNew[blk.blkToSkel[child.t]];
+                ogdf::node nA = skelToNew[blk.blkToSkel[child.s]];
+                ogdf::node nB = skelToNew[blk.blkToSkel[child.t]];
                 
 
                 
 
                 if(dir==1) {
-                    newGraph.newEdge(nS, nT);
+                    newGraph.newEdge(nA, nB);
                 } else if(dir==-1) {
-                    newGraph.newEdge(nT, nS);
+                    newGraph.newEdge(nB, nA);
                 } 
 
 
-                if(nS == nU && nT == nV) {
-                    localOutDeg[nS]+=child.localOutS; 
-                    localInDeg[nS]+=child.localInS;
+                if(nA == nU && nB == nV) {
+                    localOutDeg[nA]+=child.localOutS;
+                    localInDeg[nA]+=child.localInS;
 
-                    localOutDeg[nT]+=child.localOutT;
-                    localInDeg[nT]+=child.localInT;
+                    localOutDeg[nB]+=child.localOutT;
+                    localInDeg[nB]+=child.localInT;
                 } else {
-                    localOutDeg[nT]+=child.localOutT; 
-                    localInDeg[nT]+=child.localInT;
+                    localOutDeg[nB]+=child.localOutT; 
+                    localInDeg[nB]+=child.localInT;
 
-                    localOutDeg[nS]+=child.localOutS;
-                    localInDeg[nS]+=child.localInS;
+                    localOutDeg[nA]+=child.localOutS;
+                    localInDeg[nA]+=child.localInS;
                 }
 
 
@@ -690,7 +700,7 @@ namespace solver {
 
 
         void processNode(node curr_node, EdgeArray<EdgeDP> &edge_dp, NodeArray<NodeDPState> &node_dp, const CcData &cc, BlockData &blk) {
-            PROFILE_FUNCTION();
+            //PROFILE_FUNCTION();
             auto& C = ctx();
 
             const ogdf::NodeArray<int> &globIn  = C.inDeg;
@@ -718,8 +728,8 @@ namespace solver {
             for (node v : skelGraph.nodes) newToSkel[skelToNew[v]] = v;
 
             for (ogdf::node h : skelGraph.nodes) {
-                ogdf::node vCc = skel.original(h);
-                blk.blkToSkel[vCc] = h;
+                ogdf::node vB = skel.original(h);
+                blk.blkToSkel[vB] = h;
             }
 
             
@@ -785,6 +795,8 @@ namespace solver {
 
 
             // Building new graph
+            {
+                //PROFILE_BLOCK("processNode:: build oriented local graph");
             for(edge e : skelGraph.edges) {
                 node u = e->source();
                 node v = e->target();
@@ -874,13 +886,16 @@ namespace solver {
                     localOutDeg[nS]+=child->localOutS;
                     localInDeg[nS]+=child->localInS;
                 }
+                }
             }
 
         
 
+            {
+                //PROFILE_BLOCK("processNode:: mark source/sink and leakage");
             for(node vN : newGraph.nodes) {
                 node vG = mapNewToGlobal(vN);
-                node vB = skel.original(newToSkel[vN]);
+                    // node vB = skel.original(newToSkel[vN]);
                 if(globIn[vG] == 0 || globOut[vG] == 0) {
                     localSourceSinkCount++;
                     isSourceSink[vN] = true;
@@ -889,12 +904,14 @@ namespace solver {
                 if(globIn[vG] != localInDeg[vN] || globOut[vG] != localOutDeg[vN]) {
                     localLeakageCount++;
                     isLeaking[vN] = true;
+                    }
                 }
             }
 
 
             // calculating ingoing dp states of direct st and ts edges in P node
             if (spqr.typeOf(A) == StaticSPQRTree::NodeType::PNode) {
+                //PROFILE_BLOCK("processNode:: P-node direct edge analysis");
                 node pole0Blk = nullptr, pole1Blk = nullptr;
                 {
                     auto it = skelGraph.nodes.begin();
@@ -947,6 +964,7 @@ namespace solver {
 
             // Computing acyclicity
             if(curr_state.outgoingCyclesCount>=2) {
+                //PROFILE_BLOCK("processNode:: acyclicity - multi-outgoing case");
                 for(edge e : virtualEdges) {
                     if(edgeToDp[e]->acyclic) {
                         node_dp[edgeChild[e]].outgoingCyclesCount++;
@@ -955,6 +973,7 @@ namespace solver {
                     edgeToDp[e]->acyclic &= false;
                 }
             } else if(node_dp[curr_node].outgoingCyclesCount == 1) {
+                //PROFILE_BLOCK("processNode:: acyclicity - single-outgoing case");
                 for (edge e : virtualEdges) {
                     if(edgeChild[e] != curr_state.lastCycleNode) {
                         if(edgeToDp[e]->acyclic) {
@@ -989,6 +1008,7 @@ namespace solver {
                 }
 
             } else {
+                //PROFILE_BLOCK("processNode:: acyclicity - FAS baseline");
 
                 FeedbackArcSet FAS(newGraph);
                 std::vector<edge> fas = FAS.run();
@@ -1057,6 +1077,8 @@ namespace solver {
 
 
             // computing global sources/sinks
+            {
+                //PROFILE_BLOCK("processNode:: compute global source/sink");
             if(curr_state.outgoingSourceSinkCount >= 2) {
                 // all ingoing have source
                 for(edge e : virtualEdges) {
@@ -1103,11 +1125,14 @@ namespace solver {
                         edgeToDp[e]->globalSourceSink |= true;
                     }
                     
+                    }
                 }
             }
 
 
             // computing leakage
+            {
+                //PROFILE_BLOCK("processNode:: compute leakage");
             if(curr_state.outgoingLeakageCount >= 2) {
                 for(edge e : virtualEdges) {
                     // if(!isVirtual[e]) continue;
@@ -1151,12 +1176,15 @@ namespace solver {
                             node_dp[edgeChild[e]].lastLeakageNode = curr_node;
                         }
                         edgeToDp[e]->hasLeakage |= true;
+                        }
                     }
                 }
             }
 
 
             // updating local degrees of poles of states going into A
+            {
+                //PROFILE_BLOCK("processNode:: update DP local degrees at poles");
             for(edge e:virtualEdges) {
                 // if(!isVirtual[e]) continue;
                 node vN = e->source();
@@ -1170,6 +1198,7 @@ namespace solver {
 
                 BA->localOutS = localOutDeg[mapBlockToNew(BA->s)] - AB->localOutS; 
                 BA->localOutT = localOutDeg[mapBlockToNew(BA->t)] - AB->localOutT; 
+                }
             }
         }
 
@@ -1401,7 +1430,10 @@ namespace solver {
             bool noGSource = !curr.globalSourceSink;
 
 
-            if (acyclic &&
+
+            if (
+                !additionalCheck &&
+                acyclic &&
                 noGSource &&
                 noLeakage &&
                 backGood &&
@@ -1428,7 +1460,7 @@ namespace solver {
 
 
         void collectSuperbubbles(const CcData &cc, const BlockData &blk, EdgeArray<EdgeDP> &edge_dp, NodeArray<NodeDPState> &node_dp) {
-            PROFILE_FUNCTION();
+            //PROFILE_FUNCTION();
             const Graph &T = blk.spqr->tree();
             // printAllStates(edge_dp, node_dp, T);
 
@@ -1465,10 +1497,12 @@ namespace solver {
 
     void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)    
     {
-        PROFILE_FUNCTION();
+        //PROFILE_FUNCTION();
+        auto start = std::chrono::high_resolution_clock::now();
         auto &C      = ctx();
         const Graph &G = *blk.Gblk;
 
+        auto step1 = std::chrono::high_resolution_clock::now();
         node src=nullptr, snk=nullptr;
 
         for (node v : G.nodes) {
@@ -1478,12 +1512,6 @@ namespace solver {
 
             bool isSrc = (inL  == 0 && outL == outG);
             bool isSnk = (outL == 0 && inL == inG);
-
-
-            // std::cout << ctx().node2name[vG] << ": " << (isSrc) << ", " << (isSnk) << std::endl;
-            // std::cout << "IN: " << inL << " out of " << inG << std::endl;
-            // std::cout << "OUT: " << inL << " out of " << inG << std::endl;
-            
 
             if (isSrc ^ isSnk) {
                 if (isSrc) { 
@@ -1497,14 +1525,16 @@ namespace solver {
                 return;
             }
         }
-        // std::cout << std::endl;
 
+        auto step2 = std::chrono::high_resolution_clock::now();
         if (!src || !snk) { return; }
 
+        auto step3 = std::chrono::high_resolution_clock::now();
         if (!isAcyclic(G)) { 
             return;
         }
 
+        auto step4 = std::chrono::high_resolution_clock::now();
         // reachability
         NodeArray<bool> vis(G,false); std::stack<node> S; vis[src]=true; S.push(src);
         bool reach=false;
@@ -1517,10 +1547,31 @@ namespace solver {
                                 vis[v]=true; S.push(v);}
                 }
         }
+        auto step5 = std::chrono::high_resolution_clock::now();
         if(!reach) { return; }
 
         node srcG = blk.toOrig[src], snkG = blk.toOrig[snk];
         addSuperbubble(srcG, snkG);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        // Debug slow checkBlockByCutVertices calls
+        auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        // if (totalDuration.count() > 5000) { // > 5ms
+        //     auto step1Duration = std::chrono::duration_cast<std::chrono::microseconds>(step2 - step1);
+        //     auto step2Duration = std::chrono::duration_cast<std::chrono::microseconds>(step3 - step2);
+        //     auto step3Duration = std::chrono::duration_cast<std::chrono::microseconds>(step4 - step3);
+        //     auto step4Duration = std::chrono::duration_cast<std::chrono::microseconds>(step5 - step4);
+        //     auto step5Duration = std::chrono::duration_cast<std::chrono::microseconds>(end - step5);
+            
+        //     std::cout << "SLOW checkBlockByCutVertices: " << totalDuration.count() << "μs total" << std::endl;
+        //     std::cout << "  - Find src/snk: " << step1Duration.count() << "μs" << std::endl;
+        //     std::cout << "  - Check src/snk: " << step2Duration.count() << "μs" << std::endl;
+        //     std::cout << "  - isAcyclic: " << step3Duration.count() << "μs" << std::endl;
+        //     std::cout << "  - Reachability: " << step4Duration.count() << "μs" << std::endl;
+        //     std::cout << "  - Add superbubble: " << step5Duration.count() << "μs" << std::endl;
+        //     std::cout << "  - Graph size: " << G.numberOfNodes() << " nodes, " << G.numberOfEdges() << " edges" << std::endl;
+        // }
     }
 
 
@@ -1529,10 +1580,16 @@ namespace solver {
 
 
     void solveSPQR(BlockData &blk, const CcData &cc) {
-        PROFILE_FUNCTION();
+        //PROFILE_FUNCTION();
+        // SPQR tree is now built in buildBlockDataParallel, so just use it
+        if (!blk.spqr || blk.Gblk->numberOfNodes() < 3) {
+            return; // No SPQR tree needed for small blocks
+        }
+        
         auto T = blk.spqr->tree();
 
-        GraphIO::drawGraph(T, "spqrTree");
+        // Disabled in parallel mode to avoid file write races
+        // GraphIO::drawGraph(T, "spqrTree");
 
         EdgeArray<SPQRsolve::EdgeDP> dp(T);
         NodeArray<SPQRsolve::NodeDPState> node_dp(T);
@@ -1567,7 +1624,7 @@ namespace solver {
 
 
     void findMiniSuperbubbles() {
-        PROFILE_FUNCTION();
+        //PROFILE_FUNCTION();
         // TIME_BLOCK("Finding mini-superbubbles");
 
         auto& C = ctx();
@@ -1608,36 +1665,30 @@ namespace solver {
             const std::unordered_set<node> &verts,
             CcData& cc,
             BlockData& blk) {        
-        PROFILE_FUNCTION();
+        //PROFILE_FUNCTION();
 
         {
-            PROFILE_BLOCK("buildBlockData:: create clear graph");
+            //PROFILE_BLOCK("buildBlockData:: create clear graph");
             blk.Gblk = std::make_unique<Graph>();
         }
-        // NodeArray<node> toCc  {*blk.Gblk};
-        // NodeArray<node> toOrig{*blk.Gblk};
-        // NodeArray<int>  inDeg {*blk.Gblk};
-        // NodeArray<int>  outDeg{*blk.Gblk};
 
         {
-            PROFILE_BLOCK("buildBlockData:: blk mappings inits");
+            //PROFILE_BLOCK("buildBlockData:: blk mappings inits");
 
             blk.toOrig.init(*blk.Gblk, nullptr);
             blk.toCc.init(*blk.Gblk, nullptr);
             blk.inDeg.init(*blk.Gblk, 0);
             blk.outDeg.init(*blk.Gblk, 0);
-            blk.isCutNode.init(*blk.Gblk, false);
         }
 
-
-        std::unordered_map<node, node> cc_to_blk;
+        // Use array mapping instead of hash map for speed
+        NodeArray<node> cc_to_blk(*cc.Gcc, nullptr);
 
         {
-            PROFILE_BLOCK("buildBlockData:: create nodes in Gblk");
+            //PROFILE_BLOCK("buildBlockData:: create nodes in Gblk");
 
             for (node vCc : verts) {
                 node vB = blk.Gblk->newNode();
-                // cc.toBlk[vCc] = vB;
                 cc_to_blk[vCc] = vB;
                 blk.toCc[vB] = vCc;
                 blk.toOrig[vB] = cc.toOrig[vCc];
@@ -1645,23 +1696,132 @@ namespace solver {
         }
 
         {
-            PROFILE_BLOCK("buildBlockData:: create edges in Gblk");
+            //PROFILE_BLOCK("buildBlockData:: create edges in Gblk");
 
             for (edge hE : cc.bc->hEdges(blk.bNode)) {
                 edge eCc = cc.bc->original(hE);
                 auto src = cc_to_blk[eCc->source()];
                 auto tgt = cc_to_blk[eCc->target()];
+                if (src && tgt) {
+                edge e = blk.Gblk->newEdge(src, tgt);
+                blk.outDeg[e->source()]++;
+                blk.inDeg[e->target()]++;
+                }
+            }
+        }
+
+        // Defer SPQR building to solveSPQR (lazy), avoids contention in parallel build phase
+    }
+
+    // New: faster variant taking precomputed vector of vertices (sorted unique)
+    static void buildBlockData(
+            const std::vector<node> &verts,
+            CcData& cc,
+            BlockData& blk) {
+        blk.Gblk = std::make_unique<Graph>();
+
+        blk.toOrig.init(*blk.Gblk, nullptr);
+        blk.toCc.init(*blk.Gblk, nullptr);
+        blk.inDeg.init(*blk.Gblk, 0);
+        blk.outDeg.init(*blk.Gblk, 0);
+
+        NodeArray<node> cc_to_blk(*cc.Gcc, nullptr);
+
+        for (node vCc : verts) {
+            node vB = blk.Gblk->newNode();
+            cc_to_blk[vCc] = vB;
+            blk.toCc[vB] = vCc;
+            blk.toOrig[vB] = cc.toOrig[vCc];
+        }
+
+        for (edge hE : cc.bc->hEdges(blk.bNode)) {
+            edge eCc = cc.bc->original(hE);
+            node src = cc_to_blk[eCc->source()];
+            node tgt = cc_to_blk[eCc->target()];
+            if (src && tgt) {
                 edge e = blk.Gblk->newEdge(src, tgt);
                 blk.outDeg[e->source()]++;
                 blk.inDeg[e->target()]++;
             }
         }
+    }
+
+    // Parallel version of buildBlockData that parallelizes internal operations
+    static void buildBlockDataParallel(CcData& cc, BlockData& blk) {
+        //PROFILE_FUNCTION();
+        {
+            PROFILE_BLOCK("buildBlockDataParallel:: all but SPQR and parent");
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: create clear graph");
+                blk.Gblk = std::make_unique<Graph>();
+            }
+
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: blk mappings inits");
+                blk.toOrig.init(*blk.Gblk, nullptr);
+                blk.toCc.init(*blk.Gblk, nullptr);
+                blk.inDeg.init(*blk.Gblk, 0);
+                blk.outDeg.init(*blk.Gblk, 0);
+            }
+
+
+            std::unordered_set<node> verts;
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: collect vertices");
+                for (edge hE : cc.bc->hEdges(blk.bNode)) {
+                    edge eC = cc.bc->original(hE);
+                    verts.insert(eC->source());
+                    verts.insert(eC->target());
+                }
+            }
+
+            std::unordered_map<node, node> cc_to_blk;
+            cc_to_blk.reserve(verts.size());
+
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: create nodes in Gblk");
+                for (node vCc : verts) {
+                    node vB = blk.Gblk->newNode();
+                    cc_to_blk[vCc] = vB;
+                    blk.toCc[vB] = vCc;
+                    node vG = cc.toOrig[vCc];
+                    blk.toOrig[vB] = vG;
+                }
+            }
+
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: create edges in Gblk");
+                for (edge hE : cc.bc->hEdges(blk.bNode)) {
+                    edge eCc = cc.bc->original(hE);
+                    auto srcIt = cc_to_blk.find(eCc->source());
+                    auto tgtIt = cc_to_blk.find(eCc->target());
+                    if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end()) {
+                        edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
+                        blk.outDeg[e->source()]++;
+                        blk.inDeg[e->target()]++;
+                    }
+                }
+            }
+
+
+            {
+                //PROFILE_BLOCK("buildBlockDataParallel:: init cached global degrees");
+                blk.globIn.init(*blk.Gblk, 0);
+                blk.globOut.init(*blk.Gblk, 0);
+                for (node vB : blk.Gblk->nodes) {
+                    node vG = blk.toOrig[vB];
+                    blk.globIn[vB] = ctx().inDeg[vG];
+                    blk.globOut[vB] = ctx().outDeg[vG];
+                }
+            }
+        }
 
         if (blk.Gblk->numberOfNodes() >= 3) {
-            PROFILE_BLOCK("buildBlockData:: spqr building and parent");
-
-            blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
-
+            PROFILE_BLOCK("buildBlockDataParallel:: spqr building and parent");
+            {
+                PROFILE_BLOCK("buildBlockDataParallel:: build SPQR tree");
+                blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
+            }
             const Graph& T = blk.spqr->tree();
             blk.skel2tree.reserve(2*T.edges.size());
             blk.parent.init(T, nullptr);
@@ -1670,7 +1830,6 @@ namespace solver {
             blk.parent[root] = root;
 
             for (edge te : T.edges) {
-
                 {
                     node u = te->source();
                     node v = te->target();
@@ -1692,20 +1851,20 @@ namespace solver {
 
     // BEST NOW
     void solveStreaming() {
-        PROFILE_FUNCTION();
+        //PROFILE_FUNCTION();
         auto& C = ctx();
         Graph& G = C.G;
 
         NodeArray<int> compIdx(G);
         int nCC;
         {
-            PROFILE_BLOCK("solveStreaming:: ComputeCC");
+            //PROFILE_BLOCK("solveStreaming:: ComputeCC");
             nCC = connectedComponents(G, compIdx);
         }
 
         std::vector<std::vector<node>> bucket(nCC);
         {
-            PROFILE_BLOCK("solveStreaming:: bucket nodes");
+            //PROFILE_BLOCK("solveStreaming:: bucket nodes");
             for (node v : G.nodes) {
                 bucket[compIdx[v]].push_back(v);
             }
@@ -1714,7 +1873,7 @@ namespace solver {
         std::vector<std::vector<edge>> edgeBuckets(nCC);
 
         {
-            PROFILE_BLOCK("solveStreaming:: bucket edges");
+            //PROFILE_BLOCK("solveStreaming:: bucket edges");
             for (edge e : G.edges) {
                 edgeBuckets[compIdx[e->source()]].push_back(e);
             }
@@ -1725,145 +1884,322 @@ namespace solver {
 
 
         logger::info("Streaming over {} components", nCC);
-        CcData cc;
-        // cc.toCopy.init(G, nullptr);
 
-        int totalSizes = 0;
+        
+        std::vector<std::unique_ptr<CcData>> components(nCC);
+        std::vector<std::unique_ptr<BlockData>> allBlockData; 
+        
+        struct WorkItem {
+            CcData* cc;
+            BlockData* blockData;
+            node bNode;
+        };
+        std::vector<WorkItem> workItems;
 
+        struct BlockPrep {
+            CcData* cc;
+            node bNode;
+        };
+        std::vector<BlockPrep> blockPreps;
 
-        for (int cid = 0; cid < nCC; ++cid) {
-            {
-                {
-                    PROFILE_BLOCK("solveStreaming:: rebuild cc graph");
+        {
+            TIME_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
+            PROFILE_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
+
+            size_t numThreads = std::thread::hardware_concurrency();
+            numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
+            std::vector<std::thread> workers;
+            workers.reserve(numThreads);
+
+            // std::cout << "Using " << numThreads << " threads for component building" << std::endl;
+
+            std::mutex workMutex;
+            size_t nextIndex = 0;
+
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                workers.emplace_back([&, tid]() {
+                    size_t chunkSize = std::max<size_t>(1, nCC / (numThreads * 4));
+                    size_t processed = 0;
+                    while (true) {
+                        size_t startIndex, endIndex;
+                        {
+                            std::lock_guard<std::mutex> lock(workMutex);
+                            if (nextIndex >= static_cast<size_t>(nCC)) break;
+                            startIndex = nextIndex;
+                            endIndex = std::min(nextIndex + chunkSize, static_cast<size_t>(nCC));
+                            nextIndex = endIndex;
+                        }
+
+                        for (size_t ci = startIndex; ci < endIndex; ++ci) {
+                            int cid = static_cast<int>(ci);
+                            auto cc = std::make_unique<CcData>();
+
+                            // Build component graph
+                            {
+                                PROFILE_BLOCK("solveStreaming:: rebuild cc graph");
+                                cc->Gcc = std::make_unique<Graph>();
+                                cc->toOrig.init(*cc->Gcc, nullptr);
             
-                    cc.Gcc = std::make_unique<Graph>();
-                    cc.toOrig.init(*cc.Gcc, nullptr);
+                                // Local mapping from original nodes to component nodes
+                                std::unordered_map<node, node> orig_to_cc_local;
+                                orig_to_cc_local.reserve(bucket[cid].size());
 
-                    for (node vG : bucket[cid]) {
-                        node vC = cc.Gcc->newNode();
-                        // cc.toCopy[vG] = vC;
-                        cc.toOrig[vC] = vG;
-                        orig_to_cc[vG] = vC;
+                                for (node vG : bucket[cid]) {
+                                    node vC = cc->Gcc->newNode();
+                                    cc->toOrig[vC] = vG;
+                                    orig_to_cc_local[vG] = vC;
+                                }
+
+                                for (edge e : edgeBuckets[cid]) {
+                                        cc->Gcc->newEdge(orig_to_cc_local[e->source()], orig_to_cc_local[e->target()]);
+                                }
+                            }
+
+                            components[cid] = std::move(cc);
+                            
+                            processed++;
+                        }
+
+                        if (chunkSize < 10) {
+                            chunkSize = std::min(chunkSize * 2, static_cast<size_t>(nCC / numThreads));
+                        }
                     }
+                    std::cout << "Thread " << tid << " built " << processed << " components (Gcc)" << std::endl;
+                });
+            }
 
-                    for (edge e : edgeBuckets[cid]) {
-                        cc.Gcc->newEdge(orig_to_cc[e->source()], orig_to_cc[e->target()]);
-                    }
-                }
+            for (auto &t : workers) t.join();
+        }
 
+        {
+            TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
+            PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
+
+            for (int cid = 0; cid < nCC; ++cid) {
+                auto *cc = components[cid].get();
                 {                    
                     PROFILE_BLOCK("solveStreaming:: building bc tree");
-                    cc.bc = std::make_unique<BCTree>(*cc.Gcc);
-                }
-                
-            }
-
-
-            std::vector<node> bNodes;
-            bNodes.reserve(cc.bc->bcTree().numberOfNodes());
-            for (node v : cc.bc->bcTree().nodes) {
-                if (cc.bc->typeOfBNode(v) == BCTree::BNodeType::BComp)
-                    bNodes.push_back(v);
-            }
-
-
-            // Collect candidates per B-node; commit them after the loop in a deterministic order
-                std::vector<std::vector<std::pair<node, node>>> perNodeCandidates(bNodes.size());
-
-            {
-                PROFILE_BLOCK("solveStreaming:: collect candidates per B-node");
-                //#pragma omp parallel for schedule(guided,8) if(bNodes.size() > 1)
-                #pragma omp parallel for
-                for (size_t i = 0; i < bNodes.size(); i++) {
-                    PROFILE_BLOCK("solveStreaming:: process B-node");
-                    node bNode = bNodes[i];
-
-                    std::unordered_set<node> verts;
-                    for (edge hE : cc.bc->hEdges(bNode)) {
-                        edge eC = cc.bc->original(hE);
-                        verts.insert(eC->source());
-                        verts.insert(eC->target());
-                    }
-
-                    BlockData blk;
-                    blk.bNode = bNode;
-
-                    std::vector<std::pair<node, node>> localCandidates;
-                    localCandidates.reserve(8);
-                    tls_superbubble_collector = &localCandidates;
-
-                    buildBlockData(verts, cc, blk);
-                    checkBlockByCutVertices(blk, cc);
-
-                    if (blk.Gblk->numberOfNodes() >= 3) {
-                        solveSPQR(blk, cc);
-                    }
-
-                    tls_superbubble_collector = nullptr;
-                    perNodeCandidates[i] = std::move(localCandidates);
-
-
-                    //if((i+1)%1000 == 0) logger::info("Processed block {}/{}\n", i+1, bNodes.size());
-
-
+                    cc->bc = std::make_unique<BCTree>(*cc->Gcc);
                 }
 
-            }
-
-            {
-                PROFILE_BLOCK("solveStreaming:: commit collected candidates");
-                // Commit collected candidates
-                for (size_t i = 0; i < perNodeCandidates.size(); ++i) {
-                    totalSizes += perNodeCandidates[i].size();
-                    for (const auto &p : perNodeCandidates[i]) {
-                        tryCommitSuperbubble(p.first, p.second);
+                {
+                    PROFILE_BLOCK("solveStreaming:: collect bc tree nodes");
+                    for (node v : cc->bc->bcTree().nodes) {
+                        if (cc->bc->typeOfBNode(v) == BCTree::BNodeType::BComp) {
+                            blockPreps.push_back({cc, v});
+                        }
                     }
                 }
             }
-
-
-            // NodeArray<node> toBlk(*cc.Gcc, nullptr);
-            // cc.toBlk = toBlk;
-            // std::unordered_set<node> verts;
-            // for (node bNode : cc.bc->bcTree().nodes) {
-            //     if (cc.bc->typeOfBNode(bNode) != BCTree::BNodeType::BComp)
-            //         continue;
-
-            //     verts.clear();
-            //     // std::vector<node> verts;
-            //     // std::unordered_set<node> verts_set;
-
-            //     for (edge hE : cc.bc->hEdges(bNode)) {
-            //         edge eC = cc.bc->original(hE);
-            //         verts.insert(eC->source());
-            //         verts.insert(eC->target());
-            //     }
-
-            //     BlockData blk;
-            //     blk.bNode = bNode;
-
-                
-            //     buildBlockData(verts, cc, blk);
-
-            //     checkBlockByCutVertices(blk, cc);
-
-            //     if (blk.Gblk->numberOfNodes() >= 3) {
-            //         // try {
-            //             solveSPQR(blk, cc);
-            //         // } catch (const std::exception& e) {
-            //         //     logger::error("SPQR processing failed: {}", e.what());
-            //         // }
-            //     }
-
-            //     blk.Gblk.reset();
-            //     blk.spqr.reset();
-            // }
-
-
-
-            if((cid+1)%1 == 0) logger::info("Processed component {}/{}\n", cid+1, nCC);
         }
-        std::cout << totalSizes << " total superbubbles found\n";
+
+        // Phase 3: Build BlockData in parallel for all collected blocks
+        allBlockData.resize(blockPreps.size());
+        {
+            TIME_BLOCK("solveStreaming:: build BlockData in parallel (global)");
+            PROFILE_BLOCK("solveStreaming:: build BlockData in parallel (global)");
+
+            size_t numThreads = std::thread::hardware_concurrency();
+            numThreads = std::min({(size_t)C.threads, (size_t)blockPreps.size(), numThreads});
+            std::vector<std::thread> workers;
+            workers.reserve(numThreads);
+
+            std::mutex workMutex;
+            size_t nextIndex = 0;
+
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                workers.emplace_back([&, tid]() {
+                    size_t chunkSize = std::max<size_t>(1, blockPreps.size() / (numThreads * numThreads));
+                    size_t processed = 0;
+                    while (true) {
+                        size_t startIndex, endIndex;
+                        {
+                            std::lock_guard<std::mutex> lock(workMutex);
+                            if (nextIndex >= blockPreps.size()) break;
+                            startIndex = nextIndex;
+                            endIndex = std::min(nextIndex + chunkSize, blockPreps.size());
+                            nextIndex = endIndex;
+                        }
+
+                        for (size_t i = startIndex; i < endIndex; ++i) {
+                            const auto &bp = blockPreps[i];
+
+                            allBlockData[i] = std::make_unique<BlockData>();
+                            allBlockData[i]->bNode = bp.bNode;
+
+                            {
+                                PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
+                                buildBlockDataParallel(*bp.cc, *allBlockData[i]);
+                            }
+
+                            processed++;
+                        }
+
+                        if (chunkSize < 10) {
+                            chunkSize = std::min(chunkSize * 2, static_cast<size_t>(blockPreps.size() / numThreads));
+                        }
+                    }
+                    std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
+                });
+            }
+
+            for (auto &t : workers) t.join();
+
+            workItems.reserve(workItems.size() + allBlockData.size());
+            for (size_t i = 0; i < allBlockData.size(); ++i) {
+                workItems.push_back({blockPreps[i].cc, allBlockData[i].get(), blockPreps[i].bNode});
+            }
+        }
+
+        {
+            TIME_BLOCK("solveStreaming:: sort work items by block edges");
+            PROFILE_BLOCK("solveStreaming:: sort work items by block edges");
+            std::sort(workItems.begin(), workItems.end(), [](const WorkItem &a, const WorkItem &b) {
+                const int ea = a.cc->bc->numberOfEdges(a.bNode);
+                const int eb = b.cc->bc->numberOfEdges(b.bNode);
+                return ea > eb;
+            });
+        }
+
+        std::cout << "Built " << components.size() << " components and " << allBlockData.size() << " blocks" << std::endl;
+        std::cout << "Collected " << workItems.size() << " work items" << std::endl;
+
+
+
+        std::vector<std::vector<std::pair<node, node>>> blockResults(workItems.size());
+        {
+            TIME_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
+            PROFILE_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
+            
+            size_t numThreads = std::thread::hardware_concurrency();
+            numThreads = std::min({(size_t)C.threads, (size_t)workItems.size(), numThreads});
+            std::vector<std::thread> workers;
+            workers.reserve(numThreads);
+            
+            std::mutex workMutex;
+            std::mutex debugMutex;
+            size_t nextWorkIndex = 0;
+            
+            std::cout << "Processing " << workItems.size() << " work items with " << numThreads << " threads" << std::endl;
+            
+            auto phaseStart = std::chrono::high_resolution_clock::now();
+            std::vector<std::chrono::high_resolution_clock::time_point> threadLastWork(numThreads);
+            std::vector<size_t> threadWorkCounts(numThreads, 0);
+            std::vector<size_t> threadWaitCounts(numThreads, 0);
+            
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                workers.emplace_back([&, tid]() {
+                    size_t chunkSize = std::max(workItems.size() / (numThreads * 4), size_t(1));  // Start with larger chunks
+                    auto lastChunkStart = std::chrono::high_resolution_clock::now();
+                    size_t totalProcessed = 0;
+                    
+                    auto threadStart = std::chrono::high_resolution_clock::now();
+                    threadLastWork[tid] = threadStart;
+
+                    while (true) {
+                        size_t startIndex, endIndex;
+                        auto waitStart = std::chrono::high_resolution_clock::now();
+                        {
+                            std::lock_guard<std::mutex> lock(workMutex);
+                            if (nextWorkIndex >= workItems.size()) {
+                                break;  // No more work
+                            }
+                            startIndex = nextWorkIndex;
+                            endIndex = std::min(nextWorkIndex + chunkSize, workItems.size());
+                            nextWorkIndex = endIndex;
+                        }
+                        auto waitEnd = std::chrono::high_resolution_clock::now();
+                        auto waitDuration = std::chrono::duration_cast<std::chrono::microseconds>(waitEnd - waitStart);
+                        if (waitDuration.count() > 100) { // > 0.1ms wait
+                            threadWaitCounts[tid]++;
+                        }
+                        
+                        auto chunkStart = std::chrono::high_resolution_clock::now();
+                        
+                        // Process chunk
+                        for (size_t i = startIndex; i < endIndex; ++i) {
+                            const auto& workItem = workItems[i];
+                            threadLastWork[tid] = std::chrono::high_resolution_clock::now();
+                            tls_superbubble_collector = &blockResults[i];
+
+                            BlockData *blockData = workItem.blockData;
+
+                            auto checkStart = std::chrono::high_resolution_clock::now();
+                            checkBlockByCutVertices(*blockData, *workItem.cc);
+                            auto checkEnd = std::chrono::high_resolution_clock::now();
+
+                            auto spqrStart = std::chrono::high_resolution_clock::now();
+                            if (blockData->Gblk->numberOfNodes() >= 3) {
+                                solveSPQR(*blockData, *workItem.cc);
+                            }
+                            auto spqrEnd = std::chrono::high_resolution_clock::now();
+
+                            tls_superbubble_collector = nullptr;
+                            totalProcessed++;
+                            threadWorkCounts[tid]++;
+
+                            auto checkDuration = std::chrono::duration_cast<std::chrono::microseconds>(checkEnd - checkStart);
+                            auto spqrDuration = std::chrono::duration_cast<std::chrono::microseconds>(spqrEnd - spqrStart);
+                            if (checkDuration.count() > 10000 || spqrDuration.count() > 10000) { // > 10ms
+                                std::lock_guard<std::mutex> debugLock(debugMutex);
+                                std::cout << "Thread " << tid << ": Block " << i << " - checkBlock: " << checkDuration.count() 
+                                         << "μs, solveSPQR: " << spqrDuration.count() << "μs" << std::endl;
+                            }
+                        }
+                        
+                        auto chunkEnd = std::chrono::high_resolution_clock::now();
+                        auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
+                        
+                        if (chunkDuration.count() < 100) {
+                            chunkSize = std::min(chunkSize * 2, static_cast<size_t>(workItems.size() / numThreads));
+                        } else if (chunkDuration.count() > 2000) {
+                            chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
+                        }
+                        
+                        // Debug output every 100 items processed
+                        // if (totalProcessed % 100 == 0) {
+                        //     std::cout << "Thread " << tid << " processed " << totalProcessed << " items, chunk size: " << chunkSize << std::endl;
+                        // }
+                        
+                        lastChunkStart = chunkStart;
+                    }
+                    
+                    auto threadEnd = std::chrono::high_resolution_clock::now();
+                    auto threadDuration = std::chrono::duration_cast<std::chrono::milliseconds>(threadEnd - threadStart);
+                    
+                    std::lock_guard<std::mutex> debugLock(debugMutex);
+                    std::cout << "Thread " << tid << " finished: " << totalProcessed << " items in " 
+                             << threadDuration.count() << "ms, " << threadWaitCounts[tid] << " waits" << std::endl;
+                });
+            }
+            
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            
+            // Report thread utilization
+            auto phaseEnd = std::chrono::high_resolution_clock::now();
+            auto phaseDuration = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnd - phaseStart);
+            
+            std::cout << "\nThread Utilization Report:" << std::endl;
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                auto lastWorkDuration = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnd - threadLastWork[tid]);
+                std::cout << "Thread " << tid << ": " << threadWorkCounts[tid] << " items, " 
+                         << threadWaitCounts[tid] << " waits, last work " << lastWorkDuration.count() << "ms ago" << std::endl;
+            }
+            std::cout << "Total phase time: " << phaseDuration.count() << "ms" << std::endl;
+        }
+
+        // Step 5: Commit all results in deterministic order
+        {
+            TIME_BLOCK("solveStreaming:: commit results");
+            PROFILE_BLOCK("solveStreaming:: commit results");
+            for (const auto& candidates : blockResults) {
+                for (const auto& p : candidates) {
+                    tryCommitSuperbubble(p.first, p.second);
+                }
+            }
+        }
     }
 
 
@@ -1871,7 +2207,7 @@ namespace solver {
     void solve() {
         TIME_BLOCK("Finding superbubbles");
         findMiniSuperbubbles();
-        GraphIO::drawGraph(ctx().G, "movedMinis");
+        // GraphIO::drawGraph(ctx().G, "movedMinis");
         solveStreaming();
     }
 }
@@ -1881,13 +2217,18 @@ namespace solver {
 
 
 int main(int argc, char** argv) {
-    PROFILE_BLOCK("Total run");
-    PROFILE_FUNCTION();
+    //PROFILE_BLOCK("Total run");
+    //PROFILE_FUNCTION();
     TIME_BLOCK("Starting graph reading...");
     logger::init();
 
+    
+
     readArgs(argc, argv);
+    {
+        PROFILE_BLOCK("Graph reading");
     GraphIO::readGraph();
+    }
     GraphIO::drawGraph(ctx().G, "input_graph");
 
 
@@ -1916,9 +2257,10 @@ int main(int argc, char** argv) {
         return false;
     });
 
-    
+    {
+        PROFILE_BLOCK("Writing output");
     GraphIO::writeSuperbubbles();
-
+    }
 
     PROFILING_REPORT();
 

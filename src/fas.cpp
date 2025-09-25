@@ -1,6 +1,6 @@
 #include "fas.h"
 
-void FeedbackArcSet::run_fas(ogdf::Graph G, 
+void FeedbackArcSet::run_fas(const ogdf::Graph &G, 
     std::vector<ogdf::edge> &result
 ) {
     ogdf::NodeArray<int>  disc(G, 0), dfsNum(G, 0);
@@ -8,7 +8,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
     ogdf::NodeArray<char> colour(G, 0);
     ogdf::EdgeArray<EdgeType> etype(G);   
     int time = 0, dfsTime=0;
-    std::vector<ogdf::node> dfsNumInverse(G.maxNodeIndex()+1, nullptr);
+    std::vector<ogdf::node> dfsNumInverse(G.numberOfNodes(), nullptr);
     ogdf::edge singleBackEdge = nullptr;
 
     
@@ -81,6 +81,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
             }
         }
     }
+    
 
 
     if(backEdgeCount == 1) {
@@ -100,6 +101,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
     // drawGraph(T, "treeWithTreeEdges");
     ogdf::node z = G.firstNode(); 
     {
+        // PROFILE_BLOCK("FAS::compute deepest back-edge node z");
 
         std::function<void(ogdf::node, ogdf::node)> dfsSubtree = [&](ogdf::node u, ogdf::node prev=nullptr) {
             for (ogdf::adjEntry adj = u->firstAdj(); adj; adj = adj->succ()) {
@@ -158,6 +160,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
 
     // removing [y,z] and checking acyclicity
     {
+        // PROFILE_BLOCK("FAS::remove interval and test acyclicity");
         std::function<bool(ogdf::node)> inInterval = [&](ogdf::node u) -> bool {
             return dfsNum[y] <= dfsNum[u] && dfsNum[u] <= dfsNum[z];
         };
@@ -177,7 +180,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
             Gp.newEdge(map[u], map[v]);
         }
 
-        GraphIO::drawGraph(Gp, "removed_input"+std::to_string(G.nodes.size()));
+        // Removed debug drawing for performance
 
         if(!isAcyclic(Gp)) {
             // std::cout << "Graph without interval is not acylic, so there is no feedback set" << std::endl;
@@ -189,6 +192,7 @@ void FeedbackArcSet::run_fas(ogdf::Graph G,
     ogdf::NodeArray<bool> loop(G, false);
     ogdf::NodeArray<int> maxi(G, 0);
     {
+        // PROFILE_BLOCK("FAS::compute loop and maxi");
         ogdf::NodeArray<int> disc(G), fin(G);
         int time=0;
         std::function<bool(ogdf::node, ogdf::node)> isDescendant = [&](ogdf::node ancestor, ogdf::node v) -> bool {
@@ -388,7 +392,7 @@ void FeedbackArcSet::find_feedback_arcs(
 
 
 std::vector<ogdf::edge> FeedbackArcSet::run() {
-    PROFILE_FUNCTION();
+    // PROFILE_FUNCTION();
 
     ogdf::NodeArray<int> comp(this->G);
     int sccs = strongComponents(this->G, comp);

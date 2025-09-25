@@ -29,6 +29,8 @@ struct Context
     ogdf::NodeArray<bool>             isEntry;
     ogdf::NodeArray<bool>             isExit;
 
+    unsigned threads = 1;
+
     std::unordered_set<std::pair<int,int>, PairHash> _edges;
 
     std::unordered_map<std::string, ogdf::node> name2node;
