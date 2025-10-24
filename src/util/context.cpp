@@ -12,6 +12,9 @@ Context::Context()
     , logLevel(Context::LOG_WARN)
     , timingEnabled(true)
     , threads(1)
+    , bubbleType(Context::BubbleType::SUPERBUBBLE)
+    , _edge2types(G, std::make_pair(EdgePartType::NONE, EdgePartType::NONE))
+    , _goodCutVertices(G, false)
 {}
 
 

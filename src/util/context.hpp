@@ -5,9 +5,12 @@
 #include <unordered_set>
 #include <vector>
 
+enum class EdgePartType { PLUS, MINUS, NONE };
+
 struct Context
 {
     enum LogLevel { LOG_ERROR = 0, LOG_WARN, LOG_INFO, LOG_DEBUG };
+    enum BubbleType { SUPERBUBBLE, SNARL };
 
     struct PairHash {
         std::size_t operator()(const std::pair<int, int>& p) const {
@@ -31,11 +34,23 @@ struct Context
 
     unsigned threads = 1;
 
+    // int type = 0;
+
+    BubbleType bubbleType = SUPERBUBBLE;
+
+    ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> _edge2types; // for bidirected graphs/snarls
+    ogdf::NodeArray<bool> _goodCutVertices; // for bidirected graphs/snarls
+
+
     std::unordered_set<std::pair<int,int>, PairHash> _edges;
 
     std::unordered_map<std::string, ogdf::node> name2node;
     std::unordered_map<ogdf::node,std::string>  node2name;
     std::vector<std::pair<ogdf::node,ogdf::node>> superbubbles;
+
+    std::vector<std::vector<std::string>> snarls;
+    
+
 
     Context();
     Context(const Context&) = delete;

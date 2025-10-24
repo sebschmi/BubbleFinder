@@ -103,8 +103,8 @@ target_link_libraries(sbfind PRIVATE
 option(SB_ENABLE_LTO "Enable Link Time Optimization (IPO)" ON)
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ipo_ok OUTPUT ipo_err)
-if(SB_ENABLE_LTO AND ipo_ok AND NOT SB_ENABLE_SANITIZERS)          # LTO + ASan = pain
-    foreach(t sbfind sbio sbutil ${OGDF_LIB})
+if(SB_ENABLE_LTO AND ipo_ok AND NOT SB_ENABLE_SANITIZERS)
+    foreach(t sbfind sbio sbutil)
         set_property(TARGET ${t} PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     endforeach()
 endif()

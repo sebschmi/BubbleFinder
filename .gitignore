@@ -2,7 +2,7 @@ test/*
 graphs/*
 .vscode/*
 build/*
-build_asan/*
+build-asan/*
 log.log
 src/mainBad.cpp
 debug.out

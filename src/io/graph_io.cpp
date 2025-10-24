@@ -10,13 +10,19 @@
 
 #include "util/logger.hpp"
 
+
 using namespace ogdf;
+
+
 
 namespace GraphIO {
 void readStandard()
 {
     auto &C = ctx();
 
+    if(C.bubbleType == Context::BubbleType::SNARL) {
+        throw std::runtime_error("Standard graph input not supported for snarls, use GFA input");
+    }
     int n, m;
     if (!C.graphPath.empty()) {
         std::ifstream in(C.graphPath);
@@ -96,9 +102,17 @@ void readGFA()
             std::string tok, id, seq;
             iss >> tok >> id >> seq;
             if (id.empty()) continue;
-            have_segment.insert(id);
-            ensure(id + "+");
-            ensure(id + "-");
+
+            if(C.bubbleType == Context::BubbleType::SNARL) {
+                have_segment.insert(id);
+                auto newNode = C.G.newNode();
+                C.name2node[id] = newNode;
+                C.node2name[newNode] = id;
+            } else {
+                have_segment.insert(id);
+                ensure(id + "+");
+                ensure(id + "-");
+            }
             continue;
         }
         if (line[0] == 'L') {
@@ -112,7 +126,6 @@ void readGFA()
 
     auto flip = [](char c){ return c == '+' ? '-' : '+'; };
 
-    // dedup per oriented endpoints AND overlap (mirrors Python's set-of-triples uniqueness)
     struct EdgeKey {
         std::string u, v;
         bool operator==(const EdgeKey& o) const { return  u==o.u && v==o.v; }
@@ -128,10 +141,20 @@ void readGFA()
 
 
 
-    auto add_edge = [&](const std::string& u, const std::string& v){
+    auto add_edge_double = [&](const std::string& u, const std::string& v){
         EdgeKey key{u, v};
         if (seen.insert(key).second) {
             C.G.newEdge(C.name2node[u], C.name2node[v]);
+        }
+    };
+
+    auto add_edge_bidirected = [&](const std::string& u, const std::string& v, EdgePartType t1, EdgePartType t2){
+        EdgeKey key{u, v};
+        if (seen.insert(key).second) {
+            auto e = C.G.newEdge(C.name2node[u], C.name2node[v]);
+            C._edge2types[e] = std::make_pair(t1, t2);
+            // std::cout << "Added " << u << " - " << v <<  (t1 == EdgePartType::PLUS ? "+" : "-") << " - " << (t2 == EdgePartType::PLUS ? "+" : "-") << std::endl;
+
         }
     };
 
@@ -147,20 +170,26 @@ void readGFA()
             continue;
         }
 
-        ensure(from + "+"); ensure(from + "-");
-        ensure(to   + "+"); ensure(to   + "-");
-
-        if (o1=='+' || o1=='-') {
-            if (o2=='+' || o2=='-') {
-                const std::string u1 = from + std::string(1, o1);
-                const std::string v1 = to   + std::string(1, o2);
-                add_edge(u1, v1);
-
-                const std::string u2 = to   + std::string(1, flip(o2));
-                const std::string v2 = from + std::string(1, flip(o1));
-                add_edge(u2, v2);
+        if(C.bubbleType == Context::BubbleType::SUPERBUBBLE) {
+            ensure(from + "+"); ensure(from + "-");
+            ensure(to   + "+"); ensure(to   + "-");
+            if (o1=='+' || o1=='-') {
+                if (o2=='+' || o2=='-') {
+                    const std::string u1 = from + std::string(1, o1);
+                    const std::string v1 = to   + std::string(1, o2);
+                    add_edge_double(u1, v1);
+    
+                    const std::string u2 = to   + std::string(1, flip(o2));
+                    const std::string v2 = from + std::string(1, flip(o1));
+                    add_edge_double(u2, v2);
+                }
             }
+        } else if(C.bubbleType == Context::BubbleType::SNARL) {
+            auto t1 = (o1 == '+' ? EdgePartType::PLUS : EdgePartType::MINUS);
+            auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
+            add_edge_bidirected(from, to, t1, t2);
         }
+
     }
 }
 
@@ -189,7 +218,7 @@ void readGraph() {
     logger::info("Graph read");
 }
 
-void drawGraph(const Graph &G, const std::string &file)
+void drawGraph(const ogdf::Graph &G, const std::string &file)
 {
     return;
     using namespace ogdf;
@@ -354,6 +383,36 @@ std::vector<std::pair<std::string, std::string>> project_bubblegun_pairs_from_do
 
 void writeSuperbubbles() {
     std::vector<std::pair<std::string, std::string>> res;
+
+    if(ctx().bubbleType == Context::BubbleType::SNARL) {
+        if (ctx().outputPath.empty()) {
+            std::cout << ctx().snarls.size() << "\n";
+            for (auto &s : ctx().snarls) {
+                for(auto &v : s) {
+                    std::cout << v << " ";
+                }
+                std::cout << std::endl;
+                // std::cout << p.first << " " << p.second << "\n";
+            }
+        } else {
+            std::ofstream out(ctx().outputPath);
+
+            // for(auto &p:ctx().superbubbles) {
+            //     out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
+            // }
+
+            out << ctx().snarls.size() << "\n";
+            for (auto &s : ctx().snarls) {
+                for(auto &v : s) {
+                    out << v << " ";
+                }
+                out << "\n";
+                // std::cout << p.first << " " << p.second << "\n";
+            }
+        }
+
+        return;
+    } 
 
     if (ctx().gfaInput) {
         // auto has_orient = [](const std::string& s) {
