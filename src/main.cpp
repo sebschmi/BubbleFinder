@@ -114,13 +114,13 @@ namespace solver {
         static bool tryCommitSuperbubble(ogdf::node source, ogdf::node sink) {
             auto &C = ctx();
             if (C.isEntry[source] || C.isExit[sink]) {
-                std::cout << C.node2name[source] << " " << C.node2name[sink] << " is already superbubble\n";
+                // std::cout << C.node2name[source] << " " << C.node2name[sink] << " is already superbubble\n";
                 return false;
             }
             C.isEntry[source] = true;
             C.isExit[sink] = true;
             C.superbubbles.emplace_back(source, sink);
-            std::cout << "Added " << C.node2name[source] << " " << C.node2name[sink] << " as superbubble\n";
+            // std::cout << "Added " << C.node2name[source] << " " << C.node2name[sink] << " as superbubble\n";
             return true;
         }
         struct BlockData {
@@ -1511,7 +1511,7 @@ namespace solver {
         {
 
             if (!isAcyclic(*blk.Gblk)) { 
-                std::cout << "Block is not acyclic, skipping cut vertex check." << std::endl;
+                // std::cout << "Block is not acyclic, skipping cut vertex check." << std::endl;
                 return;
             }
 
@@ -2056,7 +2056,7 @@ namespace solver {
                 PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
 
 
-                std::cout << 123 << std::endl;
+                // std::cout << 123 << std::endl;
                 size_t numThreads = std::thread::hardware_concurrency();
                 // size_t numThreads = 16;
                 numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
