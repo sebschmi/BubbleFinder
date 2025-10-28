@@ -2173,7 +2173,7 @@ namespace solver {
                         size_t chunkSize = 1;
 
                         
-                        std::cout << "Thread " << tid << " chunk size: " << chunkSize << std::endl;
+                        // std::cout << "Thread " << tid << " chunk size: " << chunkSize << std::endl;
 
                         size_t processed = 0;
                         while (true) {
@@ -2227,7 +2227,7 @@ namespace solver {
                             
 
                         }
-                        std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
+                        // std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
                     });
                 }
 
@@ -2416,7 +2416,7 @@ namespace solver {
             // snarlsFound += s.size()*(s.size()-1)/2;
             // }
             // std::cout << "S SIZE: " << s.size() << std::endl;
-            std::sort(s.begin(), s.end());
+            // std::sort(s.begin(), s.end());
             // for (size_t i = 0; i < s.size(); i++)
             // {
             //     for (size_t j = i + 1; j < s.size(); j++)
@@ -2957,11 +2957,11 @@ namespace solver {
 
 
 
-                auto printDegrees = [&]() {
-                    for(node vN:newGraph.nodes) {
-                        node vG = mapNewToGlobal(vN);
-                    }
-                };
+                // auto printDegrees = [&]() {
+                //     for(node vN:newGraph.nodes) {
+                //         node vG = mapNewToGlobal(vN);
+                //     }
+                // };
 
 
                 // std::cout << "Processing node " << curr_node << "\n";
@@ -3875,11 +3875,11 @@ namespace solver {
                 // printAllEdgeStates(edge_dp, blk, T);
                 
 
-                for(auto vGblk:blk.Gblk->nodes) {
-                    if(ctx().node2name[blk.nodeToOrig[vGblk]] == "3497") {
-                        std::cout << "Node 3497 is in this block" << std::endl; 
-                    }
-                }
+                // for(auto vGblk:blk.Gblk->nodes) {
+                //     if(ctx().node2name[blk.nodeToOrig[vGblk]] == "3497") {
+                //         std::cout << "Node 3497 is in this block" << std::endl; 
+                //     }
+                // }
 
                 solveNodes(node_dp, edge_dp, blk, cc); // S, P, R-R
                 // printAllStates(node_dp, T);
@@ -3918,7 +3918,7 @@ namespace solver {
                     isolatedNodesCnt++;
                 }
 
-                if(ctx().node2name[cc.nodeToOrig[v]] == "3497") std::cout << ctx().node2name[cc.nodeToOrig[v]] << " has " << plusCnt << " plus and " << minusCnt << " minus outgoing edges" << std::endl;
+                // if(ctx().node2name[cc.nodeToOrig[v]] == "3497") std::cout << ctx().node2name[cc.nodeToOrig[v]] << " has " << plusCnt << " plus and " << minusCnt << " minus outgoing edges" << std::endl;
                 if(plusCnt == 0 || minusCnt == 0) {
                     cc.isTip[v] = true;
                 } else {
@@ -4096,7 +4096,7 @@ namespace solver {
                 }
             };
 
-            std::cout << "1" << std::endl;
+            // std::cout << "1" << std::endl;
 
             for(node v : cc.Gcc->nodes) {
                 for(auto &t : {EdgePartType::PLUS, EdgePartType::MINUS}) {
@@ -4143,8 +4143,8 @@ namespace solver {
                 if(cc.isGoodCutNode[v]) goodCnt++;
             }
 
-            std::cout << cc.Gcc->numberOfNodes() << " nodes" << std::endl;
-            std::cout << tipsCnt << " tips, " << cutCnt << " cut nodes, " << goodCnt << " good cut nodes found in component" << std::endl;
+            // std::cout << cc.Gcc->numberOfNodes() << " nodes" << std::endl;
+            // std::cout << tipsCnt << " tips, " << cutCnt << " cut nodes, " << goodCnt << " good cut nodes found in component" << std::endl;
             
             // std::cout << "tips: ";
             // for(auto &s:tips) {
@@ -4201,8 +4201,6 @@ namespace solver {
                     if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end()) {
                         edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
                         blk.edgeToOrig[e] = cc.edgeToOrig[eCc];
-                    } else {
-                        std::cout << "EDGE OUTSIDE???" << std::endl;
                     }
                 }
             }
@@ -4366,11 +4364,11 @@ namespace solver {
                 auto *cc = components[cid].get();
                 if(cc->bc->numberOfCComps() > 0) {
                     processCutNodes(*cc);
-                    std::cout << cc->bc->numberOfBComps() << ", " << cc->bc->numberOfCComps() << std::endl; 
+                    // std::cout << cc->bc->numberOfBComps() << ", " << cc->bc->numberOfCComps() << std::endl; 
                 }
             }
 
-            std::cout << "Isolated: " << isolatedNodesCnt << " nodes\n";
+            // std::cout << "Isolated: " << isolatedNodesCnt << " nodes\n";
 
 
             // tip-tip finding in tree-cut components
