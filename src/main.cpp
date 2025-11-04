@@ -113,7 +113,7 @@ namespace solver {
 
         static bool tryCommitSuperbubble(ogdf::node source, ogdf::node sink) {
             auto &C = ctx();
-            if (C.isEntry[source] || C.isExit[sink]) {
+            if (C.isEntry[source] || C.isExit[sink] || ctx().node2name[source] == "_trash" || ctx().node2name[sink] == "_trash") {
                 // std::cout << C.node2name[source] << " " << C.node2name[sink] << " is already superbubble\n";
                 return false;
             }
@@ -148,6 +148,23 @@ namespace solver {
             ogdf::NodeArray<int> globOut;
         
             BlockData() {}
+
+            // BlockData() = default;
+            // ~BlockData() = default;
+
+            // // disable copying & moving
+            // BlockData(const BlockData&) = delete;
+            // BlockData& operator=(const BlockData&) = delete;
+            // BlockData(BlockData&&) = delete;
+            // BlockData& operator=(BlockData&&) = delete;
+
+
+            // BlockData() = default;
+
+            // BlockData(const BlockData&) = delete;
+            // BlockData& operator=(const BlockData&) = delete;
+            // BlockData(BlockData&&) = delete;
+            // BlockData& operator=(BlockData&&) = delete;
         };
 
         struct CcData {
@@ -157,7 +174,8 @@ namespace solver {
             // ogdf::NodeArray<ogdf::node> toBlk;
 
             std::unique_ptr<ogdf::BCTree> bc;
-            std::vector<BlockData> blocks;
+            // std::vector<BlockData> blocks;
+            std::vector<std::unique_ptr<BlockData>> blocks; 
         };
 
 
@@ -1610,11 +1628,20 @@ namespace solver {
             std::vector<ogdf::node> nodeOrder;
             std::vector<ogdf::edge> edgeOrder;
 
+            // std::cout << 222 << std::endl;
+
             SPQRsolve::dfsSPQR_order(*blk.spqr, edgeOrder, nodeOrder);
 
-            ogdf::NodeArray<ogdf::node> blkToSkel(*blk.Gblk, nullptr);
+            // std::cout << 333 << std::endl;
 
-            blk.blkToSkel = blkToSkel;
+            // ogdf::NodeArray<ogdf::node> blkToSkel(*blk.Gblk, nullptr);
+
+            // std::cout << 444 << std::endl;
+
+
+            // blk.blkToSkel = blkToSkel;
+            blk.blkToSkel.init(*blk.Gblk, nullptr);
+
 
             for(auto e:edgeOrder) {
                 SPQRsolve::processEdge(e, dp, node_dp, cc, blk);
@@ -1623,6 +1650,8 @@ namespace solver {
             for(auto v:nodeOrder) {
                 SPQRsolve::processNode(v, dp, node_dp, cc, blk);
             }
+
+            // std::cout << 555 << std::endl;
 
             SPQRsolve::collectSuperbubbles(cc, blk, dp, node_dp);
         }
@@ -1719,14 +1748,20 @@ namespace solver {
         //     }
         // }
 
-        static void buildBlockDataParallel(CcData& cc, BlockData& blk) {
+        static void buildBlockDataParallel(const CcData& cc, BlockData& blk) {
             // PROFILE_FUNCTION();
             {
-                PROFILE_BLOCK("buildBlockDataParallel:: all but SPQR and parent");
-                {
-                    //PROFILE_BLOCK("buildBlockDataParallel:: create clear graph");
-                    blk.Gblk = std::make_unique<Graph>();
-                }
+
+                // std::cout << "1" << std::endl;
+
+                // PROFILE_BLOCK("buildBlockDataParallel:: all but SPQR and parent");
+                
+                //PROFILE_BLOCK("buildBlockDataParallel:: create clear graph");
+
+
+                blk.Gblk = std::make_unique<Graph>();
+
+                // std::cout << "1.1" << std::endl;
 
                 {
                     blk.toOrig.init(*blk.Gblk, nullptr);
@@ -1736,6 +1771,7 @@ namespace solver {
                 }
 
 
+                // std::cout << "2" << std::endl;
                 std::unordered_set<node> verts;
                 {
                     //PROFILE_BLOCK("buildBlockDataParallel:: collect vertices");
@@ -1746,6 +1782,8 @@ namespace solver {
                     }
                 }
 
+
+                // std::cout << "3" << std::endl;
                 std::unordered_map<node, node> cc_to_blk;
                 cc_to_blk.reserve(verts.size());
 
@@ -1775,6 +1813,9 @@ namespace solver {
                 }
 
 
+                // std::cout << "4" << std::endl;
+
+
                 {
                     //PROFILE_BLOCK("buildBlockDataParallel:: init cached global degrees");
                     blk.globIn.init(*blk.Gblk, 0);
@@ -1787,10 +1828,13 @@ namespace solver {
                 }
             }
 
+
+            // std::cout << "4" << std::endl;
+
             if (blk.Gblk->numberOfNodes() >= 3) {
                 // PROFILE_BLOCK("buildBlockDataParallel:: spqr building and parent");
                 {
-                    PROFILE_BLOCK("buildBlockDataParallel:: build SPQR tree");
+                    // PROFILE_BLOCK("buildBlockDataParallel:: build SPQR tree");
                     blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
                 }
                 const Graph& T = blk.spqr->tree();
@@ -1821,7 +1865,7 @@ namespace solver {
 
         struct WorkItem {
             CcData* cc;
-            BlockData* blockData;
+            // BlockData* blockData;
             node bNode;
         };
 
@@ -1925,12 +1969,22 @@ namespace solver {
             auto& C = ctx();
             Graph& G = C.G;
 
+            std::vector<WorkItem> workItems;
+
+            std::vector<std::unique_ptr<CcData>> components;
+
+        {
+            // PROFILE_BLOCK("solve:: prepare");
+
+
             NodeArray<int> compIdx(G);
             int nCC;
             {
                 //PROFILE_BLOCK("solveStreaming:: ComputeCC");
                 nCC = connectedComponents(G, compIdx);
             }
+
+            components.resize(nCC);
 
             std::vector<std::vector<node>> bucket(nCC);
             {
@@ -1956,18 +2010,16 @@ namespace solver {
             logger::info("Streaming over {} components", nCC);
 
             
-            std::vector<std::unique_ptr<CcData>> components(nCC);
             std::vector<std::unique_ptr<BlockData>> allBlockData; 
 
             
-            std::vector<WorkItem> workItems;
 
 
             std::vector<BlockPrep> blockPreps;
 
             {
-                TIME_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
-                PROFILE_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
+                // TIME_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
+                PROFILE_BLOCK("solve:: building data");
 
                 size_t numThreads = std::thread::hardware_concurrency();
                 // size_t numThreads = 16;
@@ -2003,7 +2055,7 @@ namespace solver {
                                 auto cc = std::make_unique<CcData>();
 
                                 {
-                                    PROFILE_BLOCK("solveStreaming:: rebuild cc graph");
+                                    // PROFILE_BLOCK("solveStreaming:: rebuild cc graph");
                                     cc->Gcc = std::make_unique<Graph>();
                                     cc->toOrig.init(*cc->Gcc, nullptr);
                 
@@ -2052,8 +2104,9 @@ namespace solver {
             }
 
             {
-                TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
+                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
+                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
+                PROFILE_BLOCK("solve:: building data");
 
 
                 // std::cout << 123 << std::endl;
@@ -2131,27 +2184,32 @@ namespace solver {
             allBlockData.resize(blockPreps.size());
             
 
+            // {
+            //     PROFILE_BLOCK("solveStreaming:: build BlockData sequential");
+
+            //                     PROFILE_BLOCK("solve:: building data");
+
+
+            //     for (size_t i = 0; i < blockPreps.size(); ++i) {
+            //         const auto &bp = blockPreps[i];
+
+            //         allBlockData[i] = std::make_unique<BlockData>();
+            //         allBlockData[i]->bNode = bp.bNode;
+
+            //         {
+            //             // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
+            //             buildBlockDataParallel(*bp.cc, *allBlockData[i]);
+            //         }
+            //     }
+
+            // }
+
+
             {
-                PROFILE_BLOCK("solveStreaming:: build BlockData sequential");
+                // TIME_BLOCK("solveStreaming:: build BlockData in parallel");
+                // PROFILE_BLOCK("solveStreaming:: build BlockData in parallel");
+                PROFILE_BLOCK("solve:: building data");
 
-                for (size_t i = 0; i < blockPreps.size(); ++i) {
-                    const auto &bp = blockPreps[i];
-
-                    allBlockData[i] = std::make_unique<BlockData>();
-                    allBlockData[i]->bNode = bp.bNode;
-
-                    {
-                        // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
-                        buildBlockDataParallel(*bp.cc, *allBlockData[i]);
-                    }
-                }
-
-            }
-
-
-            {
-                TIME_BLOCK("solveStreaming:: build BlockData in parallel");
-                PROFILE_BLOCK("solveStreaming:: build BlockData in parallel");
 
                 size_t numThreads = std::thread::hardware_concurrency();
 
@@ -2165,104 +2223,110 @@ namespace solver {
                 std::mutex workMutex;
                 size_t nextIndex = 0;
 
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    workers.emplace_back([&, tid]() {
+                // for (size_t tid = 0; tid < numThreads; ++tid) {
+                //     workers.emplace_back([&, tid]() {
 
-                        // size_t chunkSize = std::max<size_t>(1, blockPreps.size() / (numThreads * numThreads));
-                        // size_t chunkSize = 124950;
-                        size_t chunkSize = 1;
+                //         // size_t chunkSize = std::max<size_t>(1, blockPreps.size() / (numThreads * numThreads));
+                //         // size_t chunkSize = 124950;
+                //         size_t chunkSize = 1;
 
                         
-                        // std::cout << "Thread " << tid << " chunk size: " << chunkSize << std::endl;
+                //         // std::cout << "Thread " << tid << " chunk size: " << chunkSize << std::endl;
 
-                        size_t processed = 0;
-                        while (true) {
-                            size_t startIndex, endIndex;
-                            {
-                                std::lock_guard<std::mutex> lock(workMutex);
-                                if (nextIndex >= blockPreps.size()) break;
-                                startIndex = nextIndex;
-                                endIndex = std::min(nextIndex + chunkSize, blockPreps.size());
-                                nextIndex = endIndex;
-                            }
-
-
-                            auto chunkStart = std::chrono::high_resolution_clock::now();
+                //         size_t processed = 0;
+                //         while (true) {
+                //             size_t startIndex, endIndex;
+                //             {
+                //                 std::lock_guard<std::mutex> lock(workMutex);
+                //                 if (nextIndex >= blockPreps.size()) break;
+                //                 startIndex = nextIndex;
+                //                 endIndex = std::min(nextIndex + chunkSize, blockPreps.size());
+                //                 nextIndex = endIndex;
+                //             }
 
 
-                            for (size_t i = startIndex; i < endIndex; ++i) {
-                                const auto &bp = blockPreps[i];
-
-                                allBlockData[i] = std::make_unique<BlockData>();
-                                allBlockData[i]->bNode = bp.bNode;
-
-                                {
-                                    // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
-                                    buildBlockDataParallel(*bp.cc, *allBlockData[i]);
-                                }
-
-                                processed++;
-                            }
+                //             auto chunkStart = std::chrono::high_resolution_clock::now();
 
 
-                            auto chunkEnd = std::chrono::high_resolution_clock::now();
-                            auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
+                //             for (size_t i = startIndex; i < endIndex; ++i) {
+                //                 auto &bp = blockPreps[i];
+
+                //                 // allBlockData[i] = std::make_unique<BlockData>();
+                //                 // allBlockData[i]->bNode = bp.bNode;
+
+                //                 // {
+                //                 //     // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
+                //                 //     buildBlockDataParallel(*bp.cc, *allBlockData[i]);
+                //                 // }
+
+                //                 processed++;
+                //             }
 
 
-                            // if (chunkSize < 10) {
-                            //     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(blockPreps.size() / numThreads));
-                            // }
+                //             auto chunkEnd = std::chrono::high_resolution_clock::now();
+                //             auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
+
+
+                //             // if (chunkSize < 10) {
+                //             //     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(blockPreps.size() / numThreads));
+                //             // }
 
 
                                                     
-                            if (chunkDuration.count() < 100) {
-                                // std::cout << tid << " enlarging chunk from " << chunkSize;
-                                chunkSize = std::min(chunkSize * 2, blockPreps.size() / numThreads);
-                                // std::cout << " to " << chunkSize << std::endl;
-                            } else if (chunkDuration.count() > 2000) {
-                                // std::cout << tid << " shrinking chunk from " << chunkSize;
-                                chunkSize = std::max(chunkSize / 2, (size_t)1);
-                                // std::cout << " to " << chunkSize << std::endl;
-                            }
+                //             if (chunkDuration.count() < 100) {
+                //                 // std::cout << tid << " enlarging chunk from " << chunkSize;
+                //                 chunkSize = std::min(chunkSize * 2, blockPreps.size() / numThreads);
+                //                 // std::cout << " to " << chunkSize << std::endl;
+                //             } else if (chunkDuration.count() > 2000) {
+                //                 // std::cout << tid << " shrinking chunk from " << chunkSize;
+                //                 chunkSize = std::max(chunkSize / 2, (size_t)1);
+                //                 // std::cout << " to " << chunkSize << std::endl;
+                //             }
                             
 
-                        }
-                        // std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
-                    });
-                }
+                //         }
+                //         // std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
+                //     });
+                // }
 
-                for (auto &t : workers) t.join();
+                // for (auto &t : workers) t.join();
 
                 workItems.reserve(workItems.size() + allBlockData.size());
                 for (size_t i = 0; i < allBlockData.size(); ++i) {
-                    workItems.push_back({blockPreps[i].cc, allBlockData[i].get(), blockPreps[i].bNode});
+                    // workItems.push_back({blockPreps[i].cc, allBlockData[i].get(), blockPreps[i].bNode});
+                    workItems.push_back({blockPreps[i].cc, blockPreps[i].bNode});
                 }
             }
 
-            {
-                TIME_BLOCK("solveStreaming:: sort work items by block edges");
-                PROFILE_BLOCK("solveStreaming:: sort work items by block edges");
-                std::sort(workItems.begin(), workItems.end(), [](const WorkItem &a, const WorkItem &b) {
-                    const int ea = a.cc->bc->numberOfEdges(a.bNode);
-                    const int eb = b.cc->bc->numberOfEdges(b.bNode);
-                    return ea > eb;
-                });
-            }
+            // {
+            //     // TIME_BLOCK("solveStreaming:: sort work items by block edges");
+            //     // PROFILE_BLOCK("solveStreaming:: sort work items by block edges");
+            //     PROFILE_BLOCK("solve:: building data");
 
-            for(int i = 0; i < std::min(10, (int)workItems.size()); ++i) {
-                std::cout << "Work item " << i << ": Block with " << workItems[i].blockData->Gblk->numberOfNodes() << " nodes, " << workItems[i].blockData->Gblk->numberOfEdges() << " edges" << std::endl;
-            }
+            //     std::sort(workItems.begin(), workItems.end(), [](const WorkItem &a, const WorkItem &b) {
+            //         const int ea = a.cc->bc->numberOfEdges(a.bNode);
+            //         const int eb = b.cc->bc->numberOfEdges(b.bNode);
+            //         return ea > eb;
+            //     });
+            // }
 
-            std::cout << "Built " << components.size() << " components and " << allBlockData.size() << " blocks" << std::endl;
-            std::cout << "Collected " << workItems.size() << " work items" << std::endl;
+            // for(int i = 0; i < std::min(10, (int)workItems.size()); ++i) {
+            //     std::cout << "Work item " << i << ": Block with " << workItems[i].blockData->Gblk->numberOfNodes() << " nodes, " << workItems[i].blockData->Gblk->numberOfEdges() << " edges" << std::endl;
+            // }
 
+            // std::cout << "Built " << components.size() << " components and " << allBlockData.size() << " blocks" << std::endl;
+            // std::cout << "Collected " << workItems.size() << " work items" << std::endl;
+}
 
 
             std::vector<std::vector<std::pair<node, node>>> blockResults(workItems.size());
             {
-                TIME_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
-                PROFILE_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
+                // TIME_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
+                // PROFILE_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
                 
+                PROFILE_BLOCK("solve:: solving");
+
+
                 size_t numThreads = std::thread::hardware_concurrency();
                 numThreads = std::min({(size_t)C.threads, (size_t)workItems.size(), numThreads});
                 std::vector<std::thread> workers;
@@ -2300,21 +2364,32 @@ namespace solver {
                                 nextWorkIndex = endIndex;
                             }
 
+                            // std::cout << startIndex << " to " << endIndex << " (chunk size: " << chunkSize << ")" << std::endl;
                             
                             auto chunkStart = std::chrono::high_resolution_clock::now();
                             
                             for (size_t i = startIndex; i < endIndex; ++i) {
                                 const auto& workItem = workItems[i];
+                                auto blockData = std::make_unique<BlockData>();
+                                blockData->bNode = workItem.bNode;
+                                // std::cout << "building for " << i << ".." << std::endl;
+                                buildBlockDataParallel(*workItem.cc,  *blockData);
+                                // std::cout << "built for " << i << ".." << std::endl;
+
                                 threadLastWork[tid] = std::chrono::high_resolution_clock::now();
                                 tls_superbubble_collector = &blockResults[i];
 
-                                BlockData *blockData = workItem.blockData;
+                                // BlockData *blockData = blockDataPtr.get();
 
-                                
+
+                                // std::cout << 123321 << std::endl;
+
                                 auto spqrStart = std::chrono::high_resolution_clock::now();
                                 if (blockData->Gblk->numberOfNodes() >= 3) {
                                     solveSPQR(*blockData, *workItem.cc);
                                 }
+
+                                // std::cout << 321123 << std::endl;
                                 auto spqrEnd = std::chrono::high_resolution_clock::now();
 
                                 auto checkStart = std::chrono::high_resolution_clock::now();
@@ -2327,10 +2402,10 @@ namespace solver {
 
                                 auto checkDuration = std::chrono::duration_cast<std::chrono::microseconds>(checkEnd - checkStart);
                                 auto spqrDuration = std::chrono::duration_cast<std::chrono::microseconds>(spqrEnd - spqrStart);
-                                if (checkDuration.count() > 10000 || spqrDuration.count() > 10000) {
-                                    std::lock_guard<std::mutex> debugLock(debugMutex);
-                                    // std::cout << "Thread " << tid << ": Block " << i << " - checkBlock: " << checkDuration.count() << "μs, solveSPQR: " << spqrDuration.count() << "μs" << std::endl;
-                                }
+                                // if (checkDuration.count() > 10000 || spqrDuration.count() > 10000) {
+                                //     std::lock_guard<std::mutex> debugLock(debugMutex);
+                                //     // std::cout << "Thread " << tid << ": Block " << i << " - checkBlock: " << checkDuration.count() << "μs, solveSPQR: " << spqrDuration.count() << "μs" << std::endl;
+                                // }
                             }
                             
                             auto chunkEnd = std::chrono::high_resolution_clock::now();
@@ -2373,8 +2448,8 @@ namespace solver {
             }
 
             {
-                TIME_BLOCK("solveStreaming:: commit results");
-                PROFILE_BLOCK("solveStreaming:: commit results");
+                // TIME_BLOCK("solveStreaming:: commit results");
+                // PROFILE_BLOCK("solveStreaming:: commit results");
                 for (const auto& candidates : blockResults) {
                     for (const auto& p : candidates) {
                         tryCommitSuperbubble(p.first, p.second);
@@ -2398,7 +2473,6 @@ namespace solver {
                 size_t operator()(const std::pair<std::string, std::string>& p) const noexcept {
                     auto h1 = std::hash<std::string>{}(p.first);
                     auto h2 = std::hash<std::string>{}(p.second);
-                    // combine the two hashes
                     return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
                 }
             };
@@ -2408,7 +2482,7 @@ namespace solver {
 
         static void tryCommitSnarl(std::vector<std::string> s) {
             auto &C = ctx();
-            PROFILE_BLOCK("tryCommitSnarl");
+            // PROFILE_BLOCK("tryCommitSnarl");
 
 
             // if(std::count(s[0].begin(), s[0].end(), ':') == 0) {
@@ -2730,9 +2804,9 @@ namespace solver {
                 // std::cout << "PROCESSING " << A << "->" << B << " EDGE\n";
                 
                 state.localPlusS = 0;
-                state.localPlusT  = 0;
+                state.localPlusT = 0;
                 state.localMinusT = 0;
-                state.localMinusS  = 0;
+                state.localMinusS = 0;
                 
                 const Skeleton &skel = spqr.skeleton(B);
                 const Graph &skelGraph = skel.getGraph();
@@ -3178,47 +3252,7 @@ namespace solver {
                     };
                     
                     dfs(skelGraph.firstNode(), skelGraph.firstNode()->firstAdj()->twinNode());
-                    // adjEntriesSkel.push_back(skelGraph.firstNode()->firstAdj()->twinNode()->firstAdj()->twinNode() == skelGraph.firstNode() ? skelGraph.firstNode()->firstAdj()->twinNode()->firstAdj() : std::next(skelGraph.firstNode()->firstAdj()->twinNode()->firstAdj())); // adding edge back to first node
-
-                    
-
                 }
-
-                // GraphIO::drawGraph(skelGraph, "skelOfSNode");
-                // bool toPrint = false;
-                // {
-                //     for (size_t i = 0; i < nodesInOrderGcc.size(); i++)
-                //     {
-                //         if(ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[i]]] == "3497") {
-                //             toPrint = true;
-                //         }
-                //     }
-                // }
-
-                // if(toPrint) {
-                //     GraphIO::drawGraph(skelGraph, "skelOfSNode");
-                // }
-
-                // if(toPrint) {
-                //     for(auto v:skelGraph.nodes) {
-                //         std::cout << ctx().node2name[blk.nodeToOrig[skel.original(v)]] << ", ";
-                //     }
-                //     std::cout << std::endl;
-                // }
-                
-
-                // if(toPrint) {
-                //     std::cout << "Order of nodes in S: " << std::endl;
-
-                //     for (size_t i = 0; i < nodesInOrderGcc.size(); i++)
-                //     {
-                //         std::cout << ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[i]]] << ", ";
-                //     }
-                //     std::cout << std::endl;
-
-                //     std::cout << "Number of adjacent edges in S: " << adjEntriesSkel.size() << ", " << adjEdgesG_.size() << std::endl;
-
-                // }
 
                 std::vector<bool> cuts(nodesInOrderGcc.size(), false);
 
@@ -3228,115 +3262,21 @@ namespace solver {
                     auto uGcc = nodesInOrderGcc[i];
                     auto uSkel = nodesInOrderSkel[i];
 
-                    // if(toPrint) {
-
-                    // std::cout << "checking for " << ctx().node2name[cc.nodeToOrig[uGcc]] << std::endl;
-                    // }
-
-                    // for (ogdf::adjEntry adj = uSkel->firstAdj(); adj; adj = adj->succ()) {
-                    //     ogdf::edge eSkel = adj->theEdge();
-                    //     ogdf::node adjNode = adj->twinNode();
-                        
-                    //     // Only collect edges incident to uSkel (both outgoing and incoming)
-                    //     if(skel.realEdge(eSkel)) {
-                    //         adjEdgesG.push_back(blk.edgeToOrig[skel.realEdge(eSkel)]);
-                    //     } else {
-                    //         adjEdgesG.push_back(nullptr);
-                    //     }
-                    //     adjEdgesSkel.push_back(eSkel);
-                    // }
-
-                    // std::cout << "11" << std::endl;
-                    // assert(adjEdgesSkel.size() == 2);
-                    // assert(adjEdgesG.size() == 2);
-
-                    // if(uSkel->firstAdj()->twinNode() != nodesInOrderSkel[(i-1+nodesInOrderSkel.size())%nodesInOrderSkel.size()]) {
-                    //     std::swap(adjEdgesG[0], adjEdgesG[1]);
-                    //     std::swap(adjEdgesSkel[0], adjEdgesSkel[1]);  
-                    //     std::cout << ctx().node2name[cc.nodeToOrig[uGcc]] << ": swapped edges\n";      
-                    // }
-
-                    // std::cout <<  adjEdgesSkel[0]->source() << " - " << adjEdgesSkel[1]->source() << "\n";
-
-
                     std::vector<edge> adjEdgesSkel = {adjEntriesSkel[(i-1+adjEntriesSkel.size())%adjEntriesSkel.size()]->theEdge(), adjEntriesSkel[i]->theEdge()};
                     std::vector<ogdf::edge> adjEdgesG = {adjEdgesG_[(i-1+adjEdgesG_.size())%adjEdgesG_.size()], adjEdgesG_[i]};
 
-
-                    // std::cout << "Got edges" << std::endl;
-
-
-                    
-                    
-                    // std::cout << adjEdgesG[0]->source() << " - " << adjEdgesG[0]->target() << "\n";
-                    // std::cout << adjEdgesG[1]->source() << " - " << adjEdgesG[1]->target() << "\n";
-
                     bool nodeIsCut = ((cc.isCutNode[uGcc] && cc.badCutCount[uGcc] == 1) || (!cc.isCutNode[uGcc]));
 
-                    // std::cout << "22" << std::endl;
-                    if(!skel.isVirtual(adjEdgesSkel[0]) && !skel.isVirtual(adjEdgesSkel[1])) {
-                        // both edges are real
-                        // if(toPrint)
-                        // std::cout << "real - real"  << std::endl;
-                        EdgePartType t0 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[0]);
-                        EdgePartType t1 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[1]);
+                    EdgePartType t0 = EdgePartType::NONE;
+                    EdgePartType t1 = EdgePartType::NONE;
 
-
-                        nodeIsCut &= t0 != t1;
-                    } else if(!skel.isVirtual(adjEdgesSkel[0]) && skel.isVirtual(adjEdgesSkel[1])) {
-                        // first is real, second is virtual
-                        // if(toPrint)
-                        // std::cout << "real - vir" << std::endl;
-                        EdgePartType t0 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[0]);
-                        EdgePartType t1 = EdgePartType::NONE;
-
-                        edge treeE1 = blk.skel2tree.at(adjEdgesSkel[1]);
-
-                        EdgeDPState* state1 = skelToState[treeE1];
-
-                        // std::cout << "S-" << skelToState[treeE1]->localMinusS << " " << "S+"  << skelToState[treeE1]->localPlusS << " " << "T-" << skelToState[treeE1]->localMinusT << " " << "T+" << skelToState[treeE1]->localPlusT << std::endl;
-                        // node B = skel.twinTreeNode(adjEdges[1])
-
-                        if(blk.toCc[state1->s] == uGcc) {
-                            // take state1.s
-                            if(state1->localMinusS>0 && state1->localPlusS>0) {}
-                            else if(state1->localMinusS == 0 && state1->localPlusS>0) {
-                                t1 = EdgePartType::PLUS;
-                            } else if(state1->localMinusS > 0 && state1->localPlusS==0) {
-                                t1 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        } else {
-                            // take state1.t
-                            if(state1->localMinusT>0 && state1->localPlusT>0) {}
-                            else if(state1->localMinusT == 0 && state1->localPlusT>0) {
-                                t1 = EdgePartType::PLUS;
-                            } else if(state1->localMinusT > 0 && state1->localPlusT==0) {
-                                t1 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        }
-
-                        nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
-                    } else if(skel.isVirtual(adjEdgesSkel[0]) && !skel.isVirtual(adjEdgesSkel[1])) {
-                        // first is virtual, second is real
-                        // if(toPrint)
-                        // std::cout << "vir - real, " << std::endl;
-                        EdgePartType t0 = EdgePartType::NONE;
-                        EdgePartType t1 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[1]);
-                        
-
-                        // std::cout << "33" << std::endl;
+                    if(!skel.isVirtual(adjEdgesSkel[0])) {
+                        t0 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[0]);
+                    } else {
                         edge treeE0 = blk.skel2tree.at(adjEdgesSkel[0]);
                         
                         EdgeDPState* state0 = skelToState[treeE0];
-                        
-                        // std::cout << "44" << std::endl;
-                        // std::cout << "S-" << skelToState[treeE1]->localMinusS << " " << "S+"  << skelToState[treeE1]->localPlusS << " " << "T-" << skelToState[treeE1]->localMinusT << " " << "T+" << skelToState[treeE1]->localPlusT << std::endl;
-                        // node B = skel.twinTreeNode(adjEdges[1])
-
+            
                         if(blk.toCc[state0->s] == uGcc) {
                             // take state0.s
                             if(state0->localMinusS>0 && state0->localPlusS>0) {}
@@ -3358,84 +3298,194 @@ namespace solver {
                                 assert(false);
                             }
                         }
-
-                        
-
-
-                        nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
-                    } else if(skel.isVirtual(adjEdgesSkel[0]) && skel.isVirtual(adjEdgesSkel[1])) {
-                        // both edges are virtual
-                        // if(toPrint)
-                        // std::cout << ctx().node2name[cc.nodeToOrig[uGcc]] << " vir - vir" << std::endl;
-                        
-                        EdgePartType t0 = EdgePartType::NONE;
-                        EdgePartType t1 = EdgePartType::NONE;
-                        
-                        edge treeE0 = blk.skel2tree.at(adjEdgesSkel[0]);
-                        edge treeE1 = blk.skel2tree.at(adjEdgesSkel[1]);
-                        
-                        EdgeDPState* state0 = skelToState[treeE0];
-                        EdgeDPState* state1 = skelToState[treeE1];
-
-                        // if(toPrint) {
-                        //     std::cout << "S-" << skelToState[treeE0]->localMinusS << " " << "S+"  << skelToState[treeE0]->localPlusS << " " << "T-" << skelToState[treeE0]->localMinusT << " " << "T+" << skelToState[treeE0]->localPlusT << std::endl;
-                        //     std::cout << "S-" << skelToState[treeE1]->localMinusS << " " << "S+"  << skelToState[treeE1]->localPlusS << " " << "T-" << skelToState[treeE1]->localMinusT << " " << "T+" << skelToState[treeE1]->localPlusT << std::endl;
-                        // // node B = skel.twinTreeNode(adjEdges[1])
-                        // }
-                        assert(blk.nodeToOrig[state0->s] == cc.nodeToOrig[uGcc] || cc.nodeToOrig[state0->t] == cc.nodeToOrig[uGcc]);
-                        assert(blk.nodeToOrig[state1->s] == cc.nodeToOrig[uGcc] || cc.nodeToOrig[state1->t] == cc.nodeToOrig[uGcc]);
-
-                        // std::cout << ctx().node2name[cc.nodeToOrig[state0->s]] << " " << ctx().node2name[cc.nodeToOrig[state0->t]] << std::endl;
-                        // std::cout << ctx().node2name[state1->s] << " " << ctx().node2name[cc.nodeToOrig[state1->t]] << std::endl;
-
-                        if(blk.toCc[state0->s] == uGcc) {
-                            // take state0.s
-                            if(state0->localMinusS>0 && state0->localPlusS>0) {}
-                            else if(state0->localMinusS == 0 && state0->localPlusS>0) {
-                                t0 = EdgePartType::PLUS;
-                            } else if(state0->localMinusS > 0 && state0->localPlusS==0) {
-                                t0 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        } else {
-                            // take state0.t
-                            if(state0->localMinusT>0 && state0->localPlusT>0) {}
-                            else if(state0->localMinusT == 0 && state0->localPlusT>0) {
-                                t0 = EdgePartType::PLUS;
-                            } else if(state0->localMinusT > 0 && state0->localPlusT==0) {
-                                t0 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        }
-
-                        if(blk.toCc[state1->s] == uGcc) {
-                            // take state1.s
-                            if(state1->localMinusS>0 && state1->localPlusS>0) {}
-                            else if(state1->localMinusS == 0 && state1->localPlusS>0) {
-                                t1 = EdgePartType::PLUS;
-                            } else if(state1->localMinusS > 0 && state1->localPlusS==0) {
-                                t1 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        } else {
-                            // take state1.t
-                            if(state1->localMinusT>0 && state1->localPlusT>0) {}
-                            else if(state1->localMinusT == 0 && state1->localPlusT>0) {
-                                t1 = EdgePartType::PLUS;
-                            } else if(state1->localMinusT > 0 && state1->localPlusT==0) {
-                                t1 = EdgePartType::MINUS;
-                            } else {
-                                assert(false);
-                            }
-                        }
-
-                        // std::cout << (t0 == EdgePartType::NONE ? "NONE" : (t0 == EdgePartType::PLUS ? "PLUS" : "MINUS")) << " - " << (t1 == EdgePartType::NONE ? "NONE" : (t1 == EdgePartType::PLUS ? "PLUS" : "MINUS")) << std::endl;
-                        
-                        nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
                     }
+
+                    if(!skel.isVirtual(adjEdgesSkel[1])) {
+                        t1 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[1]);
+                    } else {
+                        edge treeE1 = blk.skel2tree.at(adjEdgesSkel[1]);
+                        
+                        EdgeDPState* state1 = skelToState[treeE1];
+            
+                        if(blk.toCc[state1->s] == uGcc) {
+                            // take state1.s
+                            if(state1->localMinusS>0 && state1->localPlusS>0) {}
+                            else if(state1->localMinusS == 0 && state1->localPlusS>0) {
+                                t1 = EdgePartType::PLUS;
+                            } else if(state1->localMinusS > 0 && state1->localPlusS==0) {
+                                t1 = EdgePartType::MINUS;
+                            } else {
+                                assert(false);
+                            }
+                        } else {
+                            // take state1.t
+                            if(state1->localMinusT>0 && state1->localPlusT>0) {}
+                            else if(state1->localMinusT == 0 && state1->localPlusT>0) {
+                                t1 = EdgePartType::PLUS;
+                            } else if(state1->localMinusT > 0 && state1->localPlusT==0) {
+                                t1 = EdgePartType::MINUS;
+                            } else {
+                                assert(false);
+                            }
+                        }
+                    }
+
+                    nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
+
+
+                    // if(!skel.isVirtual(adjEdgesSkel[0]) && !skel.isVirtual(adjEdgesSkel[1])) {
+                    //     EdgePartType t0 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[0]);
+                    //     EdgePartType t1 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[1]);
+
+
+                    //     nodeIsCut &= t0 != t1;
+                    // } else if(!skel.isVirtual(adjEdgesSkel[0]) && skel.isVirtual(adjEdgesSkel[1])) {
+                    //     EdgePartType t0 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[0]);
+                    //     EdgePartType t1 = EdgePartType::NONE;
+
+                    //     edge treeE1 = blk.skel2tree.at(adjEdgesSkel[1]);
+
+                    //     EdgeDPState* state1 = skelToState[treeE1];
+
+                    //     if(blk.toCc[state1->s] == uGcc) {
+                    //         // take state1.s
+                    //         if(state1->localMinusS>0 && state1->localPlusS>0) {}
+                    //         else if(state1->localMinusS == 0 && state1->localPlusS>0) {
+                    //             t1 = EdgePartType::PLUS;
+                    //         } else if(state1->localMinusS > 0 && state1->localPlusS==0) {
+                    //             t1 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     } else {
+                    //         // take state1.t
+                    //         if(state1->localMinusT>0 && state1->localPlusT>0) {}
+                    //         else if(state1->localMinusT == 0 && state1->localPlusT>0) {
+                    //             t1 = EdgePartType::PLUS;
+                    //         } else if(state1->localMinusT > 0 && state1->localPlusT==0) {
+                    //             t1 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     }
+
+                    //     nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
+                    // } else if(skel.isVirtual(adjEdgesSkel[0]) && !skel.isVirtual(adjEdgesSkel[1])) {
+                    //     // first is virtual, second is real
+                    //     // if(toPrint)
+                    //     // std::cout << "vir - real, " << std::endl;
+                    //     EdgePartType t0 = EdgePartType::NONE;
+                    //     EdgePartType t1 = getNodeEdgeType(cc.nodeToOrig[uGcc], adjEdgesG[1]);
+                        
+
+                    //     // std::cout << "33" << std::endl;
+                    //     edge treeE0 = blk.skel2tree.at(adjEdgesSkel[0]);
+                        
+                    //     EdgeDPState* state0 = skelToState[treeE0];
+                        
+                    //     // std::cout << "44" << std::endl;
+                    //     // std::cout << "S-" << skelToState[treeE1]->localMinusS << " " << "S+"  << skelToState[treeE1]->localPlusS << " " << "T-" << skelToState[treeE1]->localMinusT << " " << "T+" << skelToState[treeE1]->localPlusT << std::endl;
+                    //     // node B = skel.twinTreeNode(adjEdges[1])
+
+                    //     if(blk.toCc[state0->s] == uGcc) {
+                    //         // take state0.s
+                    //         if(state0->localMinusS>0 && state0->localPlusS>0) {}
+                    //         else if(state0->localMinusS == 0 && state0->localPlusS>0) {
+                    //             t0 = EdgePartType::PLUS;
+                    //         } else if(state0->localMinusS > 0 && state0->localPlusS==0) {
+                    //             t0 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     } else {
+                    //         // take state0.t
+                    //         if(state0->localMinusT>0 && state0->localPlusT>0) {}
+                    //         else if(state0->localMinusT == 0 && state0->localPlusT>0) {
+                    //             t0 = EdgePartType::PLUS;
+                    //         } else if(state0->localMinusT > 0 && state0->localPlusT==0) {
+                    //             t0 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     }
+
+                        
+
+
+                    //     nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
+                    // } else if(skel.isVirtual(adjEdgesSkel[0]) && skel.isVirtual(adjEdgesSkel[1])) {
+                    //     // both edges are virtual
+                    //     // if(toPrint)
+                    //     // std::cout << ctx().node2name[cc.nodeToOrig[uGcc]] << " vir - vir" << std::endl;
+                        
+                    //     EdgePartType t0 = EdgePartType::NONE;
+                    //     EdgePartType t1 = EdgePartType::NONE;
+                        
+                    //     edge treeE0 = blk.skel2tree.at(adjEdgesSkel[0]);
+                    //     edge treeE1 = blk.skel2tree.at(adjEdgesSkel[1]);
+                        
+                    //     EdgeDPState* state0 = skelToState[treeE0];
+                    //     EdgeDPState* state1 = skelToState[treeE1];
+
+                    //     // if(toPrint) {
+                    //     //     std::cout << "S-" << skelToState[treeE0]->localMinusS << " " << "S+"  << skelToState[treeE0]->localPlusS << " " << "T-" << skelToState[treeE0]->localMinusT << " " << "T+" << skelToState[treeE0]->localPlusT << std::endl;
+                    //     //     std::cout << "S-" << skelToState[treeE1]->localMinusS << " " << "S+"  << skelToState[treeE1]->localPlusS << " " << "T-" << skelToState[treeE1]->localMinusT << " " << "T+" << skelToState[treeE1]->localPlusT << std::endl;
+                    //     // // node B = skel.twinTreeNode(adjEdges[1])
+                    //     // }
+                    //     assert(blk.nodeToOrig[state0->s] == cc.nodeToOrig[uGcc] || cc.nodeToOrig[state0->t] == cc.nodeToOrig[uGcc]);
+                    //     assert(blk.nodeToOrig[state1->s] == cc.nodeToOrig[uGcc] || cc.nodeToOrig[state1->t] == cc.nodeToOrig[uGcc]);
+
+                    //     // std::cout << ctx().node2name[cc.nodeToOrig[state0->s]] << " " << ctx().node2name[cc.nodeToOrig[state0->t]] << std::endl;
+                    //     // std::cout << ctx().node2name[state1->s] << " " << ctx().node2name[cc.nodeToOrig[state1->t]] << std::endl;
+
+                    //     if(blk.toCc[state0->s] == uGcc) {
+                    //         // take state0.s
+                    //         if(state0->localMinusS>0 && state0->localPlusS>0) {}
+                    //         else if(state0->localMinusS == 0 && state0->localPlusS>0) {
+                    //             t0 = EdgePartType::PLUS;
+                    //         } else if(state0->localMinusS > 0 && state0->localPlusS==0) {
+                    //             t0 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     } else {
+                    //         // take state0.t
+                    //         if(state0->localMinusT>0 && state0->localPlusT>0) {}
+                    //         else if(state0->localMinusT == 0 && state0->localPlusT>0) {
+                    //             t0 = EdgePartType::PLUS;
+                    //         } else if(state0->localMinusT > 0 && state0->localPlusT==0) {
+                    //             t0 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     }
+
+                    //     if(blk.toCc[state1->s] == uGcc) {
+                    //         // take state1.s
+                    //         if(state1->localMinusS>0 && state1->localPlusS>0) {}
+                    //         else if(state1->localMinusS == 0 && state1->localPlusS>0) {
+                    //             t1 = EdgePartType::PLUS;
+                    //         } else if(state1->localMinusS > 0 && state1->localPlusS==0) {
+                    //             t1 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     } else {
+                    //         // take state1.t
+                    //         if(state1->localMinusT>0 && state1->localPlusT>0) {}
+                    //         else if(state1->localMinusT == 0 && state1->localPlusT>0) {
+                    //             t1 = EdgePartType::PLUS;
+                    //         } else if(state1->localMinusT > 0 && state1->localPlusT==0) {
+                    //             t1 = EdgePartType::MINUS;
+                    //         } else {
+                    //             assert(false);
+                    //         }
+                    //     }
+
+                    //     // std::cout << (t0 == EdgePartType::NONE ? "NONE" : (t0 == EdgePartType::PLUS ? "PLUS" : "MINUS")) << " - " << (t1 == EdgePartType::NONE ? "NONE" : (t1 == EdgePartType::PLUS ? "PLUS" : "MINUS")) << std::endl;
+                        
+                    //     nodeIsCut &= (t0 != EdgePartType::NONE && t1!= EdgePartType::NONE && t0 != t1);
+                    // }
 
 
                     if(nodeIsCut) { 
@@ -4012,31 +4062,11 @@ namespace solver {
             PROFILE_FUNCTION();
             ogdf::NodeArray<std::pair<bool, bool>> visited(*cc.Gcc, {false, false}); // first: minus visited, second: plus visited
 
-            // std::function<void(ogdf::node, EdgePartType, std::vector<std::string> &)> bfs=[&](ogdf::node node, EdgePartType edgeType, std::vector<std::string> &goodNodes) -> void {
-                
-            //     //Another approach...
-            //     std::queue<std::pair<ogdf::node, EdgePartType>> q;
-            //     q.push({node, edgeType});
-
-            //     while(!q.empty()) {
-            //         ogdf::node curr = q.front().first;
-            //         EdgePartType currType = q.front().second;
-            //         q.pop();
-            //         //if(cc.isTip[curr] || )
-            //     }
-                
-            // };
-
-            // for(node v : cc.Gcc->nodes) {
-            //     std::cout << ctx().node2name[cc.nodeToOrig[v]] << ": " << (cc.isCutNode[v]) << ", " << (cc.isGoodCutNode[v]) << ", " << (cc.isTip[v]) << std::endl;
-            // }
 
             std::function<void(ogdf::node, ogdf::node, EdgePartType, std::vector<std::string> &)>  dfs=[&](ogdf::node node, ogdf::node prev, EdgePartType edgeType, std::vector<std::string> &goodNodes) -> void {
                 if((cc.isGoodCutNode[node] || cc.isTip[node]) && ctx().node2name[cc.nodeToOrig[node]] != "_trash") {
                     goodNodes.push_back(/*"C"+*//*(prev!=nullptr ? ctx().node2name[cc.nodeToOrig[prev]] : "-")+":"+*/ctx().node2name[cc.nodeToOrig[node]]+(edgeType == EdgePartType::PLUS ? "+" : "-"));
-                    // if(ctx().node2name[cc.nodeToOrig[node]] == "2346654") {
-                    //     std::cout << ctx().node2name[cc.nodeToOrig[node]] << ": " << (cc.isCutNode[node]) << ", " << (cc.isGoodCutNode[node]) << ", " << (cc.isTip[node]) << std::endl;
-                    // }
+  
                 }
 
 
@@ -4047,35 +4077,23 @@ namespace solver {
                     else visited[node].second = true;
                 }
 
-                // std::vector<ogdf::edge> sameOutEdges, otherOutEdges;
 
                 std::vector<ogdf::AdjElement*> sameOutEdges, otherOutEdges;
                 getAllOutgoingEdgesOfType(cc, node, (edgeType == EdgePartType::PLUS ? EdgePartType::PLUS : EdgePartType::MINUS), sameOutEdges);
                 getAllOutgoingEdgesOfType(cc, node, (edgeType == EdgePartType::PLUS ? EdgePartType::MINUS : EdgePartType::PLUS), otherOutEdges);
 
-                // std::cout << "At node " << ctx().node2name[cc.nodeToOrig[node]] << (edgeType == EdgePartType::PLUS ? "+" : "-") << ", found " << sameOutEdges.size() << " same type out edges and " << otherOutEdges.size() << " other type out edges" << std::endl;
-                // std::cout << "it is " << (cc.isTip[node] ? "a tip" : "not a tip") << ", " << (cc.isCutNode[node] ? "a cut node" : "not a cut node") << (cc.isCutNode[node] ? (cc.isGoodCutNode[node] ? " (good)" : " (bad)") : "") << std::endl;
-                // std::cout << "sameOutEdges: " << sameOutEdges.size() << ", otherOutEdges: " << otherOutEdges.size() << std::endl;
-
                 bool canGoOther = !cc.isGoodCutNode[node] && !cc.isTip[node];
 
-                // std::cout << "canGoOther: " << (canGoOther) << std::endl;
-
-                
                 for(auto &adjE:sameOutEdges) {
                     ogdf::node otherNode = adjE->twinNode();
                     ogdf::edge e = adjE->theEdge();
                     EdgePartType inType = getNodeEdgeType(cc.nodeToOrig[otherNode], cc.edgeToOrig[e]);
 
-                    // std::cout << "maybe going to " << ctx().node2name[cc.nodeToOrig[otherNode]] << (inType == EdgePartType::PLUS ? "+" : "-") << std::endl;
-
                     assert(node != otherNode);
 
-                    // if(otherNode != prev) {
-                        if((inType == EdgePartType::PLUS && !visited[otherNode].second) || (inType == EdgePartType::MINUS && !visited[otherNode].first)) {
-                            dfs(otherNode, node, inType, goodNodes);
-                        }
-                    // }
+                    if((inType == EdgePartType::PLUS && !visited[otherNode].second) || (inType == EdgePartType::MINUS && !visited[otherNode].first)) {
+                        dfs(otherNode, node, inType, goodNodes);
+                    }
                 }
 
                 if(canGoOther) {
@@ -4083,52 +4101,28 @@ namespace solver {
                         ogdf::node otherNode = adjE->twinNode();
                         ogdf::edge e = adjE->theEdge();
 
+                        assert(node != otherNode);
 
-                    assert(node != otherNode);
                         EdgePartType inType = getNodeEdgeType(cc.nodeToOrig[otherNode], cc.edgeToOrig[e]);
 
-                        // if(otherNode != prev) {
-                            if((inType == EdgePartType::PLUS && !visited[otherNode].second) || (inType == EdgePartType::MINUS && !visited[otherNode].first)) {
-                                dfs(otherNode, node, inType, goodNodes);
-                            }
-                        // }
+                        if((inType == EdgePartType::PLUS && !visited[otherNode].second) || (inType == EdgePartType::MINUS && !visited[otherNode].first)) {
+                            dfs(otherNode, node, inType, goodNodes);
+                        }
                     }
                 }
             };
-
-            // std::cout << "1" << std::endl;
 
             for(node v : cc.Gcc->nodes) {
                 for(auto &t : {EdgePartType::PLUS, EdgePartType::MINUS}) {
                     if(t == EdgePartType::PLUS && visited[v].second) continue;
                     if(t == EdgePartType::MINUS && visited[v].first) continue;
-                    // std::cout << "Starting DFS from node " << ctx().node2name[cc.nodeToOrig[v]] << (t == EdgePartType::PLUS ? "+" : "-") << std::endl;
                     std::vector<std::string> goodNodes;
                     dfs(v, nullptr, t, goodNodes);
 
                     if(goodNodes.size()>=2) {
-                        // std::cout << "find cut snarls: ";
-                        // for(auto &s:goodNodes) std::cout << s << " ";
-                        // std::cout << std::endl;
-
                         addSnarl(goodNodes);
                     }
-
-                    // std::cout << "Found cut/tip snarls: ";
-                    // for (size_t i = 0; i < goodNodes.size(); i++)
-                    // {
-                    //     for(size_t j = i+1; j< goodNodes.size(); j++) {
-                    //         addSnarl(goodNodes[i], goodNodes[j]);
-                    //     }
-                    // }
-                    
-                    // for(auto &s:goodNodes) {
-                    //     std::cout << s << " ";
-                    // }
-                    // std::cout << std::endl;
-                    // std::cout << "----\n";
                 }
-
             }   
 
 
@@ -4142,22 +4136,11 @@ namespace solver {
                 if(cc.isCutNode[v]) cutCnt++;
                 if(cc.isGoodCutNode[v]) goodCnt++;
             }
-
-            // std::cout << cc.Gcc->numberOfNodes() << " nodes" << std::endl;
-            // std::cout << tipsCnt << " tips, " << cutCnt << " cut nodes, " << goodCnt << " good cut nodes found in component" << std::endl;
-            
-            // std::cout << "tips: ";
-            // for(auto &s:tips) {
-            //     std::cout << s << " ";
-            // }
-            // std::cout << std::endl;
-            // std::cout << "done" << std::endl;
         }
 
         void buildBlockData(BlockData& blk, const CcData& cc) {
             PROFILE_FUNCTION();
             {
-                //PROFILE_BLOCK("buildBlockDataParallel:: create clear graph");
                 blk.Gblk = std::make_unique<Graph>();
             }
 
@@ -4170,7 +4153,6 @@ namespace solver {
 
             std::unordered_set<node> verts;
             {
-                //PROFILE_BLOCK("buildBlockDataParallel:: collect vertices");
                 for (edge hE : cc.bc->hEdges(blk.bNode)) {
                     edge eC = cc.bc->original(hE);
                     verts.insert(eC->source());
@@ -4182,7 +4164,6 @@ namespace solver {
             cc_to_blk.reserve(verts.size());
 
             {
-                //PROFILE_BLOCK("buildBlockDataParallel:: create nodes in Gblk");
                 for (node vCc : verts) {
                     node vB = blk.Gblk->newNode();
                     cc_to_blk[vCc] = vB;
@@ -4193,7 +4174,6 @@ namespace solver {
             }
 
             {
-                //PROFILE_BLOCK("buildBlockDataParallel:: create edges in Gblk");
                 for (edge hE : cc.bc->hEdges(blk.bNode)) {
                     edge eCc = cc.bc->original(hE);
                     auto srcIt = cc_to_blk.find(eCc->source());
@@ -4206,21 +4186,7 @@ namespace solver {
             }
 
 
-            // {
-            //     //PROFILE_BLOCK("buildBlockDataParallel:: init cached global degrees");
-            //     blk.globIn.init(*blk.Gblk, 0);
-            //     blk.globOut.init(*blk.Gblk, 0);
-            //     for (node vB : blk.Gblk->nodes) {
-            //         node vG = blk.toOrig[vB];
-            //         blk.globIn[vB] = ctx().inDeg[vG];
-            //         blk.globOut[vB] = ctx().outDeg[vG];
-            //     }
-            // }
-        
-            // std::cout << "Built " << blk.Gblk->numberOfNodes() << " nodes graph" << std::endl;
-
             if (blk.Gblk->numberOfNodes() >= 3) {
-                // PROFILE_BLOCK("buildBlockDataParallel:: spqr building and parent");
                 {
                     PROFILE_BLOCK("buildBlockData:: build SPQR tree");
                     blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
@@ -4235,11 +4201,10 @@ namespace solver {
                 blk.parent[root] = root;
 
                 for (edge te : T.edges) {
-                    {
-                        node u = te->source();
-                        node v = te->target();
-                        blk.parent[v] = u;
-                    }
+                    node u = te->source();
+                    node v = te->target();
+                    blk.parent[v] = u;
+                
 
                     if (auto eSrc = blk.spqr->skeletonEdgeSrc(te)) {
                         blk.skel2tree[eSrc] = te;
@@ -4303,7 +4268,7 @@ namespace solver {
 
                 {
                     PROFILE_BLOCK("solve:: rebuild cc graph");
-                    TIME_BLOCK("solve:: rebuild cc graph");
+                    // TIME_BLOCK("solve:: rebuild cc graph");
                     cc->Gcc = std::make_unique<Graph>();
                     cc->nodeToOrig.init(*cc->Gcc, nullptr);
                     cc->edgeToOrig.init(*cc->Gcc, nullptr);
@@ -4335,7 +4300,7 @@ namespace solver {
             // building bc trees
             for (int cid = 0; cid < nCC; ++cid) {
                 PROFILE_BLOCK("solve:: building bc tree");
-                TIME_BLOCK("solve:: building bc tree");
+                // TIME_BLOCK("solve:: building bc tree");
                 auto *cc = components[cid].get();
                 cc->bc = std::make_unique<BCTree>(*cc->Gcc);
                 // cc->auxToOriginal.init(cc->bc->auxiliaryGraph());
@@ -4352,14 +4317,14 @@ namespace solver {
 
             for (int cid = 0; cid < nCC; ++cid) {
                 PROFILE_BLOCK("solve:: finding tips");
-                TIME_BLOCK("solve:: finding tips");
+                // TIME_BLOCK("solve:: finding tips");
                 auto *cc = components[cid].get();
                 findTips(*cc);
             }
 
             for (int cid = 0; cid < nCC; ++cid) {
                 PROFILE_BLOCK("solve:: process cut nodes");
-                TIME_BLOCK("solve:: process cut nodes");
+                // TIME_BLOCK("solve:: process cut nodes");
 
                 auto *cc = components[cid].get();
                 if(cc->bc->numberOfCComps() > 0) {
@@ -4374,7 +4339,7 @@ namespace solver {
             // tip-tip finding in tree-cut components
             for (int cid = 0; cid < nCC; ++cid) {
                 PROFILE_BLOCK("solve:: finding tip-tip snarl candidates");
-                TIME_BLOCK("solve:: finding tip-tip snarl candidates");
+                // TIME_BLOCK("solve:: finding tip-tip snarl candidates");
                 auto *cc = components[cid].get();
                 // if(cc->bc->numberOfCComps() > 0) 
                 findCutSnarl(*cc);
@@ -4384,7 +4349,7 @@ namespace solver {
             for (int cid = 0; cid < nCC; ++cid) {
                 std::cout << "Processing " << cid << std::endl;
                 PROFILE_BLOCK("solve:: building blocks data");
-                TIME_BLOCK("solve:: finding tip-tip snarl candidates");
+                // TIME_BLOCK("solve:: building blocks data");
 
                 for(auto &bNode : components[cid]->bc->bcTree().nodes) {
                     if(components[cid]->bc->typeOfBNode(bNode) == BCTree::BNodeType::CComp) continue;
@@ -4399,7 +4364,7 @@ namespace solver {
             std::cout << "Done building blocks" << std::endl;
 
             for (int cid = 0; cid < nCC; ++cid) {
-                PROFILE_BLOCK("solve:: ");
+                PROFILE_BLOCK("solve:: finding snarls inside blocks");
                 for(auto &blk : components[cid]->blocks) {
                     if(blk.Gblk->numberOfNodes() >= 3) {
                         SPQRsolve::solveSPQR(blk, *components[cid]);
@@ -4486,7 +4451,7 @@ int main(int argc, char** argv) {
         GraphIO::writeSuperbubbles();
     }
 
-    std::cout << "Snarls found: " << snarlsFound << std::endl;
+    // std::cout << "Snarls found: " << snarlsFound << std::endl;
     PROFILING_REPORT();
 
     // for(auto &sb:ctx().superbubbles) {

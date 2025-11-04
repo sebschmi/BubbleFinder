@@ -52,7 +52,7 @@ FetchContent_MakeAvailable(spdlog)
 # 3.2 OGDF  – either bundled or system
 option(SB_BUNDLE_OGDF "Download & build OGDF locally" ON)
 # set(OGDF_TAG "elderberry-202309" CACHE STRING "OGDF tag/branch/commit")
-set(OGDF_TAG "foxglove-202510" CACHE STRING "OGDF tag/branch/commit")
+set(OGDF_TAG "dogwood-202202" CACHE STRING "OGDF tag/branch/commit")
 
 
 if(SB_BUNDLE_OGDF)

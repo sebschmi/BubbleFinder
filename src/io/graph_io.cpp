@@ -24,51 +24,173 @@ void readStandard()
         throw std::runtime_error("Standard graph input not supported for snarls, use GFA input");
     }
     int n, m;
+
+    std::istream* input = nullptr;
+    std::ifstream infile;
+
     if (!C.graphPath.empty()) {
-        std::ifstream in(C.graphPath);
-
-        if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
-
-        if (!(in >> n >> m))
-            throw std::runtime_error("expected: n m, then m lines u v");
-
-        C.node2name.reserve(n);
-
-        for (int i = 0; i < m; ++i) {
-            std::string u, v;
-            if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
-
-            if (!C.name2node.count(u)) {
-                C.name2node[u] = C.G.newNode();
-                C.node2name[C.name2node[u]] = u;
-            }
-            if (!C.name2node.count(v)) {
-                C.name2node[v] = C.G.newNode();
-                C.node2name[C.name2node[v]] = v;
-            }
-            C.G.newEdge(C.name2node[u], C.name2node[v]);
-        }
+        infile.open(C.graphPath);
+        if (!infile) throw std::runtime_error("Cannot open " + C.graphPath);
+        input = &infile;
     } else {
-        if (!(std::cin >> n >> m))
-            throw std::runtime_error("expected: n m, then m lines u v");
+        input = &std::cin;
+    }
+
+    if (!(*input >> n >> m)) throw std::runtime_error("expected: n m, then m lines u v");
+
 
         C.node2name.reserve(n);
 
-        for (int i = 0; i < m; ++i) {
-            std::string u, v;
-            if (!(std::cin >> u >> v)) throw std::runtime_error("edge line");
+    struct EdgeKey {
+        std::string u, v;
+        bool operator==(const EdgeKey& o) const { return u == o.u && v == o.v; }
+    };
+    struct EdgeKeyHash {
+        std::size_t operator()(EdgeKey const& k) const {
+            std::size_t h1 = std::hash<std::string>{}(k.u);
+            std::size_t h2 = std::hash<std::string>{}(k.v);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        }
+    };
 
-            if (!C.name2node.count(u)) {
-                C.name2node[u] = C.G.newNode();
-                C.node2name[C.name2node[u]] = u;
+    std::unordered_set<EdgeKey, EdgeKeyHash> edges;
+    for (int i = 0; i < m; ++i) {
+        std::string u, v;
+        if (!(*input >> u >> v)) throw std::runtime_error("edge line missing");
+        edges.insert({u, v});
+    }
+
+    std::unordered_set<EdgeKey, EdgeKeyHash> processed;
+
+
+    for (auto const& e : edges) {
+        if (processed.count(e)) continue;
+
+        EdgeKey rev{e.v, e.u};
+
+        if (edges.count(rev)) {
+            processed.insert(e);
+            processed.insert(rev);
+
+            if (!C.name2node.count(e.u)) {
+                C.name2node[e.u] = C.G.newNode();
+                C.node2name[C.name2node[e.u]] = e.u;
             }
-            if (!C.name2node.count(v)) {
-                C.name2node[v] = C.G.newNode();
-                C.node2name[C.name2node[v]] = v;
+            if (!C.name2node.count(e.v)) {
+                C.name2node[e.v] = C.G.newNode();
+                C.node2name[C.name2node[e.v]] = e.v;
             }
-            C.G.newEdge(C.name2node[u], C.name2node[v]);
+
+
+            node t1 = C.G.newNode(), t2 = C.G.newNode(); 
+
+            C.node2name[t1] = "_trash";
+            C.node2name[t2] = "_trash";
+
+            C.G.newEdge(C.name2node[e.u], t1);
+            C.G.newEdge(t1, C.name2node[e.v]);
+            C.G.newEdge(C.name2node[e.v], t2);
+            C.G.newEdge(t2, C.name2node[e.u]);
+        } else {
+            
+            processed.insert(e);
+
+            if (!C.name2node.count(e.u)) {
+                C.name2node[e.u] = C.G.newNode();
+                C.node2name[C.name2node[e.u]] = e.u;
+            }
+            if (!C.name2node.count(e.v)) {
+                C.name2node[e.v] = C.G.newNode();
+                C.node2name[C.name2node[e.v]] = e.v;
+            }
+
+            C.G.newEdge(C.name2node[e.u], C.name2node[e.v]);
         }
     }
+
+
+
+
+    // if (!C.graphPath.empty()) {
+    //     std::ifstream in(C.graphPath);
+
+    //     if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
+
+    //     if (!(in >> n >> m))
+    //         throw std::runtime_error("expected: n m, then m lines u v");
+
+    //     C.node2name.reserve(n);
+
+        
+    //     struct EdgeKey {
+    //         std::string u, v;
+    //         bool operator==(const EdgeKey& o) const { return  u==o.u && v==o.v; }
+    //     };
+
+    //     struct EdgeKeyHash {
+    //         std::size_t operator()(EdgeKey const& k) const {
+    //             std::size_t h1 = std::hash<std::string>{}(k.u);
+    //             std::size_t h2 = std::hash<std::string>{}(k.v);
+    //             return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+    //         }
+    //     };
+
+    //     std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+    //     std::vector<std::pair<std::string, std::string>> raw_edges;
+
+
+    //     for (size_t i = 0; i < m; i++)
+    //     {
+    //         std::string u, v;
+    //         if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
+    //         raw_edges.push_back({u,v});
+    //     }
+        
+
+    //     for (int i = 0; i < m; ++i) {
+    //         std::string u = raw_edges[i].first, v = raw_edges[i].second;
+    //         // if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
+
+
+    //         // EdgeKey key{u, v};
+    //         // if(seen.count(key)) continue;
+
+
+
+    //         if (!C.name2node.count(u)) {
+    //             C.name2node[u] = C.G.newNode();
+    //             C.node2name[C.name2node[u]] = u;
+    //         }
+    //         if (!C.name2node.count(v)) {
+    //             C.name2node[v] = C.G.newNode();
+    //             C.node2name[C.name2node[v]] = v;
+    //         }
+
+
+
+    //         C.G.newEdge(C.name2node[u], C.name2node[v]);
+    //     }
+    // } else {
+    //     if (!(std::cin >> n >> m))
+    //         throw std::runtime_error("expected: n m, then m lines u v");
+
+    //     C.node2name.reserve(n);
+
+    //     for (int i = 0; i < m; ++i) {
+    //         std::string u, v;
+    //         if (!(std::cin >> u >> v)) throw std::runtime_error("edge line");
+
+    //         if (!C.name2node.count(u)) {
+    //             C.name2node[u] = C.G.newNode();
+    //             C.node2name[C.name2node[u]] = u;
+    //         }
+    //         if (!C.name2node.count(v)) {
+    //             C.name2node[v] = C.G.newNode();
+    //             C.node2name[C.name2node[v]] = v;
+    //         }
+    //         C.G.newEdge(C.name2node[u], C.name2node[v]);
+    //     }
+    // }
 }
 
 
