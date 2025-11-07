@@ -46,14 +46,25 @@
 #include "util/profiling.hpp"
 #include "fas.h"
 
+#include "util/mark_scope.hpp"
+#include "util/mem_time.hpp"
+#include "util/phase_accum.hpp"
+
 
 using namespace ogdf;
 
+static std::string g_report_json_path;
+
 
 static void usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " -g <graphFile> -o <outputFile> [--gfa] [--superbubbles / --snarls]\n";
+    std::cerr << "Usage: " << prog
+              << " -g <graphFile> -o <outputFile> [--gfa] "
+              << "[--superbubbles | --snarls] "
+              << "[-j <threads>] "
+              << "[--report-json <file>]\n";
     std::exit(EXIT_FAILURE);
 }
+
 
 
 static std::string nextArgOrDie(const std::vector<std::string>& a, std::size_t& i, const char* flag) {
@@ -63,6 +74,7 @@ static std::string nextArgOrDie(const std::vector<std::string>& a, std::size_t& 
     }
     return a[i];
 }
+
 
 
 void readArgs(int argc, char** argv) {
@@ -82,18 +94,24 @@ void readArgs(int argc, char** argv) {
         } else if (s == "--gfa") {
             C.gfaInput = true;
 
-        } else if (s == "-h" || s == "--help") {
-            usage(argv[0]);
+        } else if (s == "--report-json") {
+            g_report_json_path = nextArgOrDie(args, i, "--report-json");
 
-        } else if(s == "-j") {
+        } else if (s == "-h" || s == "--help") {
+            usage(args[0].c_str());
+
+        } else if (s == "-j") {
             C.threads = std::stoi(nextArgOrDie(args, i, "-j"));
-        } else if (s == "--superbubbles"){
+
+        } else if (s == "--superbubbles") {
             C.bubbleType = Context::BubbleType::SUPERBUBBLE;
-        } else if(s == "--snarls") {
+
+        } else if (s == "--snarls") {
             C.bubbleType = Context::BubbleType::SNARL;
+
         } else {
             std::cerr << "Unknown argument: " << s << "\n";
-            usage(argv[0]);
+            usage(args[0].c_str());
         }
     }
 }
@@ -1527,18 +1545,15 @@ namespace solver {
 
         void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)    
         {
+            MARK_SCOPE_MEM("sb/checkCutVertices");
 
             if (!isAcyclic(*blk.Gblk)) { 
-                // std::cout << "Block is not acyclic, skipping cut vertex check." << std::endl;
                 return;
             }
 
-            //PROFILE_FUNCTION();
-            auto start = std::chrono::high_resolution_clock::now();
             auto &C      = ctx();
             const Graph &G = *blk.Gblk;
 
-            auto step1 = std::chrono::high_resolution_clock::now();
             node src=nullptr, snk=nullptr;
 
             for (node v : G.nodes) {
@@ -1562,14 +1577,8 @@ namespace solver {
                 }
             }
 
-            auto step2 = std::chrono::high_resolution_clock::now();
             if (!src || !snk) { return; }
 
-            auto step3 = std::chrono::high_resolution_clock::now();
-
-
-            auto step4 = std::chrono::high_resolution_clock::now();
-            // reachability
             NodeArray<bool> vis(G,false); std::stack<node> S; vis[src]=true; S.push(src);
             bool reach=false;
             while(!S.empty() && !reach){
@@ -1581,40 +1590,18 @@ namespace solver {
                                     vis[v]=true; S.push(v);}
                     }
             }
-            auto step5 = std::chrono::high_resolution_clock::now();
             if(!reach) { return; }
 
             node srcG = blk.toOrig[src], snkG = blk.toOrig[snk];
             addSuperbubble(srcG, snkG);
-            
-            auto end = std::chrono::high_resolution_clock::now();
-            
-            // Debug slow checkBlockByCutVertices calls
-            auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-            // if (totalDuration.count() > 5000) { // > 5ms
-            //     auto step1Duration = std::chrono::duration_cast<std::chrono::microseconds>(step2 - step1);
-            //     auto step2Duration = std::chrono::duration_cast<std::chrono::microseconds>(step3 - step2);
-            //     auto step3Duration = std::chrono::duration_cast<std::chrono::microseconds>(step4 - step3);
-            //     auto step4Duration = std::chrono::duration_cast<std::chrono::microseconds>(step5 - step4);
-            //     auto step5Duration = std::chrono::duration_cast<std::chrono::microseconds>(end - step5);
-                
-            //     std::cout << "SLOW checkBlockByCutVertices: " << totalDuration.count() << "μs total" << std::endl;
-            //     std::cout << "  - Find src/snk: " << step1Duration.count() << "μs" << std::endl;
-            //     std::cout << "  - Check src/snk: " << step2Duration.count() << "μs" << std::endl;
-            //     std::cout << "  - isAcyclic: " << step3Duration.count() << "μs" << std::endl;
-            //     std::cout << "  - Reachability: " << step4Duration.count() << "μs" << std::endl;
-            //     std::cout << "  - Add superbubble: " << step5Duration.count() << "μs" << std::endl;
-            //     std::cout << "  - Graph size: " << G.numberOfNodes() << " nodes, " << G.numberOfEdges() << " edges" << std::endl;
-            // }
         }
 
 
 
 
-
-
         void solveSPQR(BlockData &blk, const CcData &cc) {
-            //PROFILE_FUNCTION();
+            MARK_SCOPE_MEM("sb/solveSPQR");
+
             if (!blk.spqr || blk.Gblk->numberOfNodes() < 3) {
                 return;
             }
@@ -1624,24 +1611,12 @@ namespace solver {
             EdgeArray<SPQRsolve::EdgeDP> dp(T);
             NodeArray<SPQRsolve::NodeDPState> node_dp(T);
 
-
             std::vector<ogdf::node> nodeOrder;
             std::vector<ogdf::edge> edgeOrder;
 
-            // std::cout << 222 << std::endl;
-
             SPQRsolve::dfsSPQR_order(*blk.spqr, edgeOrder, nodeOrder);
 
-            // std::cout << 333 << std::endl;
-
-            // ogdf::NodeArray<ogdf::node> blkToSkel(*blk.Gblk, nullptr);
-
-            // std::cout << 444 << std::endl;
-
-
-            // blk.blkToSkel = blkToSkel;
             blk.blkToSkel.init(*blk.Gblk, nullptr);
-
 
             for(auto e:edgeOrder) {
                 SPQRsolve::processEdge(e, dp, node_dp, cc, blk);
@@ -1651,18 +1626,14 @@ namespace solver {
                 SPQRsolve::processNode(v, dp, node_dp, cc, blk);
             }
 
-            // std::cout << 555 << std::endl;
-
             SPQRsolve::collectSuperbubbles(cc, blk, dp, node_dp);
         }
 
 
 
 
-
         void findMiniSuperbubbles() {
-            //PROFILE_FUNCTION();
-            // TIME_BLOCK("Finding mini-superbubbles");
+            MARK_SCOPE_MEM("sb/findMini");
 
             auto& C = ctx();
 
@@ -1675,9 +1646,9 @@ namespace solver {
                 if(a->outdeg() == 1 && b->indeg() == 1) {
                     bool ok=true;
                     for(auto &w:b->adjEntries) {
-                        auto e = w->theEdge();
-                        auto src = e->source();
-                        auto tgt = e->target();
+                        auto e2 = w->theEdge();
+                        auto src = e2->source();
+                        auto tgt = e2->target();
                         if(src == b && tgt == a) {
                             ok = false;
                             break;
@@ -1690,10 +1661,8 @@ namespace solver {
                 }
             }
 
-
             logger::info("Checked for mini-superbubbles");
         }
-
 
 
         // // // BEST
@@ -1748,93 +1717,58 @@ namespace solver {
         //     }
         // }
 
+
         static void buildBlockDataParallel(const CcData& cc, BlockData& blk) {
-            // PROFILE_FUNCTION();
             {
-
-                // std::cout << "1" << std::endl;
-
-                // PROFILE_BLOCK("buildBlockDataParallel:: all but SPQR and parent");
-                
-                //PROFILE_BLOCK("buildBlockDataParallel:: create clear graph");
-
-
+                MARK_SCOPE_MEM("sb/blockData/build");
                 blk.Gblk = std::make_unique<Graph>();
 
-                // std::cout << "1.1" << std::endl;
+                blk.toOrig.init(*blk.Gblk, nullptr);
+                blk.toCc.init(*blk.Gblk, nullptr);
+                blk.inDeg.init(*blk.Gblk, 0);
+                blk.outDeg.init(*blk.Gblk, 0);
 
-                {
-                    blk.toOrig.init(*blk.Gblk, nullptr);
-                    blk.toCc.init(*blk.Gblk, nullptr);
-                    blk.inDeg.init(*blk.Gblk, 0);
-                    blk.outDeg.init(*blk.Gblk, 0);
-                }
-
-
-                // std::cout << "2" << std::endl;
                 std::unordered_set<node> verts;
-                {
-                    //PROFILE_BLOCK("buildBlockDataParallel:: collect vertices");
-                    for (edge hE : cc.bc->hEdges(blk.bNode)) {
-                        edge eC = cc.bc->original(hE);
-                        verts.insert(eC->source());
-                        verts.insert(eC->target());
-                    }
+                for (edge hE : cc.bc->hEdges(blk.bNode)) {
+                    edge eC = cc.bc->original(hE);
+                    verts.insert(eC->source());
+                    verts.insert(eC->target());
                 }
 
-
-                // std::cout << "3" << std::endl;
                 std::unordered_map<node, node> cc_to_blk;
                 cc_to_blk.reserve(verts.size());
 
-                {
-                    //PROFILE_BLOCK("buildBlockDataParallel:: create nodes in Gblk");
-                    for (node vCc : verts) {
-                        node vB = blk.Gblk->newNode();
-                        cc_to_blk[vCc] = vB;
-                        blk.toCc[vB] = vCc;
-                        node vG = cc.toOrig[vCc];
-                        blk.toOrig[vB] = vG;
+                for (node vCc : verts) {
+                    node vB = blk.Gblk->newNode();
+                    cc_to_blk[vCc] = vB;
+                    blk.toCc[vB] = vCc;
+                    node vG = cc.toOrig[vCc];
+                    blk.toOrig[vB] = vG;
+                }
+
+                for (edge hE : cc.bc->hEdges(blk.bNode)) {
+                    edge eCc = cc.bc->original(hE);
+                    auto srcIt = cc_to_blk.find(eCc->source());
+                    auto tgtIt = cc_to_blk.find(eCc->target());
+                    if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end()) {
+                        edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
+                        blk.outDeg[e->source()]++;
+                        blk.inDeg[e->target()]++;
                     }
                 }
 
-                {
-                    //PROFILE_BLOCK("buildBlockDataParallel:: create edges in Gblk");
-                    for (edge hE : cc.bc->hEdges(blk.bNode)) {
-                        edge eCc = cc.bc->original(hE);
-                        auto srcIt = cc_to_blk.find(eCc->source());
-                        auto tgtIt = cc_to_blk.find(eCc->target());
-                        if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end()) {
-                            edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
-                            blk.outDeg[e->source()]++;
-                            blk.inDeg[e->target()]++;
-                        }
-                    }
-                }
-
-
-                // std::cout << "4" << std::endl;
-
-
-                {
-                    //PROFILE_BLOCK("buildBlockDataParallel:: init cached global degrees");
-                    blk.globIn.init(*blk.Gblk, 0);
-                    blk.globOut.init(*blk.Gblk, 0);
-                    for (node vB : blk.Gblk->nodes) {
-                        node vG = blk.toOrig[vB];
-                        blk.globIn[vB] = ctx().inDeg[vG];
-                        blk.globOut[vB] = ctx().outDeg[vG];
-                    }
+                blk.globIn.init(*blk.Gblk, 0);
+                blk.globOut.init(*blk.Gblk, 0);
+                for (node vB : blk.Gblk->nodes) {
+                    node vG = blk.toOrig[vB];
+                    blk.globIn[vB] = ctx().inDeg[vG];
+                    blk.globOut[vB] = ctx().outDeg[vG];
                 }
             }
 
-
-            // std::cout << "4" << std::endl;
-
             if (blk.Gblk->numberOfNodes() >= 3) {
-                // PROFILE_BLOCK("buildBlockDataParallel:: spqr building and parent");
                 {
-                    // PROFILE_BLOCK("buildBlockDataParallel:: build SPQR tree");
+                    MARK_SCOPE_MEM("sb/blockData/spqr_build");
                     blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
                 }
                 const Graph& T = blk.spqr->tree();
@@ -1845,11 +1779,9 @@ namespace solver {
                 blk.parent[root] = root;
 
                 for (edge te : T.edges) {
-                    {
-                        node u = te->source();
-                        node v = te->target();
-                        blk.parent[v] = u;
-                    }
+                    node u = te->source();
+                    node v = te->target();
+                    blk.parent[v] = u;
 
                     if (auto eSrc = blk.spqr->skeletonEdgeSrc(te)) {
                         blk.skel2tree[eSrc] = te;
@@ -1860,7 +1792,6 @@ namespace solver {
                 }
             }
         }
-
 
 
         struct WorkItem {
@@ -1896,13 +1827,11 @@ namespace solver {
             std::vector<std::unique_ptr<CcData>>* components = targs->components;
             std::vector<BlockPrep>* blockPreps = targs->blockPreps;
 
-            //size_t chunkSize = std::max<size_t>(1, nCC / numThreads);
             size_t chunkSize = 1;
             size_t processed = 0;
 
             while (true) {
                 size_t startIndex, endIndex;
-                // std::cout << chunkSize << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(*workMutex);
                     if (*nextIndex >= static_cast<size_t>(nCC)) break;
@@ -1911,20 +1840,19 @@ namespace solver {
                     *nextIndex = endIndex;
                 }
 
-
                 auto chunkStart = std::chrono::high_resolution_clock::now();
-                
+
                 for (size_t cid = startIndex; cid < endIndex; ++cid) {
                     CcData* cc = (*components)[cid].get();
 
                     {
-                        // PROFILE_BLOCK("solveStreaming:: building bc tree");
+                        MARK_SCOPE_MEM("sb/worker_bcTree/build");
                         cc->bc = std::make_unique<BCTree>(*cc->Gcc);
                     }
 
                     std::vector<BlockPrep> localPreps;
                     {
-                        // PROFILE_BLOCK("solveStreaming:: collect bc tree nodes");
+                        MARK_SCOPE_MEM("sb/worker_bcTree/collect_B_nodes");
                         for (node v : cc->bc->bcTree().nodes) {
                             if (cc->bc->typeOfBNode(v) == BCTree::BNodeType::BComp) {
                                 localPreps.push_back({cc, v});
@@ -1937,24 +1865,17 @@ namespace solver {
                         std::lock_guard<std::mutex> lock(prepMutex);
                         blockPreps->insert(blockPreps->end(), localPreps.begin(), localPreps.end());
                     }
-                    
+
                     ++processed;
                 }
-                
 
                 auto chunkEnd = std::chrono::high_resolution_clock::now();
                 auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
 
-
-                                                                
                 if (chunkDuration.count() < 1000) {
-                    // std::cout << tid << " enlarging chunk from " << chunkSize;
                     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(nCC / numThreads));
-                    // std::cout << " to " << chunkSize << std::endl;
                 } else if (chunkDuration.count() > 5000) {
-                    // std::cout << tid << " shrinking chunk from " << chunkSize;
                     chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
-                    // std::cout << " to " << chunkSize << std::endl;
                 }
             }
 
@@ -2020,14 +1941,17 @@ namespace solver {
             size_t* nextIndex;
             std::mutex* workMutex;
             std::vector<WorkItem>* workItems;
+            std::vector<std::unique_ptr<BlockData>>* allBlockData;
             std::vector<std::vector<std::pair<ogdf::node, ogdf::node>>>* blockResults;
         };
+
 
         static void* worker_processBlocks(void* arg) {
             std::unique_ptr<ThreadProcessArgs> targs(static_cast<ThreadProcessArgs*>(arg));
             size_t* nextIndex   = targs->nextIndex;
             std::mutex* workMux = targs->workMutex;
             auto& items         = *targs->workItems;
+            auto& allBlocks     = *targs->allBlockData;
             auto& results       = *targs->blockResults;
             const size_t n      = targs->nItems;
             while (true) {
@@ -2037,570 +1961,307 @@ namespace solver {
                     if (*nextIndex >= n) break;
                     i = (*nextIndex)++;
                 }
+
                 const WorkItem &w = items[i];
-                BlockData blk;
-                blk.bNode = w.bNode;
-                buildBlockDataParallel(*w.cc, blk);
+
+                BlockData *blk = allBlocks[i].get();
+                if (!blk) {
+                    results[i] = {};
+                    continue;
+                }
+
                 std::vector<std::pair<ogdf::node, ogdf::node>> local;
                 tls_superbubble_collector = &local;
-                if (blk.Gblk && blk.Gblk->numberOfNodes() >= 3) {
-                    solveSPQR(blk, *w.cc);
+
+                if (blk->Gblk && blk->Gblk->numberOfNodes() >= 3) {
+                    solveSPQR(*blk, *w.cc);
                 }
-                checkBlockByCutVertices(blk, *w.cc);
+                checkBlockByCutVertices(*blk, *w.cc);
+
                 tls_superbubble_collector = nullptr;
                 results[i] = std::move(local);
             }
             return nullptr;
         }
-        
+
+
+
+                
         // BEST NOW
-        void solveStreaming() {
-            //PROFILE_FUNCTION();
-            auto& C = ctx();
-            Graph& G = C.G;
 
-            std::vector<WorkItem> workItems;
+void solveStreaming() {
+    //PROFILE_FUNCTION();
+    auto& C = ctx();
+    Graph& G = C.G;
 
-            std::vector<std::unique_ptr<CcData>> components;
+    std::vector<WorkItem> workItems;
+
+    std::vector<std::unique_ptr<CcData>> components;
+    std::vector<std::unique_ptr<BlockData>> allBlockData;
+
+{
+    // PROFILE_BLOCK("solve:: prepare");
+
+
+    NodeArray<int> compIdx(G);
+    int nCC;
+    {
+        MARK_SCOPE_MEM("sb/phase/ComputeCC");
+        //PROFILE_BLOCK("solveStreaming:: ComputeCC");
+        nCC = connectedComponents(G, compIdx);
+    }
+
+    components.resize(nCC);
+
+    std::vector<std::vector<node>> bucket(nCC);
+    {
+        MARK_SCOPE_MEM("sb/phase/BucketNodes");
+        //PROFILE_BLOCK("solveStreaming:: bucket nodes");
+        for (node v : G.nodes) {
+            bucket[compIdx[v]].push_back(v);
+        }
+    }
+
+    std::vector<std::vector<edge>> edgeBuckets(nCC);
+
+    {
+        MARK_SCOPE_MEM("sb/phase/BucketEdges");
+        //PROFILE_BLOCK("solveStreaming:: bucket edges");
+        for (edge e : G.edges) {
+            edgeBuckets[compIdx[e->source()]].push_back(e);
+        }
+    }
+
+
+    NodeArray<node> orig_to_cc(G, nullptr);
+
+
+    logger::info("Streaming over {} components", nCC);
+
+    
+
+
+    std::vector<BlockPrep> blockPreps;
+
+    {
+        PROFILE_BLOCK("solve:: building data");
+        MEM_TIME_BLOCK("BUILD: BC+SPQR");
+        ACCUM_BUILD();
 
         {
-            // PROFILE_BLOCK("solve:: prepare");
+            MARK_SCOPE_MEM("sb/phase/GccBuildParallel");
+            size_t numThreads = std::thread::hardware_concurrency();
+            numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
+            std::vector<std::thread> workers;
+            workers.reserve(numThreads);
 
+            std::mutex workMutex;
+            size_t nextIndex = 0;
 
-            NodeArray<int> compIdx(G);
-            int nCC;
-            {
-                //PROFILE_BLOCK("solveStreaming:: ComputeCC");
-                nCC = connectedComponents(G, compIdx);
-            }
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                workers.emplace_back([&, tid]() {
+                    size_t chunkSize = std::max<size_t>(1, nCC / numThreads);
+                    size_t processed = 0;
+                    while (true) {
+                        size_t startIndex, endIndex;
+                        {
+                            std::lock_guard<std::mutex> lock(workMutex);
+                            if (nextIndex >= static_cast<size_t>(nCC)) break;
+                            startIndex = nextIndex;
+                            endIndex = std::min(nextIndex + chunkSize, static_cast<size_t>(nCC));
+                            nextIndex = endIndex;
+                        }
 
-            components.resize(nCC);
+                        for (size_t ci = startIndex; ci < endIndex; ++ci) {
+                            int cid = static_cast<int>(ci);
+                            auto cc = std::make_unique<CcData>();
 
-            std::vector<std::vector<node>> bucket(nCC);
-            {
-                //PROFILE_BLOCK("solveStreaming:: bucket nodes");
-                for (node v : G.nodes) {
-                    bucket[compIdx[v]].push_back(v);
-                }
-            }
-
-            std::vector<std::vector<edge>> edgeBuckets(nCC);
-
-            {
-                //PROFILE_BLOCK("solveStreaming:: bucket edges");
-                for (edge e : G.edges) {
-                    edgeBuckets[compIdx[e->source()]].push_back(e);
-                }
-            }
-
-
-            NodeArray<node> orig_to_cc(G, nullptr);
-
-
-            logger::info("Streaming over {} components", nCC);
-
-            
-            std::vector<std::unique_ptr<BlockData>> allBlockData; 
-
-            
-
-
-            std::vector<BlockPrep> blockPreps;
-
-            {
-                // TIME_BLOCK("solveStreaming:: build components in parallel (Gcc only)");
-                PROFILE_BLOCK("solve:: building data");
-
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
-                std::vector<std::thread> workers;
-                workers.reserve(numThreads);
-
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    workers.emplace_back([&, tid]() {
-                        size_t chunkSize = std::max<size_t>(1, nCC / numThreads);
-                        size_t processed = 0;
-                        while (true) {
-                            size_t startIndex, endIndex;
                             {
-                                std::lock_guard<std::mutex> lock(workMutex);
-                                if (nextIndex >= static_cast<size_t>(nCC)) break;
-                                startIndex = nextIndex;
-                                endIndex = std::min(nextIndex + chunkSize, static_cast<size_t>(nCC));
-                                nextIndex = endIndex;
-                            }
+                                MARK_SCOPE_MEM("sb/gcc/rebuild");
+                                cc->Gcc = std::make_unique<Graph>();
+                                cc->toOrig.init(*cc->Gcc, nullptr);
+            
+                                std::unordered_map<node, node> orig_to_cc_local;
+                                orig_to_cc_local.reserve(bucket[cid].size());
 
-                            // std::cout << startIndex << " to " << endIndex << std::endl;
-
-                            auto chunkStart = std::chrono::high_resolution_clock::now();
-                            
-                            
-                            for (size_t ci = startIndex; ci < endIndex; ++ci) {
-                                int cid = static_cast<int>(ci);
-                                auto cc = std::make_unique<CcData>();
-
-                                {
-                                    // PROFILE_BLOCK("solveStreaming:: rebuild cc graph");
-                                    cc->Gcc = std::make_unique<Graph>();
-                                    cc->toOrig.init(*cc->Gcc, nullptr);
-                
-                                    std::unordered_map<node, node> orig_to_cc_local;
-                                    orig_to_cc_local.reserve(bucket[cid].size());
-
-                                    for (node vG : bucket[cid]) {
-                                        node vC = cc->Gcc->newNode();
-                                        cc->toOrig[vC] = vG;
-                                        orig_to_cc_local[vG] = vC;
-                                    }
-
-                                    for (edge e : edgeBuckets[cid]) {
-                                            cc->Gcc->newEdge(orig_to_cc_local[e->source()], orig_to_cc_local[e->target()]);
-                                    }
+                                for (node vG : bucket[cid]) {
+                                    node vC = cc->Gcc->newNode();
+                                    cc->toOrig[vC] = vG;
+                                    orig_to_cc_local[vG] = vC;
                                 }
 
-                                components[cid] = std::move(cc);
-                                
-                                processed++;
+                                for (edge e : edgeBuckets[cid]) {
+                                    cc->Gcc->newEdge(orig_to_cc_local[e->source()], orig_to_cc_local[e->target()]);
+                                }
                             }
 
-
-
-                            auto chunkEnd = std::chrono::high_resolution_clock::now();
-                            auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
-
-
-                                                                        
-                            if (chunkDuration.count() < 1000) {
-                                // std::cout << tid << " enlarging chunk from " << chunkSize;
-                                chunkSize = std::min(chunkSize * 2, static_cast<size_t>(nCC / numThreads));
-                                // std::cout << " to " << chunkSize << std::endl;
-                            } else if (chunkDuration.count() > 5000) {
-                                // std::cout << tid << " shrinking chunk from " << chunkSize;
-                                chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
-                                // std::cout << " to " << chunkSize << std::endl;
-                            }
-
+                            components[cid] = std::move(cc);
+                            processed++;
                         }
-                        std::cout << "Thread " << tid << " built " << processed << " components (Gcc)" << std::endl;
-                    });
-                }
 
-                for (auto &t : workers) t.join();
-            }
-
-            {
-                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                PROFILE_BLOCK("solve:: building data");
-
-
-                // std::cout << 123 << std::endl;
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
-
-                std::vector<pthread_t> threads(numThreads);
-
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-
-                    size_t stackSize = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-                    pthread_attr_setstacksize(&attr, stackSize);
-                    
-
-                    ThreadBcTreeArgs* args = new ThreadBcTreeArgs{
-                        tid,
-                        numThreads,
-                        nCC,
-                        &nextIndex,
-                        &workMutex,
-                        &components,
-                        &blockPreps
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_bcTree, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
+                        auto chunkEnd = std::chrono::high_resolution_clock::now();
+                        auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - std::chrono::high_resolution_clock::now());
+                        // chunk size adapt kept as in your code
+                        (void)chunkDuration;
                     }
-
-                    pthread_attr_destroy(&attr);
-                }
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
-                }
-
-
-
-
-
-                // for (int cid = 0; cid < nCC; ++cid) {
-                    
-
-
-                //     auto *cc = components[cid].get();
-                //     {                    
-                //         PROFILE_BLOCK("solveStreaming:: building bc tree");
-                //         cc->bc = std::make_unique<BCTree>(*cc->Gcc);
-                //     }
-
-                //     {
-                //         PROFILE_BLOCK("solveStreaming:: collect bc tree nodes");
-                //         for (node v : cc->bc->bcTree().nodes) {
-                //             if (cc->bc->typeOfBNode(v) == BCTree::BNodeType::BComp) {
-                //                 blockPreps.push_back({cc, v});
-                //             }
-                //         }
-                //     }
-                // }
-                // });
-
-                // ww[0].join();
-
+                    std::cout << "Thread " << tid << " built " << processed << " components (Gcc)" << std::endl;
+                });
             }
 
-            allBlockData.resize(blockPreps.size());
-            
+            for (auto &t : workers) t.join();
+        }
 
-            // {
-            //     PROFILE_BLOCK("solveStreaming:: build BlockData sequential");
+        {
+            MARK_SCOPE_MEM("sb/phase/BCtrees");
 
-            //                     PROFILE_BLOCK("solve:: building data");
+            size_t numThreads = std::thread::hardware_concurrency();
+            numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
 
+            std::vector<pthread_t> threads(numThreads);
 
-            //     for (size_t i = 0; i < blockPreps.size(); ++i) {
-            //         const auto &bp = blockPreps[i];
+            std::mutex workMutex;
+            size_t nextIndex = 0;
 
-            //         allBlockData[i] = std::make_unique<BlockData>();
-            //         allBlockData[i]->bNode = bp.bNode;
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
 
-            //         {
-            //             // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
-            //             buildBlockDataParallel(*bp.cc, *allBlockData[i]);
-            //         }
-            //     }
-
-            // }
-
-
-            {
-                // TIME_BLOCK("solveStreaming:: build BlockData in parallel");
-                // PROFILE_BLOCK("solveStreaming:: build BlockData in parallel");
-                PROFILE_BLOCK("solve:: building data");
-
-
-                size_t numThreads = std::thread::hardware_concurrency();
-
-
-                // size_t maxChunkSize = 1;
-
-                numThreads = std::min({(size_t)C.threads, (size_t)blockPreps.size(), numThreads});
-                std::vector<std::thread> workers;
-                workers.reserve(numThreads);
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-                // for (size_t tid = 0; tid < numThreads; ++tid) {
-                //     workers.emplace_back([&, tid]() {
-
-                //         // size_t chunkSize = std::max<size_t>(1, blockPreps.size() / (numThreads * numThreads));
-                //         // size_t chunkSize = 124950;
-                //         size_t chunkSize = 1;
-
-                        
-                //         // std::cout << "Thread " << tid << " chunk size: " << chunkSize << std::endl;
-
-                //         size_t processed = 0;
-                //         while (true) {
-                //             size_t startIndex, endIndex;
-                //             {
-                //                 std::lock_guard<std::mutex> lock(workMutex);
-                //                 if (nextIndex >= blockPreps.size()) break;
-                //                 startIndex = nextIndex;
-                //                 endIndex = std::min(nextIndex + chunkSize, blockPreps.size());
-                //                 nextIndex = endIndex;
-                //             }
-
-
-                //             auto chunkStart = std::chrono::high_resolution_clock::now();
-
-
-                //             for (size_t i = startIndex; i < endIndex; ++i) {
-                //                 auto &bp = blockPreps[i];
-
-                //                 // allBlockData[i] = std::make_unique<BlockData>();
-                //                 // allBlockData[i]->bNode = bp.bNode;
-
-                //                 // {
-                //                 //     // PROFILE_BLOCK("solveStreaming:: buildBlockData parallel");
-                //                 //     buildBlockDataParallel(*bp.cc, *allBlockData[i]);
-                //                 // }
-
-                //                 processed++;
-                //             }
-
-
-                //             auto chunkEnd = std::chrono::high_resolution_clock::now();
-                //             auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
-
-
-                //             // if (chunkSize < 10) {
-                //             //     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(blockPreps.size() / numThreads));
-                //             // }
-
-
-                                                    
-                //             if (chunkDuration.count() < 100) {
-                //                 // std::cout << tid << " enlarging chunk from " << chunkSize;
-                //                 chunkSize = std::min(chunkSize * 2, blockPreps.size() / numThreads);
-                //                 // std::cout << " to " << chunkSize << std::endl;
-                //             } else if (chunkDuration.count() > 2000) {
-                //                 // std::cout << tid << " shrinking chunk from " << chunkSize;
-                //                 chunkSize = std::max(chunkSize / 2, (size_t)1);
-                //                 // std::cout << " to " << chunkSize << std::endl;
-                //             }
-                            
-
-                //         }
-                //         // std::cout << "Thread " << tid << " built " << processed << " BlockData objects" << std::endl;
-                //     });
-                // }
-
-                // for (auto &t : workers) t.join();
-
-                workItems.reserve(workItems.size() + allBlockData.size());
-                for (size_t i = 0; i < allBlockData.size(); ++i) {
-                    // workItems.push_back({blockPreps[i].cc, allBlockData[i].get(), blockPreps[i].bNode});
-                    workItems.push_back({blockPreps[i].cc, blockPreps[i].bNode});
+                size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                if(pthread_attr_setstacksize(&attr, stackSize) != 0){
+                    std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
                 }
+
+                ThreadBcTreeArgs* args = new ThreadBcTreeArgs{
+                    tid,
+                    numThreads,
+                    nCC,
+                    &nextIndex,
+                    &workMutex,
+                    &components,
+                    &blockPreps
+                };
+
+                int ret = pthread_create(&threads[tid], &attr, worker_bcTree, args);
+                if (ret != 0) {
+                    std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                    delete args;
+                }
+
+                pthread_attr_destroy(&attr);
             }
 
-            // {
-            //     // TIME_BLOCK("solveStreaming:: sort work items by block edges");
-            //     // PROFILE_BLOCK("solveStreaming:: sort work items by block edges");
-            //     PROFILE_BLOCK("solve:: building data");
-
-            //     std::sort(workItems.begin(), workItems.end(), [](const WorkItem &a, const WorkItem &b) {
-            //         const int ea = a.cc->bc->numberOfEdges(a.bNode);
-            //         const int eb = b.cc->bc->numberOfEdges(b.bNode);
-            //         return ea > eb;
-            //     });
-            // }
-
-            // for(int i = 0; i < std::min(10, (int)workItems.size()); ++i) {
-            //     std::cout << "Work item " << i << ": Block with " << workItems[i].blockData->Gblk->numberOfNodes() << " nodes, " << workItems[i].blockData->Gblk->numberOfEdges() << " edges" << std::endl;
-            // }
-
-            // std::cout << "Built " << components.size() << " components and " << allBlockData.size() << " blocks" << std::endl;
-            // std::cout << "Collected " << workItems.size() << " work items" << std::endl;
-}
-
-            // std::cerr << "[mem-test] Superbubbles: exit after construction, before processing blocks." << std::endl;
-            // std::cout << std::flush;
-            // std::exit(0);
-
-            {
-                PROFILE_BLOCK("solve:: process blocks (pthreads, large stack)");
-
-                std::vector<std::vector<std::pair<ogdf::node, ogdf::node>>> blockResults(workItems.size());
-
-                size_t numThreads = std::thread::hardware_concurrency();
-                numThreads = std::min({(size_t)C.threads, workItems.size(), numThreads});
-                if (numThreads == 0) numThreads = 1;
-
-                std::vector<pthread_t> threads(numThreads);
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    size_t stackSize = 1024ULL * 1024ULL * 1024ULL * 20ULL; 
-                    pthread_attr_setstacksize(&attr, stackSize);
-
-                    ThreadProcessArgs* args = new ThreadProcessArgs{
-                        tid,
-                        numThreads,
-                        workItems.size(),
-                        &nextIndex,
-                        &workMutex,
-                        &workItems,
-                        &blockResults
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_processBlocks, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
-                    }
-                    pthread_attr_destroy(&attr);
-                }
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
-                }
-
-                // Commit des résultats
-                for (const auto& candidates : blockResults) {
-                    for (const auto& p : candidates) {
-                        tryCommitSuperbubble(p.first, p.second);
-                    }
-                }
-            }
-
-
-
-            std::vector<std::vector<std::pair<node, node>>> blockResults(workItems.size());
-            {
-                // TIME_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
-                // PROFILE_BLOCK("solveStreaming:: process blocks in parallel (no buildBlockData)");
-                
-                PROFILE_BLOCK("solve:: solving");
-
-
-                size_t numThreads = std::thread::hardware_concurrency();
-                numThreads = std::min({(size_t)C.threads, (size_t)workItems.size(), numThreads});
-                std::vector<std::thread> workers;
-                workers.reserve(numThreads);
-                
-                std::mutex workMutex;
-                std::mutex debugMutex;
-                size_t nextWorkIndex = 0;
-                
-                std::cout << "Processing " << workItems.size() << " work items with " << numThreads << " threads" << std::endl;
-                
-                auto phaseStart = std::chrono::high_resolution_clock::now();
-                std::vector<std::chrono::high_resolution_clock::time_point> threadLastWork(numThreads);
-                std::vector<size_t> threadWorkCounts(numThreads, 0);
-                
-                // for (size_t tid = 0; tid < numThreads; ++tid) {
-                //     workers.emplace_back([&, tid]() {
-                //         // size_t chunkSize = std::max(workItems.size() / (numThreads * 4), size_t(1));
-                //         size_t chunkSize = 1;
-                //         auto lastChunkStart = std::chrono::high_resolution_clock::now();
-                //         size_t totalProcessed = 0;
-                        
-                //         auto threadStart = std::chrono::high_resolution_clock::now();
-                //         threadLastWork[tid] = threadStart;
-
-                //         while (true) {
-                //             size_t startIndex, endIndex;
-                //             {
-                //                 std::lock_guard<std::mutex> lock(workMutex);
-                //                 if (nextWorkIndex >= workItems.size()) {
-                //                     break;
-                //                 }
-                //                 startIndex = nextWorkIndex;
-                //                 endIndex = std::min(nextWorkIndex + chunkSize, workItems.size());
-                //                 nextWorkIndex = endIndex;
-                //             }
-
-                //             // std::cout << startIndex << " to " << endIndex << " (chunk size: " << chunkSize << ")" << std::endl;
-                            
-                //             auto chunkStart = std::chrono::high_resolution_clock::now();
-                            
-                //             for (size_t i = startIndex; i < endIndex; ++i) {
-                //                 const auto& workItem = workItems[i];
-                //                 auto blockData = std::make_unique<BlockData>();
-                //                 blockData->bNode = workItem.bNode;
-                //                 // std::cout << "building for " << i << ".." << std::endl;
-                //                 // buildBlockDataParallel(*workItem.cc,  *blockData);
-                //                 // std::cout << "built for " << i << ".." << std::endl;
-
-                //                 threadLastWork[tid] = std::chrono::high_resolution_clock::now();
-                //                 tls_superbubble_collector = &blockResults[i];
-
-                //                 // BlockData *blockData = blockDataPtr.get();
-
-
-                //                 // std::cout << 123321 << std::endl;
-
-                //                 auto spqrStart = std::chrono::high_resolution_clock::now();
-                //                 if (blockData->Gblk->numberOfNodes() >= 3) {
-                //                     solveSPQR(*blockData, *workItem.cc);
-                //                 }
-
-                //                 // std::cout << 321123 << std::endl;
-                //                 auto spqrEnd = std::chrono::high_resolution_clock::now();
-
-                //                 auto checkStart = std::chrono::high_resolution_clock::now();
-                //                 checkBlockByCutVertices(*blockData, *workItem.cc);
-                //                 auto checkEnd = std::chrono::high_resolution_clock::now();
-
-                //                 tls_superbubble_collector = nullptr;
-                //                 totalProcessed++;
-                //                 threadWorkCounts[tid]++;
-
-                //                 auto checkDuration = std::chrono::duration_cast<std::chrono::microseconds>(checkEnd - checkStart);
-                //                 auto spqrDuration = std::chrono::duration_cast<std::chrono::microseconds>(spqrEnd - spqrStart);
-                //                 // if (checkDuration.count() > 10000 || spqrDuration.count() > 10000) {
-                //                 //     std::lock_guard<std::mutex> debugLock(debugMutex);
-                //                 //     // std::cout << "Thread " << tid << ": Block " << i << " - checkBlock: " << checkDuration.count() << "μs, solveSPQR: " << spqrDuration.count() << "μs" << std::endl;
-                //                 // }
-                //             }
-                            
-                //             auto chunkEnd = std::chrono::high_resolution_clock::now();
-                //             auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
-                            
-                //             if (chunkDuration.count() < 100) {
-                //                 chunkSize = std::min(chunkSize * 2, static_cast<size_t>(workItems.size() / numThreads));
-                //             } else if (chunkDuration.count() > 2000) {
-                //                 chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
-                //             }
-                            
-                //             // Debug output every 100 items processed
-                //             // if (totalProcessed % 100 == 0) {
-                //             //     std::cout << "Thread " << tid << " processed " << totalProcessed << " items, chunk size: " << chunkSize << std::endl;
-                //             // }
-                            
-                //             lastChunkStart = chunkStart;
-                //         }
-                        
-                //         auto threadEnd = std::chrono::high_resolution_clock::now();
-                //         auto threadDuration = std::chrono::duration_cast<std::chrono::milliseconds>(threadEnd - threadStart);
-                        
-                //         std::lock_guard<std::mutex> debugLock(debugMutex);
-                //         std::cout << "Thread " << tid << " finished: " << totalProcessed << " items in " << threadDuration.count() << "ms" << std::endl;
-                //     });
-                // }
-                
-                for (auto& worker : workers) {
-                    worker.join();
-                }
-
-                auto phaseEnd = std::chrono::high_resolution_clock::now();
-                auto phaseDuration = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnd - phaseStart);
-                
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    auto lastWorkDuration = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnd - threadLastWork[tid]);
-                    std::cout << "Thread " << tid << ": " << threadWorkCounts[tid] << " items, last work " << lastWorkDuration.count() << "ms ago" << std::endl;
-                }
-                std::cout << "Total phase time: " << phaseDuration.count() << "ms" << std::endl;
-            }
-
-            {
-                // TIME_BLOCK("solveStreaming:: commit results");
-                // PROFILE_BLOCK("solveStreaming:: commit results");
-                for (const auto& candidates : blockResults) {
-                    for (const auto& p : candidates) {
-                        tryCommitSuperbubble(p.first, p.second);
-                    }
-                }
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                pthread_join(threads[tid], nullptr);
             }
         }
+
+        allBlockData.resize(blockPreps.size());
+
+        {
+            MARK_SCOPE_MEM("sb/phase/BlockDataBuildAll");
+
+            size_t numThreads2 = std::thread::hardware_concurrency();
+            numThreads2 = std::min({(size_t)C.threads, (size_t)blockPreps.size(), numThreads2});
+            std::vector<pthread_t> threads2(numThreads2);
+
+            std::mutex workMutex2;
+            size_t nextIndex2 = 0;
+
+            for (size_t tid = 0; tid < numThreads2; ++tid) {
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+
+                size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                if(pthread_attr_setstacksize(&attr, stackSize) != 0){
+                    std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+                }
+
+                ThreadBlockBuildArgs* args = new ThreadBlockBuildArgs{
+                    tid,
+                    numThreads2,
+                    blockPreps.size(),
+                    &nextIndex2,
+                    &workMutex2,
+                    &blockPreps,
+                    &allBlockData
+                };
+
+                int ret = pthread_create(&threads2[tid], &attr, worker_buildBlockData, args);
+                if (ret != 0) {
+                    std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                    delete args;
+                }
+
+                pthread_attr_destroy(&attr);
+            }
+
+            for (size_t tid = 0; tid < numThreads2; ++tid) {
+                pthread_join(threads2[tid], nullptr);
+            }
+        }
+
+        workItems.reserve(allBlockData.size());
+        for (size_t i = 0; i < allBlockData.size(); ++i) {
+            workItems.push_back({blockPreps[i].cc, blockPreps[i].bNode});
+        }
+    }
+}
+
+    {
+        MEM_TIME_BLOCK("LOGIC: solve blocks (pthreads)");
+        ACCUM_LOGIC();
+        PROFILE_BLOCK("solve:: process blocks (pthreads, large stack)");
+        MARK_SCOPE_MEM("sb/phase/SolveBlocks");
+
+        std::vector<std::vector<std::pair<ogdf::node, ogdf::node>>> blockResults(workItems.size());
+
+        size_t numThreads = std::thread::hardware_concurrency();
+        numThreads = std::min({(size_t)C.threads, workItems.size(), numThreads});
+        if (numThreads == 0) numThreads = 1;
+
+        std::vector<pthread_t> threads(numThreads);
+        std::mutex workMutex;
+        size_t nextIndex = 0;
+
+        for (size_t tid = 0; tid < numThreads; ++tid) {
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            size_t stackSize = 1024ULL * 1024ULL * 1024ULL * 20ULL; 
+            pthread_attr_setstacksize(&attr, stackSize);
+
+            ThreadProcessArgs* args = new ThreadProcessArgs{
+                tid,
+                numThreads,
+                workItems.size(),
+                &nextIndex,
+                &workMutex,
+                &workItems,
+                &allBlockData,
+                &blockResults
+            };
+
+            int ret = pthread_create(&threads[tid], &attr, worker_processBlocks, args);
+            if (ret != 0) {
+                std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                delete args;
+            }
+            pthread_attr_destroy(&attr);
+        }
+
+        for (size_t tid = 0; tid < numThreads; ++tid) {
+            pthread_join(threads[tid], nullptr);
+        }
+
+        for (const auto& candidates : blockResults) {
+            for (const auto& p : candidates) {
+                tryCommitSuperbubble(p.first, p.second);
+            }
+        }
+    }
+}
+
+
+
         void solve() {
             TIME_BLOCK("Finding superbubbles in blocks");
             findMiniSuperbubbles();
@@ -4044,66 +3705,43 @@ namespace solver {
             }
 
             void solveSPQR(BlockData& blk, const CcData& cc) {
+                MARK_SCOPE_MEM("sn/solveSPQR");
+
                 PROFILE_FUNCTION();
                 if(!blk.spqr) return;
                 if(!blk.spqr || blk.Gblk->numberOfNodes() < 3) return;
 
                 const Graph &T = blk.spqr->tree();
 
-
-                // std::cout << blk.spqr->numberOfPNodes() << " P nodes in SPQR tree" << std::endl;
-                // std::cout << blk.spqr->numberOfSNodes() << " S nodes in SPQR tree" << std::endl;
-                // std::cout << blk.spqr->numberOfRNodes() << " R nodes in SPQR tree" << std::endl;
-
                 EdgeArray<SPQRsolve::EdgeDP> edge_dp(T);
                 NodeArray<SPQRsolve::NodeDPState> node_dp(T);
-
 
                 std::vector<ogdf::node> nodeOrder;
                 std::vector<ogdf::edge> edgeOrder;
 
                 SPQRsolve::dfsSPQR_order(*blk.spqr, edgeOrder, nodeOrder);
 
-
                 ogdf::NodeArray<ogdf::node> blkToSkel(*blk.Gblk, nullptr);
-
                 blk.blkToSkel = blkToSkel;
-
 
                 for(auto e:edgeOrder) {
                     SPQRsolve::processEdge(e, edge_dp, cc, blk);
                 }
 
-                // printAllEdgeStates(edge_dp, blk, T);
-
-
                 for(auto v:nodeOrder) {
                     SPQRsolve::processNode(v, edge_dp, cc, blk);
                 }
-                // printAllEdgeStates(edge_dp, blk, T);
 
-                
-                // std::cout << "Edges dp are processed" << std::endl;
-                
-                // printAllEdgeStates(edge_dp, blk, T);
-                
-
-                // for(auto vGblk:blk.Gblk->nodes) {
-                //     if(ctx().node2name[blk.nodeToOrig[vGblk]] == "3497") {
-                //         std::cout << "Node 3497 is in this block" << std::endl; 
-                //     }
-                // }
-
-                solveNodes(node_dp, edge_dp, blk, cc); // S, P, R-R
-                // printAllStates(node_dp, T);
-                // solveEdges(); // R-R
+                solveNodes(node_dp, edge_dp, blk, cc);
             }
+
 
         }
 
 
 
         void findTips(CcData& cc) {
+            MARK_SCOPE_MEM("sn/findTips");
             PROFILE_FUNCTION();
             size_t localIsolated = 0;
             for(node v : cc.Gcc->nodes) {
@@ -4115,129 +3753,64 @@ namespace solver {
                     EdgePartType eType = getNodeEdgeType(vG, e);
                     if(eType == EdgePartType::PLUS) plusCnt++;
                     else minusCnt++;
-                    // if(e->source() == vG) {
-                    //     EdgePartType outType = ctx()._edge2types(e).first;
-                    //     if(outType == EdgePartType::PLUS) plusCnt++;
-                    //     else minusCnt++;
-                    // } else {
-                    //     EdgePartType outType = ctx()._edge2types(e).second;
-                    //     if(outType == EdgePartType::PLUS) plusCnt++;
-                    //     else minusCnt++;
-                    // }
                 }
-
-                // std::cout << "Node " << ctx().node2name[cc.nodeToOrig[v]] << " has " << plusCnt << " plus outgoing and " << minusCnt << " minus outgoing edges" << std::endl;
 
                 if(plusCnt + minusCnt == 0) {
                     isolatedNodesCnt++;
                 }
 
-                // if(ctx().node2name[cc.nodeToOrig[v]] == "3497") std::cout << ctx().node2name[cc.nodeToOrig[v]] << " has " << plusCnt << " plus and " << minusCnt << " minus outgoing edges" << std::endl;
                 if(plusCnt == 0 || minusCnt == 0) {
                     cc.isTip[v] = true;
                 } else {
                     cc.isTip[v] = false;
                 }
-
-
             }
-
-            // for(node v : cc.Gcc->nodes) {
-            //     if(cc.isTip[v]) {
-            //         std::cout << "Node " << ctx().node2name[cc.nodeToOrig[v]] << " is a tip" << std::endl;
-            //     }
-            // }
 
             {
                 std::lock_guard<std::mutex> lk(g_snarls_mtx);
                 isolatedNodesCnt += localIsolated;
             }
-
         }
 
 
         void processCutNodes(CcData& cc) {
+            MARK_SCOPE_MEM("sn/processCutNodes");
             PROFILE_FUNCTION();
-            
-
-            // std::cout << "processCutNodes.." << std::endl;
-
-            // std::cout << cc.bc->numberOfCComps() << " " << cc.bc->numberOfBComps() << std::endl;
 
             for(node v : cc.Gcc->nodes) {
-
-                // std::cout << "Node " << ctx().node2name[cc.nodeToOrig[v]] << " in bc tree node is " << (cc.bc->typeOfGNode(v) == BCTree::GNodeType::CutVertex ? "cut vertex" : "block vertex")  << std::endl;
-
-                // std::cout << 1 << std::endl;
-                // std::cout << v << std::endl;
                 if(cc.bc->typeOfGNode(v) == BCTree::GNodeType::CutVertex) {
-                    // std::cout << 2 << std::endl;
                     cc.isCutNode[v] = true;
 
                     bool isGood = true;
-                    // std::cout << 3 << std::endl;
-
-                    // if(cc.isCutNode[v]) {
                     ogdf::node vT = cc.bc->bcproper(v);
-                    // std::cout << "Cut node " << ctx().node2name[cc.nodeToOrig[v]] << " in bc tree node has " << vT->adjEntries.size() << " adj blocks"  << std::endl;  
+
                     for(auto adjV : vT->adjEntries) {
                         node uT = adjV->twinNode();
                         std::vector<ogdf::edge> outPlus, outMinus;
                         getOutgoingEdgesInBlock(cc, v, uT, EdgePartType::PLUS, outPlus);
                         getOutgoingEdgesInBlock(cc, v, uT, EdgePartType::MINUS, outMinus);
-                        // std::cout << cc.nodeToOrig[v] << " in block " << uT << " has " << outPlus.size() << " plus outgoing and " << outMinus.size() << " minus outgoing edges" << std::endl;
-                        // std::cout << vT << " " << uT << std::endl;
-                        // std::cout << "  In block with " << uT->adjEntries.size() << " adj entries, node " << ctx().node2name[cc.nodeToOrig[v]] << " has " << outPlus.size() << " pluses outgoing and " << outMinus.size() << " minus outgoing edges" << std::endl;
-                        
-                        // if(outPlus.size() == 0 && outMinus.size() > 0) {
-                        //     cc.cutToBlocks[v][0].push_back(uT);
-                        // } 
 
-                        // if(outPlus.size() > 0 && outMinus.size() == 0) {
-                        //     cc.cutToBlocks[v][1].push_back(uT);
-                        // } 
-                        
                         if(outPlus.size() > 0 && outMinus.size() > 0) {
                             isGood = false;
                             cc.lastBad[v] = uT;
                             cc.badCutCount[v]++;
-                            // cc.cutToBlocks[v][2].push_back(uT);
                         }
                     }
-                    // }
                     cc.isGoodCutNode[v] = isGood;
-                    // if(isGood) {
-                    //     std::cout << "Good cut node: " << ctx().node2name[cc.nodeToOrig[v]] << std::endl;
-                    // }
-                    // std::cout << "Cut node " << ctx().node2name[cc.nodeToOrig[v]] << " is " << (isGood ? "good" : "bad") << std::endl;
-                }
-            }
-
-
-
-            {
-                for(node v : cc.Gcc->nodes) {
-                    if(cc.bc->typeOfGNode(v) != BCTree::GNodeType::CutVertex) continue;
-
-
-                    // std::cout << "Cut node " << ctx().node2name[cc.nodeToOrig[v]] << " is " << (cc.isGoodCutNode[v] ? "good" : "bad") << " and has " << cc.badCutCount[v] << " bad blocks" << std::endl;
                 }
             }
         }
 
 
-
         void findCutSnarl(CcData &cc) {
+            MARK_SCOPE_MEM("sn/findCutSnarl");
             PROFILE_FUNCTION();
             ogdf::NodeArray<std::pair<bool, bool>> visited(*cc.Gcc, {false, false}); // first: minus visited, second: plus visited
 
-
             std::function<void(ogdf::node, ogdf::node, EdgePartType, std::vector<std::string> &)>  dfs=[&](ogdf::node node, ogdf::node prev, EdgePartType edgeType, std::vector<std::string> &goodNodes) -> void {
                 if((cc.isGoodCutNode[node] || cc.isTip[node]) && ctx().node2name[cc.nodeToOrig[node]] != "_trash") {
-                    goodNodes.push_back(/*"C"+*//*(prev!=nullptr ? ctx().node2name[cc.nodeToOrig[prev]] : "-")+":"+*/ctx().node2name[cc.nodeToOrig[node]]+(edgeType == EdgePartType::PLUS ? "+" : "-"));
-  
+                    goodNodes.push_back(ctx().node2name[cc.nodeToOrig[node]]+(edgeType == EdgePartType::PLUS ? "+" : "-"));
                 }
-
 
                 if(!cc.isGoodCutNode[node] && !cc.isTip[node]) {
                     visited[node].first = visited[node].second = true;
@@ -4245,7 +3818,6 @@ namespace solver {
                     if(edgeType == EdgePartType::MINUS) visited[node].first = true;
                     else visited[node].second = true;
                 }
-
 
                 std::vector<ogdf::AdjElement*> sameOutEdges, otherOutEdges;
                 getAllOutgoingEdgesOfType(cc, node, (edgeType == EdgePartType::PLUS ? EdgePartType::PLUS : EdgePartType::MINUS), sameOutEdges);
@@ -4258,8 +3830,6 @@ namespace solver {
                     ogdf::edge e = adjE->theEdge();
                     EdgePartType inType = getNodeEdgeType(cc.nodeToOrig[otherNode], cc.edgeToOrig[e]);
 
-                    assert(node != otherNode);
-
                     if((inType == EdgePartType::PLUS && !visited[otherNode].second) || (inType == EdgePartType::MINUS && !visited[otherNode].first)) {
                         dfs(otherNode, node, inType, goodNodes);
                     }
@@ -4269,8 +3839,6 @@ namespace solver {
                     for(auto &adjE:otherOutEdges) {
                         ogdf::node otherNode = adjE->twinNode();
                         ogdf::edge e = adjE->theEdge();
-
-                        assert(node != otherNode);
 
                         EdgePartType inType = getNodeEdgeType(cc.nodeToOrig[otherNode], cc.edgeToOrig[e]);
 
@@ -4293,32 +3861,19 @@ namespace solver {
                     }
                 }
             }   
-
-
-            std::vector<std::string> tips;
-            int tipsCnt = 0, cutCnt=0, goodCnt=0;
-            for(node v : cc.Gcc->nodes) {
-                if(cc.isTip[v]) {
-                    tipsCnt++;
-                    tips.push_back(ctx().node2name[cc.nodeToOrig[v]]);
-                }
-                if(cc.isCutNode[v]) cutCnt++;
-                if(cc.isGoodCutNode[v]) goodCnt++;
-            }
         }
 
+
         void buildBlockData(BlockData& blk, CcData& cc) {
+            MARK_SCOPE_MEM("sn/blockData/build");
             PROFILE_FUNCTION();
             {
                 blk.Gblk = std::make_unique<Graph>();
             }
 
-            {
-                blk.nodeToOrig.init(*blk.Gblk, nullptr);
-                blk.edgeToOrig.init(*blk.Gblk, nullptr);
-                blk.toCc.init(*blk.Gblk, nullptr);
-            }
-
+            blk.nodeToOrig.init(*blk.Gblk, nullptr);
+            blk.edgeToOrig.init(*blk.Gblk, nullptr);
+            blk.toCc.init(*blk.Gblk, nullptr);
 
             std::unordered_set<node> verts;
             {
@@ -4354,14 +3909,12 @@ namespace solver {
                 }
             }
 
-
             if (blk.Gblk->numberOfNodes() >= 3) {
                 {
-                    PROFILE_BLOCK("buildBlockData:: build SPQR tree");
+                    MARK_SCOPE_MEM("sn/blockData/spqr_build");
                     blk.spqr = std::make_unique<StaticSPQRTree>(*blk.Gblk);
                 }
                 const Graph& T = blk.spqr->tree();
-
 
                 blk.skel2tree.reserve(2*T.edges.size());
                 blk.parent.init(T, nullptr);
@@ -4374,7 +3927,6 @@ namespace solver {
                     node v = te->target();
                     blk.parent[v] = u;
                 
-
                     if (auto eSrc = blk.spqr->skeletonEdgeSrc(te)) {
                         blk.skel2tree[eSrc] = te;
                     }
@@ -4384,6 +3936,7 @@ namespace solver {
                 }
             }
         }
+
 
 
 
@@ -4435,6 +3988,8 @@ namespace solver {
         };
 
 
+
+
         void* worker_component(void* arg) {
             std::unique_ptr<ThreadComponentArgs> targs(static_cast<ThreadComponentArgs*>(arg));
             size_t tid = targs->tid;
@@ -4446,15 +4001,11 @@ namespace solver {
             std::vector<std::vector<node>>* bucket = targs->bucket;
             std::vector<std::vector<edge>>* edgeBuckets = targs->edgeBuckets;
 
-            // std::vector<BlockPrep>* blockPreps = targs->blockPreps;
-
-            //size_t chunkSize = std::max<size_t>(1, nCC / numThreads);
             size_t chunkSize = 1;
             size_t processed = 0;
 
             while (true) {
                 size_t startIndex, endIndex;
-                // std::cout << chunkSize << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(*workMutex);
                     if (*nextIndex >= static_cast<size_t>(nCC)) break;
@@ -4463,17 +4014,14 @@ namespace solver {
                     *nextIndex = endIndex;
                 }
 
-
                 auto chunkStart = std::chrono::high_resolution_clock::now();
                 
                 for (size_t cid = startIndex; cid < endIndex; ++cid) {
-                    // auto cc = std::make_unique<CcData>();
-                
+
                     (*components)[cid] = std::make_unique<CcData>();
 
                     {
-                        PROFILE_BLOCK("solve:: rebuild cc graph");
-                        // TIME_BLOCK("solve:: rebuild cc graph");
+                        MARK_SCOPE_MEM("sn/worker_component/gcc_rebuild");
                         (*components)[cid]->Gcc = std::make_unique<Graph>();
                         (*components)[cid]->nodeToOrig.init(*(*components)[cid]->Gcc, nullptr);
                         (*components)[cid]->edgeToOrig.init(*(*components)[cid]->Gcc, nullptr);
@@ -4499,23 +4047,14 @@ namespace solver {
                     }
                     processed++;
                 }
-                
-
-
 
                 auto chunkEnd = std::chrono::high_resolution_clock::now();
                 auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
 
-
-                                                                
                 if (chunkDuration.count() < 1000) {
-                    // std::cout << tid << " enlarging chunk from " << chunkSize;
                     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(nCC / numThreads));
-                    // std::cout << " to " << chunkSize << std::endl;
                 } else if (chunkDuration.count() > 5000) {
-                    // std::cout << tid << " shrinking chunk from " << chunkSize;
                     chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
-                    // std::cout << " to " << chunkSize << std::endl;
                 }
             }
 
@@ -4534,13 +4073,11 @@ namespace solver {
             std::vector<std::unique_ptr<CcData>>* components = targs->components;
             std::vector<BlockPrep>* blockPreps = targs->blockPreps;
 
-            //size_t chunkSize = std::max<size_t>(1, nCC / numThreads);
             size_t chunkSize = 1;
             size_t processed = 0;
 
             while (true) {
                 size_t startIndex, endIndex;
-                // std::cout << chunkSize << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(*workMutex);
                     if (*nextIndex >= static_cast<size_t>(nCC)) break;
@@ -4549,20 +4086,19 @@ namespace solver {
                     *nextIndex = endIndex;
                 }
 
-
                 auto chunkStart = std::chrono::high_resolution_clock::now();
                 
                 for (size_t cid = startIndex; cid < endIndex; ++cid) {
                     CcData* cc = (*components)[cid].get();
 
                     {
-                        // PROFILE_BLOCK("solveStreaming:: building bc tree");
+                        MARK_SCOPE_MEM("sn/worker_bcTree/build");
                         cc->bc = std::make_unique<BCTree>(*cc->Gcc);
                     }
 
                     std::vector<BlockPrep> localPreps;
                     {
-                        // PROFILE_BLOCK("solveStreaming:: collect bc tree nodes");
+                        MARK_SCOPE_MEM("sn/worker_bcTree/collect_B_nodes");
                         for (node v : cc->bc->bcTree().nodes) {
                             if (cc->bc->typeOfBNode(v) == BCTree::BNodeType::BComp) {
                                 localPreps.push_back({cc, v});
@@ -4579,27 +4115,19 @@ namespace solver {
                     ++processed;
                 }
                 
-
                 auto chunkEnd = std::chrono::high_resolution_clock::now();
                 auto chunkDuration = std::chrono::duration_cast<std::chrono::microseconds>(chunkEnd - chunkStart);
 
-
-                                                                
                 if (chunkDuration.count() < 1000) {
-                    // std::cout << tid << " enlarging chunk from " << chunkSize;
                     chunkSize = std::min(chunkSize * 2, static_cast<size_t>(nCC / numThreads));
-                    // std::cout << " to " << chunkSize << std::endl;
                 } else if (chunkDuration.count() > 5000) {
-                    // std::cout << tid << " shrinking chunk from " << chunkSize;
                     chunkSize = std::max(chunkSize / 2, static_cast<size_t>(1));
-                    // std::cout << " to " << chunkSize << std::endl;
                 }
             }
 
             std::cout << "Thread " << tid << " built " << processed << " components (bc trees)" << std::endl;
             return nullptr;
         }
-
 
         void* worker_tips(void* arg) {
             std::unique_ptr<ThreadTipsArgs> targs(static_cast<ThreadTipsArgs*>(arg));
@@ -4687,10 +4215,19 @@ namespace solver {
                 for (size_t bid = startIndex; bid < endIndex; ++bid) {
                     BlockData blk;
                     blk.bNode = (*blockPreps)[bid].bNode;
-                    buildBlockData(blk, *(*blockPreps)[bid].cc);
 
-                    if (blk.Gblk && blk.Gblk->numberOfNodes() >= 3) {
-                        SPQRsolve::solveSPQR(blk, *(*blockPreps)[bid].cc); // addSnarl -> buffer TLS
+                    // Measure SPQR build per-block
+                    {
+                        MEM_TIME_BLOCK("SPQR: build (snarl worker)");
+                        buildBlockData(blk, *(*blockPreps)[bid].cc);
+                    }
+
+                    // Measure solve (snarl detection) per-block
+                    {
+                        MEM_TIME_BLOCK("Algorithm: snarl solve (worker)");
+                        if (blk.Gblk && blk.Gblk->numberOfNodes() >= 3) {
+                            SPQRsolve::solveSPQR(blk, *(*blockPreps)[bid].cc); // addSnarl -> buffer TLS
+                        }
                     }
 
                     ++processed;
@@ -4720,400 +4257,215 @@ namespace solver {
             auto& C = ctx();
             Graph& G = C.G;
 
-            // break into wccs
-
+            MARK_SCOPE_MEM("sn/phase/ComputeCC");
             NodeArray<int> compIdx(G);
-            int nCC;
-            {
-                PROFILE_BLOCK("solve:: ComputeCC");
-                TIME_BLOCK("solve:: ComputeCC");
-                nCC = connectedComponents(G, compIdx);
-            }
+            int nCC = connectedComponents(G, compIdx);
 
             std::vector<std::vector<node>> bucket(nCC);
             {
-                PROFILE_BLOCK("solve:: bucket nodes");
-                TIME_BLOCK("solve:: bucket nodes");
-
+                MARK_SCOPE_MEM("sn/phase/BucketNodes");
                 for (node v : G.nodes) {
                     bucket[compIdx[v]].push_back(v);
                 }
             }
 
             std::vector<std::vector<edge>> edgeBuckets(nCC);
-
             {
-                PROFILE_BLOCK("solve:: bucket edges");
-                TIME_BLOCK("solve:: bucket edges");
-
+                MARK_SCOPE_MEM("sn/phase/BucketEdges");
                 for (edge e : G.edges) {
                     edgeBuckets[compIdx[e->source()]].push_back(e);
                 }
             }
 
-
-
             std::vector<std::unique_ptr<CcData>> components(nCC);
-
-            // std::cout << "1231321" << std::endl;
-
-
-            {
-                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                PROFILE_BLOCK("solve:: building components");
-
-
-                // std::cout << 123 << std::endl;
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
-
-                std::vector<pthread_t> threads(numThreads);
-
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-
-                    size_t stackSize = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-                    pthread_attr_setstacksize(&attr, stackSize);
-                    
-
-                    ThreadComponentArgs* args = new ThreadComponentArgs{
-                        tid,
-                        numThreads,
-                        nCC,
-                        &nextIndex,
-                        &workMutex,
-                        &bucket,
-                        &edgeBuckets,
-                        &components,
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_component, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
-                    }
-
-                    pthread_attr_destroy(&attr);
-                }
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
-                }
-            }
-
-
-            // for (size_t i = 0; i < nCC; i++)
-            // {
-            //     auto cc = std::make_unique<CcData>();
-
-            //     {
-            //         PROFILE_BLOCK("solve:: rebuild cc graph");
-            //         // TIME_BLOCK("solve:: rebuild cc graph");
-            //         cc->Gcc = std::make_unique<Graph>();
-            //         cc->nodeToOrig.init(*cc->Gcc, nullptr);
-            //         cc->edgeToOrig.init(*cc->Gcc, nullptr);
-            //         cc->isTip.init(*cc->Gcc, false);
-            //         cc->isCutNode.init(*cc->Gcc, false);
-            //         cc->isGoodCutNode.init(*cc->Gcc, false);
-            //         cc->lastBad.init(*cc->Gcc, nullptr);
-            //         cc->badCutCount.init(*cc->Gcc, 0);
-
-            //         std::unordered_map<node, node> orig_to_cc;
-            //         orig_to_cc.reserve(bucket[i].size());
-
-            //         for (node vG : bucket[i]) {
-            //             node vC = cc->Gcc->newNode();
-            //             cc->nodeToOrig[vC] = vG;
-            //             orig_to_cc[vG] = vC;
-            //         }
-
-            //         for (edge e : edgeBuckets[i]) {
-            //             auto eC = cc->Gcc->newEdge(orig_to_cc[e->source()], orig_to_cc[e->target()]);
-            //             cc->edgeToOrig[eC] = e;
-            //         }
-            //     }
-
-            //     components[i] = std::move(cc);
-            // }
-
-
 
             std::vector<BlockPrep> blockPreps;
 
-
-            // std::cerr << "[mem-test][snarls] Exit before BC-tree construction." << std::endl;
-            // std::cout << std::flush;
-            // std::exit(0);
-
             {
-                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solve:: building data");
-                PROFILE_BLOCK("solve:: building bc tree");
+                MEM_TIME_BLOCK("SNARLS: BUILD (Gcc+BC+SPQR)");
+                ACCUM_BUILD();
+                MARK_SCOPE_MEM("sn/phase/BUILD_all");
 
+                // build components (Gcc)
+                {
+                    size_t numThreads = std::thread::hardware_concurrency();
+                    numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
 
-                // std::cout << 123 << std::endl;
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
+                    std::vector<pthread_t> threads(numThreads);
 
-                std::vector<pthread_t> threads(numThreads);
+                    std::mutex workMutex;
+                    size_t nextIndex = 0;
 
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
 
-                std::mutex workMutex;
-                size_t nextIndex = 0;
+                        size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                        pthread_attr_setstacksize(&attr, stackSize);
 
+                        ThreadComponentArgs* args = new ThreadComponentArgs{
+                            tid,
+                            numThreads,
+                            nCC,
+                            &nextIndex,
+                            &workMutex,
+                            &bucket,
+                            &edgeBuckets,
+                            &components,
+                        };
 
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
+                        int ret = pthread_create(&threads[tid], &attr, worker_component, args);
+                        if (ret != 0) {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
 
-                    size_t stackSize = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-                    pthread_attr_setstacksize(&attr, stackSize);
-                    
-
-                    ThreadBcTreeArgs* args = new ThreadBcTreeArgs{
-                        tid,
-                        numThreads,
-                        nCC,
-                        &nextIndex,
-                        &workMutex,
-                        &components,
-                        &blockPreps
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_bcTree, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
+                        pthread_attr_destroy(&attr);
                     }
 
-                    pthread_attr_destroy(&attr);
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_join(threads[tid], nullptr);
+                    }
                 }
 
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
-                }
-            }
+                // BC trees + collect blocks
+                {
+                    size_t numThreads = std::thread::hardware_concurrency();
+                    numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
+                    std::vector<pthread_t> threads(numThreads);
 
+                    std::mutex workMutex;
+                    size_t nextIndex = 0;
 
-            // return;
-            // building bc trees
-            // for (int cid = 0; cid < nCC; ++cid) {
-            //     PROFILE_BLOCK("solve:: building bc tree");
-            //     // TIME_BLOCK("solve:: building bc tree");
-            //     auto *cc = components[cid].get();
-            //     cc->bc = std::make_unique<BCTree>(*cc->Gcc);
-            //     // cc->auxToOriginal.init(cc->bc->auxiliaryGraph());
-            //     // for(edge eGcc : cc->Gcc->edges) {
-            //     //     cc->auxToOriginal[cc->bc->rep(eGcc)] = cc->edgeToOrig[eGcc];
-            //     // }
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
 
-            //     // GraphIO::drawGraph(cc->bc->bcTree(), "bcTree");
+                        size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                        if(pthread_attr_setstacksize(&attr, stackSize) != 0){
+                            std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+                        }
 
-            // }
+                        ThreadBcTreeArgs* args = new ThreadBcTreeArgs{
+                            tid,
+                            numThreads,
+                            nCC,
+                            &nextIndex,
+                            &workMutex,
+                            &components,
+                            &blockPreps
+                        };
 
+                        int ret = pthread_create(&threads[tid], &attr, worker_bcTree, args);
+                        if (ret != 0) {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
 
-
-
-
-            // return ;
-            std::cout << "built bc trees for " << nCC << " components\n";
-
-
-            {
-                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                PROFILE_BLOCK("solve:: processing tips/cuts");
-
-
-                // std::cout << 123 << std::endl;
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
-
-                std::vector<pthread_t> threads(numThreads);
-
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-
-                    size_t stackSize = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-                    pthread_attr_setstacksize(&attr, stackSize);
-                    
-
-                    ThreadTipsArgs* args = new ThreadTipsArgs{
-                        tid,
-                        numThreads,
-                        nCC,
-                        &nextIndex,
-                        &workMutex,
-                        &components
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_tips, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
+                        pthread_attr_destroy(&attr);
                     }
 
-                    pthread_attr_destroy(&attr);
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_join(threads[tid], nullptr);
+                    }
                 }
 
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
-                }
-            }
+                // tips/cuts/cut-snarls
+                {
+                    MARK_SCOPE_MEM("sn/phase/tips_cuts");
 
+                    size_t numThreads = std::thread::hardware_concurrency();
+                    numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
 
+                    std::vector<pthread_t> threads(numThreads);
 
-                    // for (int cid = 0; cid < nCC; ++cid) {
-                    //     PROFILE_BLOCK("solve:: finding tips");
-                    //     // TIME_BLOCK("solve:: finding tips");
-                    //     auto *cc = components[cid].get();
-                    //     findTips(*cc);
-                    // }
+                    std::mutex workMutex;
+                    size_t nextIndex = 0;
 
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
 
+                        size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                        if(pthread_attr_setstacksize(&attr, stackSize) != 0){
+                            std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+                        }
 
+                        ThreadTipsArgs* args = new ThreadTipsArgs{
+                            tid,
+                            numThreads,
+                            nCC,
+                            &nextIndex,
+                            &workMutex,
+                            &components
+                        };
 
-                    // for (int cid = 0; cid < nCC; ++cid) {
-                    //     PROFILE_BLOCK("solve:: process cut nodes");
-                    //     // TIME_BLOCK("solve:: process cut nodes");
+                        int ret = pthread_create(&threads[tid], &attr, worker_tips, args);
+                        if (ret != 0) {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
 
-                    //     auto *cc = components[cid].get();
-                    //     if(cc->bc->numberOfCComps() > 0) {
-                    //         processCutNodes(*cc);
-                    //         // std::cout << cc->bc->numberOfBComps() << ", " << cc->bc->numberOfCComps() << std::endl; 
-                    //     }
-                    // }
-
-            // std::cout << "Isolated: " << isolatedNodesCnt << " nodes\n";
-
-
-            
-            // tip-tip finding in tree-cut components
-            // for (int cid = 0; cid < nCC; ++cid) {
-            //     PROFILE_BLOCK("solve:: finding tip-tip snarl candidates");
-            //     // TIME_BLOCK("solve:: finding tip-tip snarl candidates");
-            //     auto *cc = components[cid].get();
-            //     // if(cc->bc->numberOfCComps() > 0) 
-            //     findCutSnarl(*cc);
-            // }
-
-
-
-            // std::cerr << "[mem-test][snarls] Exiting after construction, before per-block SPQR/solving." << std::endl;
-            // std::cout << std::flush;
-            // std::exit(0);
-
-
-            {
-                // TIME_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                // PROFILE_BLOCK("solveStreaming:: build BC trees and collect blocks");
-                PROFILE_BLOCK("solve:: solving in blocks");
-
-
-                // std::cout << 123 << std::endl;
-                size_t numThreads = std::thread::hardware_concurrency();
-                // size_t numThreads = 16;
-                numThreads = std::min({(size_t)C.threads, (size_t)blockPreps.size(), numThreads});
-
-                std::vector<pthread_t> threads(numThreads);
-
-
-                std::mutex workMutex;
-                size_t nextIndex = 0;
-
-
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-
-                    size_t stackSize = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-                    pthread_attr_setstacksize(&attr, stackSize);
-                    
-
-                    ThreadBlocksArgs* args = new ThreadBlocksArgs{
-                        tid,
-                        numThreads,
-                        blockPreps.size(),
-                        &nextIndex,
-                        &workMutex,
-                        &blockPreps
-                    };
-
-                    int ret = pthread_create(&threads[tid], &attr, worker_block, args);
-                    if (ret != 0) {
-                        std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
-                        delete args;
+                        pthread_attr_destroy(&attr);
                     }
 
-                    pthread_attr_destroy(&attr);
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_join(threads[tid], nullptr);
+                    }
                 }
 
-                for (size_t tid = 0; tid < numThreads; ++tid) {
-                    pthread_join(threads[tid], nullptr);
+                // SPQR inside blocks
+                {
+                    MARK_SCOPE_MEM("sn/phase/block_SPQR_solve");
+
+                    size_t numThreads = std::thread::hardware_concurrency();
+                    numThreads = std::min({(size_t)C.threads, (size_t)blockPreps.size(), numThreads});
+
+                    std::vector<pthread_t> threads(numThreads);
+
+                    std::mutex workMutex;
+                    size_t nextIndex = 0;
+
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+
+                        size_t stackSize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+                        if(pthread_attr_setstacksize(&attr, stackSize) != 0){
+                            std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+                        }
+
+                        ThreadBlocksArgs* args = new ThreadBlocksArgs{
+                            tid,
+                            numThreads,
+                            blockPreps.size(),
+                            &nextIndex,
+                            &workMutex,
+                            &blockPreps
+                        };
+
+                        int ret = pthread_create(&threads[tid], &attr, worker_block, args);
+                        if (ret != 0) {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
+
+                        pthread_attr_destroy(&attr);
+                    }
+
+                    for (size_t tid = 0; tid < numThreads; ++tid) {
+                        pthread_join(threads[tid], nullptr);
+                    }
                 }
             }
-
-
-
-            // // inside of block
-            // for (int cid = 0; cid < nCC; ++cid) {
-            //     std::cout << "Processing " << cid << std::endl;
-            //     PROFILE_BLOCK("solve:: building blocks data");
-            //     // TIME_BLOCK("solve:: building blocks data");
-
-            //     for(auto &bNode : components[cid]->bc->bcTree().nodes) {
-            //         if(components[cid]->bc->typeOfBNode(bNode) == BCTree::BNodeType::CComp) continue;
-            //         BlockData blk;
-            //         blk.bNode = bNode;
-            //         buildBlockData(blk, *components[cid]);
-            //         //std::cout << "Added block with " << blk.spqr->numberOfSNodes() << " S nodes" << std::endl;
-            //         components[cid]->blocks.push_back(std::move(blk));
-            //     }
-            // }
-
-            // std::cout << "Done building blocks" << std::endl;
-
-            // for (int cid = 0; cid < nCC; ++cid) {
-            //     PROFILE_BLOCK("solve:: finding snarls inside blocks");
-            //     for(auto &blk : components[cid]->blocks) {
-            //         if(blk.Gblk->numberOfNodes() >= 3) {
-            //             SPQRsolve::solveSPQR(blk, *components[cid]);
-            //         }
-            //         // checkBlockByCutVertices(*blk, *components[cid]);
-            //     }
-            // }
         }
+
+
     }
 }
 
 
-
-
 int main(int argc, char** argv) {
-    // rlimit w;
-    // w.rlim_cur = RLIM_INFINITY;
-    // w.rlim_max = RLIM_INFINITY;
-    
-    // setrlimit(RLIMIT_STACK, &w);
-
-
     rlimit rl;
     rl.rlim_cur = RLIM_INFINITY;
     rl.rlim_max = RLIM_INFINITY;
@@ -5121,58 +4473,31 @@ int main(int argc, char** argv) {
         perror("setrlimit");
     }
 
-
-    //PROFILE_BLOCK("Total run");
-    //PROFILE_FUNCTION();
     TIME_BLOCK("Starting graph reading...");
     logger::init();
 
-    
-
     readArgs(argc, argv);
+
     {
+        MEM_TIME_BLOCK("I/O: read graph");
+        MARK_SCOPE_MEM("io/read_graph");
         PROFILE_BLOCK("Graph reading");
         GraphIO::readGraph();
     }
-    // GraphIO::drawGraph(ctx().G, "input_graph");
 
-
-    // std::vector<edge> res;
-    // solver::run_fas(ctx().G, res);
-
-
-    // for(auto &e:res) {
-    //     std::cout << e->source() << " " << e->target() << std::endl;
-    // }
-
-    // return 0;
-
-
-    
-    if(ctx().bubbleType == Context::BubbleType::SUPERBUBBLE) {
+    if (ctx().bubbleType == Context::BubbleType::SUPERBUBBLE) {
         solver::superbubble::solve();
-    
+
         std::cout << "Superbubbles found:\n";
         std::cout << ctx().superbubbles.size() << std::endl;
-        // return 0;
-        // if(false)
-        // std::sort(ctx().superbubbles.begin(), ctx().superbubbles.end(), [&](std::pair<node, node> &a, std::pair<node, node> &b) {
-        //     if(std::stoi(ctx().node2name[a.first]) < std::stoi(ctx().node2name[b.first])) return true;
-        //     else if(std::stoi(ctx().node2name[a.first]) == std::stoi(ctx().node2name[b.first])) {
-        //         return std::stoi(ctx().node2name[a.second]) < std::stoi(ctx().node2name[b.second]);
-        //     }
-        //     return false;
-        // });
-    } else if(ctx().bubbleType == Context::BubbleType::SNARL) {
+    } else if (ctx().bubbleType == Context::BubbleType::SNARL) {
         solver::snarls::solve();
         std::cout << "Snarls found..\n";
-        // for(auto &w:ctx().snarls) {
-        //     std::cout << w.first << " " << w.second << std::endl;
-        // }
-    }      
-
+    }
 
     {
+        MEM_TIME_BLOCK("I/O: write output");
+        MARK_SCOPE_MEM("io/write_output");
         PROFILE_BLOCK("Writing output");
         TIME_BLOCK("Writing output");
         GraphIO::writeSuperbubbles();
@@ -5181,13 +4506,12 @@ int main(int argc, char** argv) {
     std::cout << "Snarls found: " << snarlsFound << std::endl;
     PROFILING_REPORT();
 
-    // for(auto &sb:ctx().superbubbles) {
-    //     std::cout << ctx().node2name[sb.first] << " " << ctx().node2name[sb.second] << '\n';
-    // }
+    logger::info("Process PeakRSS: {:.2f} GiB", memtime::peakRSSBytes() / (1024.0 * 1024.0 * 1024.0));
 
-    // std::cout << "total count: " << ctx().superbubbles.size() << std::endl;
-    
-    // std::cout << ctx().outDeg[ctx().name2node["153"]] << std::endl;
+    mark::report();
+    if (!g_report_json_path.empty()) {
+        mark::report_to_json(g_report_json_path);
+    }
 
     return 0;
 }
