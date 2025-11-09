@@ -2411,6 +2411,8 @@ void solveStreaming() {
             // ogdf::NodeArray<ogdf::node> nodeBlkToSkel;
             // ogdf::NodeArray<ogdf::node> edgeBlkToSkel;
 
+            std::unordered_set<std::pair<std::string, std::string>, pair_hash> _adjInS;
+
             ogdf::node bNode {nullptr};
 
             bool isAcycic {true};
@@ -2425,6 +2427,9 @@ void solveStreaming() {
 
             ogdf::NodeArray<bool> isTip;
 
+            ogdf::NodeArray<int> degPlus, degMinus;
+
+
             ogdf::NodeArray<bool> isCutNode;
             ogdf::NodeArray<bool> isGoodCutNode;
 
@@ -2437,6 +2442,9 @@ void solveStreaming() {
             
             // ogdf::NodeArray<ogdf::node> toCopy;
             // ogdf::NodeArray<ogdf::node> toBlk;
+
+
+
 
             std::unique_ptr<ogdf::BCTree> bc;
             std::vector<BlockData> blocks;
@@ -3081,6 +3089,13 @@ void solveStreaming() {
                 std::vector<bool> cuts(nodesInOrderGcc.size(), false);
 
                 std::vector<std::string> res;
+
+
+                for (size_t i = 0; i < nodesInOrderGcc.size(); i++) {
+                    std::string s = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[i]]], t = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[(i+1)%nodesInOrderGcc.size()]]];
+                    blk._adjInS.insert({ s, t});
+                }
+
 
                 for (size_t i = 0; i < nodesInOrderGcc.size(); i++) {
                     auto uGcc = nodesInOrderGcc[i];
@@ -3733,6 +3748,55 @@ void solveStreaming() {
                 }
 
                 solveNodes(node_dp, edge_dp, blk, cc);
+
+
+                for(edge eGblk: blk.Gblk->edges) {
+                    edge eGcc = blk.edgeToOrig[eGblk];
+                    edge eG = cc.edgeToOrig[eGcc];
+
+                    node uGcc = eGcc->source();
+                    node vGcc = eGcc->target();
+
+                    node uG = cc.nodeToOrig[uGcc];
+                    node vG = cc.nodeToOrig[vGcc];
+
+                    if(ctx().node2name[uG] == "_trash" || ctx().node2name[vG] == "_trash") {
+                        continue;
+                    }
+
+                    if(cc.isTip[uGcc] || cc.isTip[vGcc]) {
+                        continue;
+                    }
+
+                    if((cc.isCutNode[uGcc] && cc.badCutCount[uGcc]>0) || (cc.isCutNode[vGcc] && cc.badCutCount[vGcc]>0)) {
+                        continue;
+                    }
+
+                    int uPlusCnt = cc.degPlus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? 1 : 0), uMinusCnt = cc.degMinus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::MINUS ? 1 : 0);
+                    int vPlusCnt = cc.degPlus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? 1 : 0), vMinusCnt = cc.degMinus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::MINUS ? 1 : 0);
+                
+
+                    bool ok = false;
+
+                    string s = ctx().node2name[cc.nodeToOrig[uGcc]];
+                    string t = ctx().node2name[cc.nodeToOrig[vGcc]];
+
+
+                    if((uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt > 0 && vMinusCnt == 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt > 0 && vMinusCnt == 0)) {
+                        ok = true;
+                    }
+
+                    if(ok) {
+                        std::vector<std::string> v={/*"E"+*/s + (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? "+" : "-"),/*"E"+*/t + (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? "+" : "-")};
+                        addSnarl(v);
+                        if(!blk._adjInS.count({s, t}) && !blk._adjInS.count({t, s})) {
+
+                            addSnarl(v);
+                        }
+                    } 
+                }
+                    
+
             }
 
 
@@ -4030,6 +4094,8 @@ void solveStreaming() {
                         (*components)[cid]->isGoodCutNode.init(*(*components)[cid]->Gcc, false);
                         (*components)[cid]->lastBad.init(*(*components)[cid]->Gcc, nullptr);
                         (*components)[cid]->badCutCount.init(*(*components)[cid]->Gcc, 0);
+                        (*components)[cid]->degPlus.init(*(*components)[cid]->Gcc, 0);
+                        (*components)[cid]->degMinus.init(*(*components)[cid]->Gcc, 0);
 
                         std::unordered_map<node, node> orig_to_cc;
                         orig_to_cc.reserve((*bucket)[cid].size());
@@ -4043,6 +4109,11 @@ void solveStreaming() {
                         for (edge e : (*edgeBuckets)[cid]) {
                             auto eC = (*components)[cid]->Gcc->newEdge(orig_to_cc[e->source()], orig_to_cc[e->target()]);
                             (*components)[cid]->edgeToOrig[eC] = e;
+                            
+                            (*components)[cid]->degPlus[orig_to_cc[e->source()]] += (getNodeEdgeType(e->source(), e) == EdgePartType::PLUS ? 1 : 0);
+                            (*components)[cid]->degMinus[orig_to_cc[e->source()]] += (getNodeEdgeType(e->source(), e) == EdgePartType::MINUS ? 1 : 0);
+                            (*components)[cid]->degPlus[orig_to_cc[e->target()]] += (getNodeEdgeType(e->target(), e) == EdgePartType::PLUS ? 1 : 0);
+                            (*components)[cid]->degMinus[orig_to_cc[e->target()]] += (getNodeEdgeType(e->target(), e) == EdgePartType::MINUS ? 1 : 0);
                         }
                     }
                     processed++;
@@ -4277,6 +4348,7 @@ void solveStreaming() {
                 }
             }
 
+
             std::vector<std::unique_ptr<CcData>> components(nCC);
 
             std::vector<BlockPrep> blockPreps;
@@ -4504,6 +4576,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Snarls found: " << snarlsFound << std::endl;
+
     PROFILING_REPORT();
 
     logger::info("Process PeakRSS: {:.2f} GiB", memtime::peakRSSBytes() / (1024.0 * 1024.0 * 1024.0));
