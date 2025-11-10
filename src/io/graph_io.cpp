@@ -1,68 +1,199 @@
-// ─── src/io/graph_io.cpp ────────────────────────────────────────────────────
-#include "graph_io.hpp"          // declarations
-#include "util/context.hpp"         // ctx()
+#include "graph_io.hpp"
+#include "util/context.hpp"
 #include "util/timer.hpp"
-#include <ogdf/energybased/FMMMLayout.h>   // drawGraph needs it
+#include <ogdf/energybased/FMMMLayout.h> 
 #include <ogdf/fileformats/GraphIO.h>
 #include <fstream>
 #include <regex>
+#include <unordered_set>
 
 
 #include "util/logger.hpp"
 
-using namespace ogdf;               // exactly as in your old main.cpp
+
+using namespace ogdf;
+
+
 
 namespace GraphIO {
-
-// ---------- readStandard ---------------------------------------------------
 void readStandard()
 {
     auto &C = ctx();
 
+    if(C.bubbleType == Context::BubbleType::SNARL) {
+        throw std::runtime_error("Standard graph input not supported for snarls, use GFA input");
+    }
     int n, m;
+
+    std::istream* input = nullptr;
+    std::ifstream infile;
+
     if (!C.graphPath.empty()) {
-        std::ifstream in(C.graphPath);
-        if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
-
-        if (!(in >> n >> m))
-            throw std::runtime_error("expected: n m, then m lines u v");
-
-        for (int i = 0; i < m; ++i) {
-            std::string u, v;
-            if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
-
-            if (!C.name2node.count(u)) {
-                C.name2node[u] = C.G.newNode();
-                C.node2name[C.name2node[u]] = u;
-            }
-            if (!C.name2node.count(v)) {
-                C.name2node[v] = C.G.newNode();
-                C.node2name[C.name2node[v]] = v;
-            }
-            C.G.newEdge(C.name2node[u], C.name2node[v]);
-        }
+        infile.open(C.graphPath);
+        if (!infile) throw std::runtime_error("Cannot open " + C.graphPath);
+        input = &infile;
     } else {
-        if (!(std::cin >> n >> m))
-            throw std::runtime_error("expected: n m, then m lines u v");
+        input = &std::cin;
+    }
 
-        for (int i = 0; i < m; ++i) {
-            std::string u, v;
-            if (!(std::cin >> u >> v)) throw std::runtime_error("edge line");
+    if (!(*input >> n >> m)) throw std::runtime_error("expected: n m, then m lines u v");
 
-            if (!C.name2node.count(u)) {
-                C.name2node[u] = C.G.newNode();
-                C.node2name[C.name2node[u]] = u;
+
+        C.node2name.reserve(n);
+
+    struct EdgeKey {
+        std::string u, v;
+        bool operator==(const EdgeKey& o) const { return u == o.u && v == o.v; }
+    };
+    struct EdgeKeyHash {
+        std::size_t operator()(EdgeKey const& k) const {
+            std::size_t h1 = std::hash<std::string>{}(k.u);
+            std::size_t h2 = std::hash<std::string>{}(k.v);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
+    std::unordered_set<EdgeKey, EdgeKeyHash> edges;
+    for (int i = 0; i < m; ++i) {
+        std::string u, v;
+        if (!(*input >> u >> v)) throw std::runtime_error("edge line missing");
+        edges.insert({u, v});
+    }
+
+    std::unordered_set<EdgeKey, EdgeKeyHash> processed;
+
+
+    for (auto const& e : edges) {
+        if (processed.count(e)) continue;
+
+        EdgeKey rev{e.v, e.u};
+
+        if (edges.count(rev)) {
+            processed.insert(e);
+            processed.insert(rev);
+
+            if (!C.name2node.count(e.u)) {
+                C.name2node[e.u] = C.G.newNode();
+                C.node2name[C.name2node[e.u]] = e.u;
             }
-            if (!C.name2node.count(v)) {
-                C.name2node[v] = C.G.newNode();
-                C.node2name[C.name2node[v]] = v;
+            if (!C.name2node.count(e.v)) {
+                C.name2node[e.v] = C.G.newNode();
+                C.node2name[C.name2node[e.v]] = e.v;
             }
-            C.G.newEdge(C.name2node[u], C.name2node[v]);
+
+
+            node t1 = C.G.newNode(), t2 = C.G.newNode(); 
+
+            C.node2name[t1] = "_trash";
+            C.node2name[t2] = "_trash";
+
+            C.G.newEdge(C.name2node[e.u], t1);
+            C.G.newEdge(t1, C.name2node[e.v]);
+            C.G.newEdge(C.name2node[e.v], t2);
+            C.G.newEdge(t2, C.name2node[e.u]);
+        } else {
+            
+            processed.insert(e);
+
+            if (!C.name2node.count(e.u)) {
+                C.name2node[e.u] = C.G.newNode();
+                C.node2name[C.name2node[e.u]] = e.u;
+            }
+            if (!C.name2node.count(e.v)) {
+                C.name2node[e.v] = C.G.newNode();
+                C.node2name[C.name2node[e.v]] = e.v;
+            }
+
+            C.G.newEdge(C.name2node[e.u], C.name2node[e.v]);
         }
     }
+
+
+
+
+    // if (!C.graphPath.empty()) {
+    //     std::ifstream in(C.graphPath);
+
+    //     if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
+
+    //     if (!(in >> n >> m))
+    //         throw std::runtime_error("expected: n m, then m lines u v");
+
+    //     C.node2name.reserve(n);
+
+        
+    //     struct EdgeKey {
+    //         std::string u, v;
+    //         bool operator==(const EdgeKey& o) const { return  u==o.u && v==o.v; }
+    //     };
+
+    //     struct EdgeKeyHash {
+    //         std::size_t operator()(EdgeKey const& k) const {
+    //             std::size_t h1 = std::hash<std::string>{}(k.u);
+    //             std::size_t h2 = std::hash<std::string>{}(k.v);
+    //             return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+    //         }
+    //     };
+
+    //     std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+    //     std::vector<std::pair<std::string, std::string>> raw_edges;
+
+
+    //     for (size_t i = 0; i < m; i++)
+    //     {
+    //         std::string u, v;
+    //         if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
+    //         raw_edges.push_back({u,v});
+    //     }
+        
+
+    //     for (int i = 0; i < m; ++i) {
+    //         std::string u = raw_edges[i].first, v = raw_edges[i].second;
+    //         // if (!(in >> u >> v)) throw std::runtime_error("edge line missing");
+
+
+    //         // EdgeKey key{u, v};
+    //         // if(seen.count(key)) continue;
+
+
+
+    //         if (!C.name2node.count(u)) {
+    //             C.name2node[u] = C.G.newNode();
+    //             C.node2name[C.name2node[u]] = u;
+    //         }
+    //         if (!C.name2node.count(v)) {
+    //             C.name2node[v] = C.G.newNode();
+    //             C.node2name[C.name2node[v]] = v;
+    //         }
+
+
+
+    //         C.G.newEdge(C.name2node[u], C.name2node[v]);
+    //     }
+    // } else {
+    //     if (!(std::cin >> n >> m))
+    //         throw std::runtime_error("expected: n m, then m lines u v");
+
+    //     C.node2name.reserve(n);
+
+    //     for (int i = 0; i < m; ++i) {
+    //         std::string u, v;
+    //         if (!(std::cin >> u >> v)) throw std::runtime_error("edge line");
+
+    //         if (!C.name2node.count(u)) {
+    //             C.name2node[u] = C.G.newNode();
+    //             C.node2name[C.name2node[u]] = u;
+    //         }
+    //         if (!C.name2node.count(v)) {
+    //             C.name2node[v] = C.G.newNode();
+    //             C.node2name[C.name2node[v]] = v;
+    //         }
+    //         C.G.newEdge(C.name2node[u], C.name2node[v]);
+    //     }
+    // }
 }
 
-// ---------- readGFA --------------------------------------------------------
+
 void readGFA()
 {
     auto &C = ctx();
@@ -72,40 +203,204 @@ void readGFA()
     std::ifstream in(C.graphPath);
     if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
+    std::unordered_set<std::string> have_segment;
+    std::vector<std::string> raw_edges;
+    raw_edges.reserve(1 << 16);
+
+
+
+    auto ensure = [&](const std::string& name){
+        if (!C.name2node.count(name)) {
+            auto id = C.G.newNode();
+            C.name2node[name] = id;
+            C.node2name[id] = name;
+        }
+    };
+
+
+
+
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
 
-        std::istringstream iss(line);
-        std::string token; iss >> token;
+        if (line[0] == 'S') {
+            std::istringstream iss(line);
+            std::string tok, id, seq;
+            iss >> tok >> id >> seq;
+            if (id.empty()) continue;
 
-        if (token == "S") {
-            std::string id, seq; iss >> id >> seq;
-            if (!C.name2node.count(id))
-                C.name2node[id] = C.G.newNode();
+            if(C.bubbleType == Context::BubbleType::SNARL) {
+                have_segment.insert(id);
+                auto newNode = C.G.newNode();
+                C.name2node[id] = newNode;
+                C.node2name[newNode] = id;
+            } else {
+                have_segment.insert(id);
+                ensure(id + "+");
+                ensure(id + "-");
+            }
+            continue;
         }
-        else if (token == "L") {
-            std::string from, o1, to, o2, ovl;
-            iss >> from >> o1 >> to >> o2 >> ovl;
-            if (o1 != o2) continue;
-            if (o1 == "-") std::swap(from, to);
+        if (line[0] == 'L') {
+            raw_edges.push_back(line);
+            continue;
+        }
+    }
 
-            if (!C.name2node.count(from)) {
-                C.name2node[from] = C.G.newNode();
-                C.node2name[C.name2node[from]] = from;
-            }
-            if (!C.name2node.count(to)) {
-                C.name2node[to]  = C.G.newNode();
-                C.node2name[C.name2node[to]]  = to;
-            }
-            C.G.newEdge(C.name2node[from], C.name2node[to]);
+    in.close();
+
+
+    auto flip = [](char c){ return c == '+' ? '-' : '+'; };
+
+    struct EdgeKey {
+        std::string u, v;
+        bool operator==(const EdgeKey& o) const { return  u==o.u && v==o.v; }
+    };
+    struct EdgeKeyHash {
+        std::size_t operator()(EdgeKey const& k) const {
+            std::size_t h1 = std::hash<std::string>{}(k.u);
+            std::size_t h2 = std::hash<std::string>{}(k.v);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
         }
+    };
+    std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+
+
+    struct PairHash {
+        std::size_t operator()(const std::pair<std::string,std::string>& p) const noexcept {
+            std::size_t h1 = std::hash<std::string>{}(p.first);
+            std::size_t h2 = std::hash<std::string>{}(p.second);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+        }
+    };
+
+    std::unordered_map<std::pair<std::string, std::string>, int, PairHash> pair_count;
+    for (const std::string& e : raw_edges) {
+        std::istringstream iss(e);
+        std::string tok, from, to, ovl_str;
+        char o1 = 0, o2 = 0;
+        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) continue;
+        if (tok != "L") continue;
+
+        // unordered pair key
+        auto key = (from < to) ? std::make_pair(from, to) : std::make_pair(to, from);
+        pair_count[key]++;
+    }
+
+
+
+
+    auto add_edge_double = [&](const std::string& u, const std::string& v){
+        EdgeKey key{u, v};
+        if (seen.insert(key).second) {
+            C.G.newEdge(C.name2node[u], C.name2node[v]);
+        }
+    };
+
+    // auto add_edge_bidirected = [&](std::string& u, std::string& v, EdgePartType t1, EdgePartType t2){
+    //     // if(u>v) {
+    //     //     std::swap(u, v);
+    //     //     std::swap(t1, t2);
+    //     // }
+
+    //     // EdgeKey key{u, v};
+    //     // if (seen.insert(key).second) {
+    //         node trashNode = C.G.newNode();
+    //         C.node2name[trashNode] = "_trash";
+
+    //         // auto e1 = C.G.newEdge(C.name2node[u], C.name2node[v]);
+
+    //         auto e1 = C.G.newEdge(C.name2node[u], trashNode);
+    //         C._edge2types[e1] = std::make_pair(t1, EdgePartType::PLUS);
+
+    //         auto e2 = C.G.newEdge(trashNode, C.name2node[v]);
+    //         C._edge2types[e2] = std::make_pair(EdgePartType::PLUS, t2);
+
+    //         // C._edge2cnt[e].first = (t1 == EdgePartType::PLUS) ? 1 : 0;
+    //         // C._edge2cnt[e].second = (t2 == EdgePartType::PLUS) ? 1 : 0;
+    //         // std::cout << "Added " << u << " - " << v <<  (t1 == EdgePartType::PLUS ? "+" : "-") << " - " << (t2 == EdgePartType::PLUS ? "+" : "-") << std::endl;
+    //     // } 
+    //     // else {
+    //     //     auto e = C.G.newEdge(C.name2node[u], C.name2node[v]);
+    //     //     C._edge2types[e] = std::make_pair(t1, t2);
+
+    //     // }
+    // };
+
+    auto add_edge_bidirected = [&]( std::string& u,
+                                    std::string& v,
+                                    EdgePartType t1,
+                                    EdgePartType t2)
+    {
+        if(u>v) {
+            std::swap(u, v);
+            std::swap(t1, t2);
+        }
+
+        auto key = std::make_pair(u, v);
+
+        bool multi = pair_count[key] > 1;
+
+        if (!multi) {
+            auto e = C.G.newEdge(C.name2node[u], C.name2node[v]);
+            C._edge2types[e] = std::make_pair(t1, t2);
+            return;
+        }
+
+        std::string mid_name = "_trash";
+        auto mid_node = C.G.newNode();
+        C.node2name[mid_node] = mid_name;
+
+        {
+            auto e1 = C.G.newEdge(C.name2node[u], mid_node);
+            C._edge2types[e1] = std::make_pair(t1, EdgePartType::PLUS);
+        }
+        {
+            auto e2 = C.G.newEdge(mid_node, C.name2node[v]);
+            C._edge2types[e2] = std::make_pair(EdgePartType::PLUS, t2);
+        }
+    };
+
+
+
+    for (const std::string& e : raw_edges) {
+        std::istringstream iss(e);
+        std::string tok, from, to, ovl_str;
+        char o1 = 0, o2 = 0;
+
+        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) continue;
+        if (tok != "L") continue;
+
+        // if (!have_segment.count(from) || !have_segment.count(to)) {
+        //     continue;
+        // }
+
+        if(C.bubbleType == Context::BubbleType::SUPERBUBBLE) {
+            ensure(from + "+"); ensure(from + "-");
+            ensure(to   + "+"); ensure(to   + "-");
+            if (o1=='+' || o1=='-') {
+                if (o2=='+' || o2=='-') {
+                    const std::string u1 = from + std::string(1, o1);
+                    const std::string v1 = to   + std::string(1, o2);
+                    add_edge_double(u1, v1);
+    
+                    const std::string u2 = to   + std::string(1, flip(o2));
+                    const std::string v2 = from + std::string(1, flip(o1));
+                    add_edge_double(u2, v2);
+                }
+            }
+        } else if(C.bubbleType == Context::BubbleType::SNARL) {
+            auto t1 = (o1 == '+' ? EdgePartType::PLUS : EdgePartType::MINUS);
+            auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
+            add_edge_bidirected(from, to, t1, t2);
+        }
+
     }
 }
 
-// ---------- readGraph (wrapper) -------------------------------------------
-void readGraph()
-{
+
+void readGraph() {
     auto &C = ctx();
     TIME_BLOCK("Graph read");
 
@@ -115,20 +410,21 @@ void readGraph()
     else readStandard();
 
     C.isEntry = NodeArray<bool>(C.G, false);
-    C.isExit  = NodeArray<bool>(C.G, false);
-    C.inDeg   = NodeArray<int >(C.G, 0);
-    C.outDeg  = NodeArray<int >(C.G, 0);
+    C.isExit = NodeArray<bool>(C.G, false);
+    C.inDeg = NodeArray<int>(C.G, 0);
+    C.outDeg = NodeArray<int>(C.G, 0);
 
     for (edge e : C.G.edges) {
         C.outDeg(e->source())++;
         C.inDeg (e->target())++;
     }
 
+    // C.superbubbles.reserve((int)C.G.nodes.size());
+
     logger::info("Graph read");
 }
 
-// ---------- drawGraph ------------------------------------------------------
-void drawGraph(Graph &G, const std::string &file)
+void drawGraph(const ogdf::Graph &G, const std::string &file)
 {
     return;
     using namespace ogdf;
@@ -148,10 +444,10 @@ void drawGraph(Graph &G, const std::string &file)
         GA.shape(v) = Shape::Ellipse;
         GA.width(v) = GA.height(v) = 20.0;
     }
-    for (edge e : G.edges)
-        GA.label(e) = C.node2name.count(e->source())
-                    ? C.node2name[e->source()]
-                    : std::to_string(e->index());
+    // for (edge e : G.edges)
+    //     GA.label(e) = C.node2name.count(e->source())
+    //                 ? C.node2name[e->source()]
+    //                 : std::to_string(e->index());
 
     FMMMLayout().call(GA);
 
@@ -239,26 +535,227 @@ void drawGraph(Graph &G, const std::string &file)
     out << in.rdbuf();
     in.close(); out.close();
     std::remove(tmp.c_str());
+}
 
-    /*  … rest of your bending/bundling and SVG-writing
-        code copied unchanged … */
+std::vector<std::pair<std::string, std::string>> project_bubblegun_pairs_from_doubled() {
+    auto& sb = ctx().superbubbles;     // vector<pair<NodeId, NodeId>> on the doubled graph
+    auto& names = ctx().node2name;     // NodeId -> "SEGID+" or "SEGID-"
+
+    auto is_oriented = [](const std::string& s) -> bool {
+        return !s.empty() && (s.back() == '+' || s.back() == '-');
+    };
+    auto strip = [](std::string s) -> std::string {
+        if (!s.empty() && (s.back() == '+' || s.back() == '-')) s.pop_back();
+        return s;
+    };
+    auto pair_hash = [](const std::pair<std::string,std::string>& p) -> std::size_t {
+        return std::hash<std::string>{}(p.first) ^ (std::hash<std::string>{}(p.second) << 1);
+    };
+
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(sb.size());
+
+    // Deduplicate exact directed (src, dst) after projection
+    std::unordered_set<std::pair<std::string,std::string>, decltype(pair_hash)> seen(0, pair_hash);
+
+    // Optional: dedupe oriented inputs first (in case your finder emitted duplicates)
+    using Oriented = std::pair<std::string,std::string>;
+    std::unordered_set<Oriented, decltype(pair_hash)> seen_oriented(0, pair_hash);
+
+    for (auto const& e : sb) {
+        const std::string& sa = names[e.first];   // e.g. "12345+"
+        const std::string& sbn = names[e.second]; // e.g. "67890-"
+
+        // Ignore exact duplicate oriented inputs
+        if (!seen_oriented.insert({sa, sbn}).second) continue;
+
+        // Canonicalize orientation to kill the doubled mirror: keep only source '+'
+        if (is_oriented(sa) && sa.back() == '-') continue;
+
+        // (If some inputs are not marked with +/- at all, we keep them as-is.)
+
+        std::string a = strip(sa);   // segment id (no +/-)
+        std::string b = strip(sbn);  // segment id (no +/-)
+        if (a == b) continue;        // BubbleGun won’t report degenerate self-bubbles
+
+        if (seen.insert({a, b}).second) {
+            out.emplace_back(std::move(a), std::move(b));
+        }
+    }
+
+    return out;
 }
 
 
 void writeSuperbubbles() {
-    if(ctx().outputPath == "") {
-        std::cout << ctx().superbubbles.size() << std::endl;
-        for(auto &p:ctx().superbubbles) {
-            std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << std::endl;
+    std::vector<std::pair<std::string, std::string>> res;
+
+    if(ctx().bubbleType == Context::BubbleType::SNARL) {
+        if (ctx().outputPath.empty()) {
+            std::cout << ctx().snarls.size() << "\n";
+            for (auto &s : ctx().snarls) {
+                for(auto &v : s) {
+                    std::cout << v << " ";
+                }
+                std::cout << std::endl;
+                // std::cout << p.first << " " << p.second << "\n";
+            }
+        } else {
+            std::ofstream out(ctx().outputPath);
+
+            // for(auto &p:ctx().superbubbles) {
+            //     out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
+            // }
+
+            out << ctx().snarls.size() << "\n";
+            for (auto &s : ctx().snarls) {
+                for(auto &v : s) {
+                    out << v << " ";
+                }
+                out << "\n";
+                // std::cout << p.first << " " << p.second << "\n";
+            }
         }
 
+        return;
+    } 
+
+    if (ctx().gfaInput) {
+        // auto has_orient = [](const std::string& s) {
+        //     return !s.empty() && (s.back() == '+' || s.back() == '-');
+        // };
+        // auto flip_char = [](char c) {
+        //     return c == '+' ? '-' : c == '-' ? '+' : c;
+        // };
+        // auto invert = [&](std::string s) {
+        //     if (has_orient(s)) s.back() = flip_char(s.back());
+        //     return s;
+        // };
+        // auto strip = [&](std::string s) {
+        //     if (has_orient(s)) s.pop_back();
+        //     return s;
+        // };
+
+        // auto pair_hash = [](const std::pair<std::string,std::string>& p) -> std::size_t {
+        //     std::size_t h1 = std::hash<std::string>{}(p.first);
+        //     std::size_t h2 = std::hash<std::string>{}(p.second);
+        //     return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+        // };
+        // std::unordered_set<std::pair<std::string,std::string>, decltype(pair_hash)> seen(0, pair_hash);
+
+        // for (auto& w : ctx().superbubbles) {
+        //     std::string sa = ctx().node2name[w.first];   // oriented, e.g. "12345+"
+        //     std::string sb = ctx().node2name[w.second];  // oriented, e.g. "67890-"
+
+        //     // Mirror normalize so the first endpoint is '+'
+        //     if (has_orient(sa) && sa.back() == '-') {
+        //         std::string sa_m = invert(sb);
+        //         std::string sb_m = invert(sa);
+        //         sa = sa_m;
+        //         sb = sb_m;
+        //     }
+
+        //     // Strip orientation
+        //     std::string a = strip(sa);
+        //     std::string b = strip(sb);
+
+        //     if (a == b) continue; // skip self-pairs
+
+        //     // Canonicalize unordered pair
+        //     if (b < a) std::swap(a, b);
+
+        //     // Deduplicate
+        //     if (seen.insert({a, b}).second) {
+        //         res.emplace_back(std::move(a), std::move(b));
+        //     }
+        // }
+
+                // --- helpers on oriented names like "12345+" / "67890-"
+        auto has_orient = [](const std::string& s) {
+            return !s.empty() && (s.back()=='+' || s.back()=='-');
+        };
+        auto flip_char = [](char c){ return c=='+'?'-': (c=='-')?'+': c; };
+        auto invert = [&](std::string s){ if (has_orient(s)) s.back() = flip_char(s.back()); return s; };
+        auto strip = [&](std::string s){ if (has_orient(s)) s.pop_back(); return s; };
+
+        // Canonical representative under (x, y) ~ (invert(y), invert(x))
+        auto canonical_mirror_rep = [&](const std::string& x, const std::string& y){
+            std::string xA = x, yA = y;
+            std::string xB = invert(y), yB = invert(x);
+            if (std::tie(xB, yB) < std::tie(xA, yA))
+                return std::pair<std::string,std::string>{xB, yB};
+            return std::pair<std::string,std::string>{xA, yA};
+        };
+
+        // After mirror-canonicalization, transform by inverting the first
+        // and then make the pair unordered (sort the two strings)
+        auto transform_and_unorder = [&](const std::pair<std::string,std::string>& p){
+            std::string a = invert(p.first);   // invert sign of first
+            std::string b = p.second;          // keep second as-is
+            if (b < a) std::swap(a, b);        // unordered set -> canonical order
+            return std::pair<std::string,std::string>{std::move(a), std::move(b)};
+        };
+
+        // hash for unordered pair<string,string>
+        auto pair_hash = [](const std::pair<std::string,std::string>& pr)->std::size_t {
+            std::size_t h1 = std::hash<std::string>{}(pr.first);
+            std::size_t h2 = std::hash<std::string>{}(pr.second);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+        };
+        std::unordered_set<std::pair<std::string,std::string>, decltype(pair_hash)> seen(0, pair_hash);
+
+        for (auto& w : ctx().superbubbles) {
+            const std::string s = ctx().node2name[w.first];   // e.g. "a+"
+            const std::string t = ctx().node2name[w.second];  // e.g. "b+"
+
+            // 1) mirror-canonicalize
+            auto rep = canonical_mirror_rep(s, t);
+
+            // 2) invert first, unorder
+            auto fin = transform_and_unorder(rep);
+
+            // 3) strip orientations for final bidirected output
+            fin.first  = strip(fin.first);
+            fin.second = strip(fin.second);
+
+            // 4) dedupe
+            if (fin.first != fin.second) {
+                if (seen.insert(fin).second) {
+                    res.emplace_back(std::move(fin));
+                }
+            }
+        }
+
+
+    } else {
+        for (auto &w : ctx().superbubbles) {
+            res.push_back({ctx().node2name[w.first], ctx().node2name[w.second]});
+        }
+    }
+
+        // for(auto &p:ctx().superbubbles) {
+        //     std::cout << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
+        // }
+
+
+    if (ctx().outputPath.empty()) {
+        std::cout << res.size() << "\n";
+        for (auto &p : res) {
+            std::cout << p.first << " " << p.second << "\n";
+        }
     } else {
         std::ofstream out(ctx().outputPath);
-        out << ctx().superbubbles.size() << std::endl;
-        for(auto &p:ctx().superbubbles) {
-            out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << std::endl;
+
+        // for(auto &p:ctx().superbubbles) {
+        //     out << ctx().node2name[p.first] << " " << ctx().node2name[p.second] << "\n";
+        // }
+
+        out << res.size() << "\n";
+        for (auto &p : res) {
+            out << p.first << " " << p.second << "\n";
         }
     }
 }
 
-} // namespace GraphIO
+
+}

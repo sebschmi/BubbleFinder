@@ -1,6 +1,5 @@
 #include "context.hpp"
 
-/* Construct the NodeArrays with the graph reference. */
 Context::Context()
     : inDeg   (G, 0)
     , outDeg  (G, 0)
@@ -9,16 +8,18 @@ Context::Context()
     , graphPath ("")
     , outputPath("")
     , gfaInput(false)
-    , logLevel(Context::LOG_INFO)
+    , doubleGraph(false)
+    , logLevel(Context::LOG_WARN)
     , timingEnabled(true)
+    , threads(1)
+    , bubbleType(Context::BubbleType::SUPERBUBBLE)
+    , _edge2types(G, std::make_pair(EdgePartType::NONE, EdgePartType::NONE))
+    , _edge2cnt(G, std::make_pair(0,0))
+    , _goodCutVertices(G, false)
 {}
 
 
-
-
-/* “Magic static” – initialised once, thread-safe since C++11.   */
-Context& ctx()
-{
-    static Context instance;         // C++11: guaranteed thread-safe
+Context& ctx() {
+    static Context instance;
     return instance;
 }
