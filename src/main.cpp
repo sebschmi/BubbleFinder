@@ -2050,7 +2050,7 @@ void solveStreaming() {
 
     {
         PROFILE_BLOCK("solve:: building data");
-        MEM_TIME_BLOCK("BUILD: BC+SPQR");
+        //MEM_TIME_BLOCK("BUILD: BC+SPQR");
         ACCUM_BUILD();
 
         {
@@ -2216,7 +2216,7 @@ void solveStreaming() {
 }
 
     {
-        MEM_TIME_BLOCK("LOGIC: solve blocks (pthreads)");
+        //MEM_TIME_BLOCK("LOGIC: solve blocks (pthreads)");
         ACCUM_LOGIC();
         PROFILE_BLOCK("solve:: process blocks (pthreads, large stack)");
         MARK_SCOPE_MEM("sb/phase/SolveBlocks");
@@ -2294,6 +2294,16 @@ void solveStreaming() {
                 for (auto &s : local) {
                     snarlsFound += s.size() * (s.size() - 1) / 2;
                     C.snarls.insert(s);
+
+
+                    // std::sort(s.begin(), s.end());
+                    // for(size_t i = 0; i < s.size(); i++) {
+                    //     for(size_t j = i + 1; j < s.size(); j++) {
+                    //         std::string source = s[i], sink = s[j];
+                    //         // if(source == "_trash+" || sink == "_trash+") continue;
+                    //         C.snarls.insert({source, sink});
+                    //     }
+                    // }
                 }
                 local.clear();
             }
@@ -2421,7 +2431,7 @@ void solveStreaming() {
             // ogdf::NodeArray<ogdf::node> nodeBlkToSkel;
             // ogdf::NodeArray<ogdf::node> edgeBlkToSkel;
 
-            std::unordered_set<std::pair<std::string, std::string>, pair_hash> _adjInS;
+            // std::unordered_set<std::pair<std::string, std::string>, pair_hash> _adjInS;
 
             ogdf::node bNode {nullptr};
 
@@ -3101,10 +3111,10 @@ void solveStreaming() {
                 std::vector<std::string> res;
 
 
-                for (size_t i = 0; i < nodesInOrderGcc.size(); i++) {
-                    std::string s = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[i]]], t = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[(i+1)%nodesInOrderGcc.size()]]];
-                    blk._adjInS.insert({ s, t});
-                }
+                // for (size_t i = 0; i < nodesInOrderGcc.size(); i++) {
+                //     std::string s = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[i]]], t = ctx().node2name[cc.nodeToOrig[nodesInOrderGcc[(i+1)%nodesInOrderGcc.size()]]];
+                //     blk._adjInS.insert({ s, t});
+                // }
 
 
                 for (size_t i = 0; i < nodesInOrderGcc.size(); i++) {
@@ -3760,50 +3770,54 @@ void solveStreaming() {
                 solveNodes(node_dp, edge_dp, blk, cc);
 
 
-                for(edge eGblk: blk.Gblk->edges) {
-                    edge eGcc = blk.edgeToOrig[eGblk];
-                    edge eG = cc.edgeToOrig[eGcc];
+                {
+                    // PROFILE_BLOCK("sn/eachEdge");
+                    for(edge eGblk: blk.Gblk->edges) {
+                        edge eG = blk.edgeToOrig[eGblk];
 
-                    node uGcc = eGcc->source();
-                    node vGcc = eGcc->target();
+                        node uGcc = blk.nodeToOrig[eGblk->source()];
+                        node vGcc = blk.nodeToOrig[eGblk->target()];
 
-                    node uG = cc.nodeToOrig[uGcc];
-                    node vG = cc.nodeToOrig[vGcc];
+                        node uG = cc.nodeToOrig[uGcc];
+                        node vG = cc.nodeToOrig[vGcc];
 
-                    if(ctx().node2name[uG] == "_trash" || ctx().node2name[vG] == "_trash") {
-                        continue;
-                    }
-
-                    if(cc.isTip[uGcc] || cc.isTip[vGcc]) {
-                        continue;
-                    }
-
-                    if((cc.isCutNode[uGcc] && cc.badCutCount[uGcc]>0) || (cc.isCutNode[vGcc] && cc.badCutCount[vGcc]>0)) {
-                        continue;
-                    }
-
-                    int uPlusCnt = cc.degPlus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? 1 : 0), uMinusCnt = cc.degMinus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::MINUS ? 1 : 0);
-                    int vPlusCnt = cc.degPlus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? 1 : 0), vMinusCnt = cc.degMinus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::MINUS ? 1 : 0);
-                
-
-                    bool ok = false;
-
-                    string s = ctx().node2name[cc.nodeToOrig[uGcc]];
-                    string t = ctx().node2name[cc.nodeToOrig[vGcc]];
-
-
-                    if((uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt > 0 && vMinusCnt == 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt > 0 && vMinusCnt == 0)) {
-                        ok = true;
-                    }
-
-                    if(ok) {
-                        std::vector<std::string> v={/*"E"+*/s + (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? "+" : "-"),/*"E"+*/t + (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? "+" : "-")};
-                        addSnarl(v);
-                        if(!blk._adjInS.count({s, t}) && !blk._adjInS.count({t, s})) {
-                            std::vector<std::string> v={/*"E"+*/s + (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? "-" : "+"),/*"E"+*/t + (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? "-" : "+")};
-                            addSnarl(v);
+                        if(ctx().node2name[uG] == "_trash" || ctx().node2name[vG] == "_trash") {
+                            continue;
                         }
-                    } 
+
+                        if(cc.isTip[uGcc] || cc.isTip[vGcc]) {
+                            continue;
+                        }
+
+                        if((cc.isCutNode[uGcc] && cc.badCutCount[uGcc]>0) || (cc.isCutNode[vGcc] && cc.badCutCount[vGcc]>0)) {
+                            continue;
+                        }
+
+                        int uPlusCnt = cc.degPlus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? 1 : 0), uMinusCnt = cc.degMinus[uGcc] - (getNodeEdgeType(uG, eG) == EdgePartType::MINUS ? 1 : 0);
+                        int vPlusCnt = cc.degPlus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? 1 : 0), vMinusCnt = cc.degMinus[vGcc] - (getNodeEdgeType(vG, eG) == EdgePartType::MINUS ? 1 : 0);
+                    
+
+                        bool ok = false;
+
+                        string s = ctx().node2name[cc.nodeToOrig[uGcc]];
+                        string t = ctx().node2name[cc.nodeToOrig[vGcc]];
+
+
+                        if((uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt > 0 && vMinusCnt == 0) || (uPlusCnt > 0 && uMinusCnt == 0 && vPlusCnt == 0 && vMinusCnt > 0) || (uPlusCnt == 0 && uMinusCnt > 0 && vPlusCnt > 0 && vMinusCnt == 0)) {
+                            ok = true;
+                        }
+
+                        if(ok) {
+                            std::vector<std::string> v={/*"E"+*/s + (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? "+" : "-"),/*"E"+*/t + (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? "+" : "-")};
+                            addSnarl(v);
+
+                            node tNode = blk.spqr->skeletonOfReal(eGblk).treeNode();
+                            if(blk.spqr->typeOf(tNode) != SPQRTree::NodeType::SNode) {
+                                std::vector<std::string> v={/*"E"+*/s + (getNodeEdgeType(uG, eG) == EdgePartType::PLUS ? "-" : "+"),/*"E"+*/t + (getNodeEdgeType(vG, eG) == EdgePartType::PLUS ? "-" : "+")};
+                                addSnarl(v);
+                            }
+                        } 
+                    }
                 }
                     
 
@@ -4299,13 +4313,13 @@ void solveStreaming() {
 
                     // Measure SPQR build per-block
                     {
-                        MEM_TIME_BLOCK("SPQR: build (snarl worker)");
+                        //MEM_TIME_BLOCK("SPQR: build (snarl worker)");
                         buildBlockData(blk, *(*blockPreps)[bid].cc);
                     }
 
                     // Measure solve (snarl detection) per-block
                     {
-                        MEM_TIME_BLOCK("Algorithm: snarl solve (worker)");
+                        //MEM_TIME_BLOCK("Algorithm: snarl solve (worker)");
                         if (blk.Gblk && blk.Gblk->numberOfNodes() >= 3) {
                             SPQRsolve::solveSPQR(blk, *(*blockPreps)[bid].cc); // addSnarl -> buffer TLS
                         }
@@ -4364,7 +4378,7 @@ void solveStreaming() {
             std::vector<BlockPrep> blockPreps;
 
             {
-                MEM_TIME_BLOCK("SNARLS: BUILD (Gcc+BC+SPQR)");
+                //MEM_TIME_BLOCK("SNARLS: BUILD (Gcc+BC+SPQR)");
                 ACCUM_BUILD();
                 MARK_SCOPE_MEM("sn/phase/BUILD_all");
 
@@ -4569,7 +4583,7 @@ int main(int argc, char** argv) {
     readArgs(argc, argv);
 
     {
-        MEM_TIME_BLOCK("I/O: read graph");
+        //MEM_TIME_BLOCK("I/O: read graph");
         MARK_SCOPE_MEM("io/read_graph");
         PROFILE_BLOCK("Graph reading");
         GraphIO::readGraph();
@@ -4586,7 +4600,7 @@ int main(int argc, char** argv) {
     }
 
     {
-        MEM_TIME_BLOCK("I/O: write output");
+        //MEM_TIME_BLOCK("I/O: write output");
         MARK_SCOPE_MEM("io/write_output");
         PROFILE_BLOCK("Writing output");
         TIME_BLOCK("Writing output");
