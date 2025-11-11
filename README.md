@@ -17,5 +17,5 @@ cd build
 To run brute-force tester for snarls
 ```
 cd build 
-./snarls_brute input_path
+./snarls_brute graphPath
 ```
