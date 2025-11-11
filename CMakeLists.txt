@@ -135,7 +135,7 @@ message(STATUS "Sanitizers: ${SB_ENABLE_SANITIZERS}")
 message(STATUS "Enable LTO: ${SB_ENABLE_LTO} (ipo_ok=${ipo_ok})")
 
 # 10. Compile brute-force tester for snarls
-add_executable(snarls_brute src/snarls_brute.cpp)
+add_executable(snarls_bf src/snarls_bruteforce.cpp)
 
 
 
