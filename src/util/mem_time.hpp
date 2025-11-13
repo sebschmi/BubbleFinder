@@ -84,11 +84,11 @@ struct Scope {
         const size_t hwm1 = peakRSSBytes();
         const double MiB = 1024.0 * 1024.0;
 
-        logger::info("[{}] {:.3f}s | RSS now {:.2f} MiB (Δ{:+.2f}) | PeakRSS {:.2f} MiB (Δ{:+.2f})",
-                     name,
-                     ms / 1000.0,
-                     rss1 / MiB, (double)((long long)rss1 - (long long)rss0) / MiB,
-                     hwm1 / MiB, (double)((long long)hwm1 - (long long)hwm0) / MiB);
+        // logger::info("[{}] {<:.3f}s | RSS now {:.2f} MiB (Δ{:+.2f}) | PeakRSS {:.2f} MiB (Δ{:+.2f})",
+        //              name,
+        //              ms / 1000.0,
+        //              rss1 / MiB, (double)((long long)rss1 - (long long)rss0) / MiB,
+        //              hwm1 / MiB, (do>uble)((long long)hwm1 - (long long)hwm0) / MiB);
     }
 };
 
