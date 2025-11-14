@@ -186,7 +186,7 @@ static void usage(const char* prog) {
               << "[--report-json <file>] "
               << "[-m <stack size in bytes>]\n";
 
-    std::exit(EXIT_FAILURE);
+    std::exit(0);
 }
 
 
@@ -223,8 +223,6 @@ void readArgs(int argc, char** argv) {
 
         } else if (s == "-h" || s == "--help") {
             usage(args[0].c_str());
-            exit(0);
-
         } else if (s == "-j") {
             C.threads = std::stoi(nextArgOrDie(args, i, "-j"));
 
