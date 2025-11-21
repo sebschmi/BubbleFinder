@@ -23,13 +23,11 @@ BubbleFinder supports two modes:
 At the moment, building from source has been tested only on linux:
 
 ```
-git clone https://github.com/algbio/bubblefinder
-cd BubbleFinder
-mkdir build
-cd build
-cmake .. 
-make 
-mv BubbleFinder ..
+git clone https://github.com/algbio/BubbleFinder && \
+cd BubbleFinder && \
+cmake -S . -B build && \
+cmake --build build && \
+mv build/BubbleFinder .
 ```
 
 Now `BubbleFinder` is in the root directory.
@@ -40,7 +38,15 @@ Now `BubbleFinder` is in the root directory.
 
 To run BubbleFinder:
 ```
-./BubbleFinder -g {graphPath} [--gfa] -o {-, outputPath} [--superbubbles | --snarls] -j {threadsNumber} [-m {stack size per thread in bytes}]
+Usage:
+  BubbleFinder -g <graphPath> -o <outputPath|-> [options]
+
+Options:
+  --gfa                       Interpret the input graph as GFA (default: OFF)
+  --superbubbles              Compute superbubbles
+  --snarls                    Compute snarls
+  -j <threadsNumber>          Number of threads
+  -m <bytes>                  Stack size per thread in bytes
 ```
 
 # 3. Example
