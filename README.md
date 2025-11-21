@@ -45,7 +45,11 @@ To run BubbleFinder:
 
 # 3. Example
 
-To run `BubbleFinder` on the tiny example from `example/tiny1.gfa`, run:
+Consider the bidirected graph below, which is encoded the file `example/tiny1.gfa`. 
+
+![Tiny example - 1](example/tiny1.png)
+
+You can run `BubbleFinder` on it as:
 ```
 ./BubbleFinder -g example/tiny1.gfa -o example/tiny1.snarls --gfa --snarls
 ```
@@ -55,16 +59,13 @@ After this, you should obtain the file `example/tiny1.snarls` with the following
 g+ k-
 a+ d- f+ g-
 ```
-The number of the first line is the number of lines in the file, and the following lines contains incidences such that *any* pair of incidences on each line is a snarl. So the snarls are {g+, k-}, {a+, d-}, {a+, f+}, {a+, g-}, {d-, f+}, {d-, g-}, {f+, g-}.
-
-This is correct, as the graph looks like this:
-![Tiny example 1](example/tiny1.png)
+The number of the first line is the number of lines in the file, and the following lines contains incidences such that *any* pair of incidences on each line is a snarl. So the snarls are {g+, k-} (from the second line in the file), and {a+, d-}, {a+, f+}, {a+, g-}, {d-, f+}, {d-, g-}, {f+, g-} (from the third line in the file).
 
 # 4. Development
 
 ## GFA format and bidirected graphs
 
-If you look at `example/tiny1.png` you'll notice that the bidirected edge `{a+, b+}` has been encoded as `L	a	+	b	-	0M`. This is because in GFA links are directed. So, the rule is that to compute snarls from a GFA file, for every link `a x b y` in the GFa file, (where x, y ∈ {+, -}), we flip the second sign `y` as `¬y`, and make an edge `{ax, b¬y}`. Then we compute snarls in this bidirected graph.
+If you look at `example/tiny1.png` you'll notice that the bidirected edge `{a+, b+}` appearing in the graph image has been encoded as `L	a	+	b	-	0M`. This is because in GFA links are directed. So, the rule is that to compute snarls from a GFA file, for every link `a x b y` in the GFa file, (where x, y ∈ {+, -}), we flip the second sign `y` as `¬y`, and make an edge `{ax, b¬y}`. Then we compute snarls in this bidirected graph.
 
 ## Snarl algorithm correctness 
 
