@@ -173,19 +173,39 @@ static std::string g_report_json_path;
 
 
 
+static void usage(const char* prog, int exitCode = 0) {
+    std::cerr
+        << "BubbleFinder computes snarls and superbubbles in genomic and\n"
+        << "pangenomic GFA graphs (bidirected graphs).\n"
+        << "It uses SPQR trees of biconnected components of the undirected\n"
+        << "counterpart of the input graph to identify all snarls and\n"
+        << "superbubbles in linear time.\n\n"
+        << "Modes:\n"
+        << "  snarl (default):\n"
+        << "    Compute all snarls, generalising 'vg snarls -a -T'.\n"
+        << "    Unlike vg, BubbleFinder does not prune snarls and may\n"
+        << "    report more structures.\n"
+        << "  superbubbles (disabled in this version):\n"
+        << "    Superbubbles in a doubled representation of the bidirected\n"
+        << "    graph, corresponding to those reported by BubbleGun.\n"
+        << "    This mode is temporarily disabled due to issues in the\n"
+        << "    directed implementation.\n\n"
+        << "Usage:\n"
+        << "  " << prog << " -g <graph.gfa> -o <outputFile> [options]\n\n"
+        << "Required arguments:\n"
+        << "  -g <graph.gfa>           Input GFA graph file path.\n"
+        << "  -o <outputFile>          Output file path.\n\n"
+        << "Mode selection:\n"
+        << "  --snarls                 Compute snarls (default).\n"
+        << "  --superbubbles           DISABLED (see above).\n\n"
+        << "Options:\n"
+        << "  -j <threads>             Number of worker threads.\n"
+        << "  --report-json <file>     Write a JSON report to <file>.\n"
+        << "  -m <bytes>               Stack size in bytes.\n"
+        << "  -h, --help               Show this help message and exit.\n";
 
-static void usage(const char* prog) {
-    std::cerr << "Usage: " << prog
-              << " -g <graphFile> -o <outputFile> [--gfa] "
-              << "[--superbubbles | --snarls] "
-              << "[-j <threads>] "
-              << "[--report-json <file>] "
-              << "[-m <stack size in bytes>]\n";
-
-    std::exit(0);
+    std::exit(exitCode);
 }
-
-
 
 static std::string nextArgOrDie(const std::vector<std::string>& a, std::size_t& i, const char* flag) {
     if (++i >= a.size() || (a[i][0] == '-' && a[i] != "-")) {
@@ -196,11 +216,18 @@ static std::string nextArgOrDie(const std::vector<std::string>& a, std::size_t& 
 }
 
 
-
 void readArgs(int argc, char** argv) {
     auto& C = ctx();
 
-    std::vector<std::string> args(argv, argv+argc);
+    C.gfaInput   = true;                          
+    C.bubbleType = Context::BubbleType::SNARL; 
+
+    std::vector<std::string> args(argv, argv + argc);
+
+    if (args.size() == 1) {
+        std::cerr << "Error: no arguments provided.\n\n";
+        usage(args[0].c_str(), 1);
+    }
 
     for (std::size_t i = 1; i < args.size(); ++i) {
         const std::string& s = args[i];
@@ -218,26 +245,75 @@ void readArgs(int argc, char** argv) {
             g_report_json_path = nextArgOrDie(args, i, "--report-json");
 
         } else if (s == "-h" || s == "--help") {
-            usage(args[0].c_str());
+            usage(args[0].c_str(), 0);
+
         } else if (s == "-j") {
-            C.threads = std::stoi(nextArgOrDie(args, i, "-j"));
+            std::string v = nextArgOrDie(args, i, "-j");
+            try {
+                C.threads = std::stoi(v);
+            } catch (const std::exception&) {
+                std::cerr << "Error: invalid value for -j/--threads: " << v << "\n\n";
+                usage(args[0].c_str(), 1);
+            }
 
         } else if (s == "--superbubbles") {
-            C.bubbleType = Context::BubbleType::SUPERBUBBLE;
-
+            std::cerr
+                << "Error: --superbubbles is currently disabled because the\n"
+                << "       directed superbubble algorithm is known to be buggy.\n"
+                << "       This mode is temporarily unavailable.\n\n";
+            usage(args[0].c_str(), 1);
         } else if (s == "--snarls") {
             C.bubbleType = Context::BubbleType::SNARL;
 
-        } else if(s == "-m") {
-            C.stackSize = std::stoull(nextArgOrDie(args, i, "-m"));
-        } else if(s == "-sanity") {
+        } else if (s == "-m") {
+            std::string v = nextArgOrDie(args, i, "-m");
+            try {
+                C.stackSize = std::stoull(v);
+            } catch (const std::exception&) {
+                std::cerr << "Error: invalid value for -m (stack size): " << v << "\n\n";
+                usage(args[0].c_str(), 1);
+            }
+
+        } else if (s == "-sanity") {
             std::exit(0);
+
         } else {
-            std::cerr << "Unknown argument: " << s << "\n";
-            usage(args[0].c_str());
+            std::cerr << "Unknown argument: " << s << "\n\n";
+            usage(args[0].c_str(), 1);
         }
     }
+
+    bool ok = true;
+
+    if (C.graphPath.empty()) {
+        std::cerr << "Error: missing required argument -g <graphFile>.\n";
+        ok = false;
+    }
+    if (C.outputPath.empty()) {
+        std::cerr << "Error: missing required argument -o <outputFile>.\n";
+        ok = false;
+    }
+
+    if (C.threads <= 0) {
+        if (C.threads == 0) {
+            C.threads = 1; 
+        } else {
+            std::cerr << "Error: -j/--threads must be positive.\n";
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        std::cerr << "\n";
+        usage(args[0].c_str(), 1);
+    }
 }
+
+
+
+
+
+
 
 
 
