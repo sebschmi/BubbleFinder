@@ -122,7 +122,7 @@ cd build
 ./snarls_bf gfaGraphPath
 ```
 
-The exact output format is documented in `src/bruteforce.py`, which parses this output and compares it to BubbleFinder’s output. The same underlying brute-force implementation is also used to validate **superbubbles**: in practice, we usually drive it through the `src/bruteforce.py` script in `--superbubbles` mode (see below), which takes care of calling the binary and parsing its output in the appropriate way.
+The brute-force program outputs results in a format consumed by `src/bruteforce.py`, which then compares them with BubbleFinder’s output. The same brute-force engine is also used for superbubble validation via the `--superbubbles` mode, which takes care of running the binary and parsing its output.
 
 ### Random testing with `src/bruteforce.py`
 
