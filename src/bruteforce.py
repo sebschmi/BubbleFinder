@@ -200,12 +200,12 @@ def run_superbubbles_bf(bruteforce_bin, gfa_path):
 def run_bubblefinder(bf_bin, gfa_path, out_path, threads):
     cmd = [
         bf_bin,
+        "snarls",
         "-g",
         str(gfa_path),
-        "--gfa",
         "-o",
         str(out_path),
-        "--snarls",
+        "--gfa",
         "-j",
         str(threads),
     ]
@@ -226,13 +226,15 @@ def run_bubblefinder(bf_bin, gfa_path, out_path, threads):
 
 
 def run_bubblefinder_superbubbles(bf_bin, gfa_path, out_path, threads):
+    # New CLI: BubbleFinder superbubbles -g <gfa> -o <out> [--gfa] -j <threads>
     cmd = [
         bf_bin,
+        "superbubbles",
         "-g",
         str(gfa_path),
-        "--gfa",
         "-o",
         str(out_path),
+        "--gfa",
         "-j",
         str(threads),
     ]
