@@ -109,19 +109,6 @@ def parse_snarls_bubblefinder_file(path: Path):
 
 
 def parse_superbubbles_bruteforce_output(stdout):
-    """
-    Parse superbubbles brute-force output.
-
-    Nouveau format (comme le C++ adapté) :
-        <N>          (optionnel : nombre total de paires)
-        u v
-        x y
-        ...
-
-    où u, v, x, y sont des identifiants de segments (entiers, sans + / -).
-
-    On renvoie un set de paires non orientées (min(u,v), max(u,v)).
-    """
     bubbles = set()
     lines = [l.strip() for l in stdout.splitlines() if l.strip()]
     if not lines:
@@ -130,7 +117,6 @@ def parse_superbubbles_bruteforce_output(stdout):
     start_idx = 0
     first_tokens = lines[0].split()
     if len(first_tokens) == 1 and first_tokens[0].isdigit():
-        # Première ligne = nombre de paires, on la saute.
         start_idx = 1
 
     for line in lines[start_idx:]:
@@ -142,7 +128,6 @@ def parse_superbubbles_bruteforce_output(stdout):
             u = int(a)
             v = int(b)
         except ValueError:
-            # Ligne pas au bon format, on ignore
             continue
         if u == v:
             continue
@@ -154,18 +139,6 @@ def parse_superbubbles_bruteforce_output(stdout):
 
 
 def parse_superbubbles_bubblefinder_file(path: Path):
-    """
-    Parse superbubbles BubbleFinder output (GFA + SUPERBUBBLE).
-
-    Format (cf. GraphIO::writeSuperbubbles) :
-        <N>
-        seg1 seg2
-        seg3 seg4
-        ...
-
-    segX = identifiants (ici ints dans nos GFA générés).
-    On renvoie un set de paires non orientées (min(seg1, seg2), max(seg1, seg2)).
-    """
     bubbles = set()
 
     with open(path) as f:
@@ -177,7 +150,6 @@ def parse_superbubbles_bubblefinder_file(path: Path):
     start_idx = 0
     first_tokens = lines[0].split()
     if len(first_tokens) == 1 and first_tokens[0].isdigit():
-        # Première ligne = nombre de paires
         start_idx = 1
 
     for line in lines[start_idx:]:
@@ -254,7 +226,6 @@ def run_bubblefinder(bf_bin, gfa_path, out_path, threads):
 
 
 def run_bubblefinder_superbubbles(bf_bin, gfa_path, out_path, threads):
-    # BubbleFinder in superbubble mode: default behaviour without --snarls
     cmd = [
         bf_bin,
         "-g",
@@ -353,7 +324,6 @@ def main():
             graph_failed = False
             reasons = set()
 
-            # Run brute-force (snarls or superbubbles)
             try:
                 if args.superbubbles:
                     snarls_bf = run_superbubbles_bf(bruteforce_bin, gfa_path)

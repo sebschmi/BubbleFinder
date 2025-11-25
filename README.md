@@ -157,17 +157,17 @@ To run the same style of tests for superbubbles, pass the `--superbubbles` flag:
 ```bash
 python3 src/bruteforce.py \
   --superbubbles \
-  --bruteforce-bin ./build/snarls_bf \
+  --bruteforce-bin ./build/superbubbles_bf \
   --bubblefinder-bin ./BubbleFinder \
   --n-graphs 100
 ```
 
-To stress-test the multi-threaded superbubble implementation and detect potential non-deterministic behaviour across different thread counts, you can run:
+To run superbubble tests with multiple thread configurations and check result consistency, you can run:
 
 ```bash
 python3 src/bruteforce.py \
   --superbubbles \
-  --bruteforce-bin ./build/snarls_bf \
+  --bruteforce-bin ./build/superbubbles_bf \
   --bubblefinder-bin ./BubbleFinder \
   --n-graphs 1000 \
   --threads 1 4 8
