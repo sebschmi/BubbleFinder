@@ -11,6 +11,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Option pour contrôler -march=native en Release
+option(SB_NATIVE_OPTIMIZATIONS "Use -march=native in Release builds" ON)
+
 # 2. FetchContent
 include(FetchContent)
 
@@ -99,7 +102,13 @@ endif()
 foreach(t BubbleFinder sbio sbutil)
     if(TARGET ${t})
         target_compile_options(${t} PRIVATE
-            $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native -flto -pthread>
+            $<$<CONFIG:Release>:
+                -O3
+                -DNDEBUG
+                -flto
+                -pthread
+                $<$<BOOL:${SB_NATIVE_OPTIMIZATIONS}>:-march=native>
+            >
             $<$<CONFIG:RelWithDebInfo>:-O2 -g -DENABLE_PROFILING -fno-omit-frame-pointer>
             $<$<CONFIG:Debug>:-O0 -g -fno-omit-frame-pointer>
         )
@@ -116,7 +125,8 @@ message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "OGDF target: ${OGDF_LIB}")
 message(STATUS "Sanitizers: ${SB_ENABLE_SANITIZERS}")
 message(STATUS "Enable LTO: ${SB_ENABLE_LTO} (ipo_ok=${ipo_ok})")
+message(STATUS "Native optimizations (-march=native): ${SB_NATIVE_OPTIMIZATIONS}")
 
-# 10. Tests
+# 10. Tests / brute-force tools
 add_executable(snarls_bf src/snarls_bruteforce.cpp)
 add_executable(superbubbles_bf src/superbubbles_bruteforce.cpp)

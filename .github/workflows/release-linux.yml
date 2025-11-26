@@ -1,0 +1,47 @@
+name: Build Linux binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSB_BUNDLE_OGDF=ON \
+            -DSB_ENABLE_SANITIZERS=OFF \
+            -DSB_NATIVE_OPTIMIZATIONS=OFF
+
+      - name: Build BubbleFinder
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Show dynamic dependencies
+        run: ldd build/BubbleFinder || true
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp build/BubbleFinder dist/
+          cp README.md dist/ || true
+          tar czf BubbleFinder-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BubbleFinder-linux-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
