@@ -49,7 +49,7 @@
 #include "util/mem_time.hpp"
 #include "util/phase_accum.hpp"
 
-bool VERBOSE = true;
+bool VERBOSE = false;
 #define VLOG if (VERBOSE) std::cerr
 
 

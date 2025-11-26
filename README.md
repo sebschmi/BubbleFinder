@@ -101,7 +101,7 @@ Consider the bidirected graph below, which is encoded the file `example/tiny1.gf
 
 You can run `BubbleFinder` on it as:
 ```
-./BubbleFinder -g example/tiny1.gfa -o example/tiny1.snarls --gfa --snarls
+./BubbleFinder snarls -g example/tiny1.gfa -o example/tiny1.snarls --gfa
 ```
 After this, you should obtain the file `example/tiny1.snarls` with the following contents:
 ```
@@ -179,7 +179,7 @@ python3 src/bruteforce.py \
   --superbubbles \
   --bruteforce-bin ./build/superbubbles_bf \
   --bubblefinder-bin ./BubbleFinder \
-  --n-graphs 1000 \
+  --n-graphs 100 \
   --threads 1 4 8
 ```
 
