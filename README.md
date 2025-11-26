@@ -161,16 +161,10 @@ b e
 
 Interpretation:
 
-- For **`superbubbles`**:
-  - Each line `u v` is an **unordered pair of segment IDs** `{u, v}`.
-  - IDs are segment names from GFA `S` records (no `+/-` sign).
-  - These pairs are obtained after orientation projection on the doubled directed graph (see [Orientation projection](#orientation-projection)).
+- Each line `u v` is an **unordered pair of segment IDs** `{u, v}`.
+- IDs are segment names from GFA `S` records (no `+/-` sign).
+- For `superbubbles`, these pairs are obtained after orientation projection on the doubled directed graph (see [Orientation projection](#orientation-projection)).
 
-- For **`directed-superbubbles`**:
-  - Each line `s t` is an **ordered pair** describing a directed superbubble from entry `s` to exit `t` in the input directed graph.
-  - Node identifiers are exactly those from the input:
-    - for `.graph`, the node IDs used in the edge list,
-    - for `--gfa-directed`, the oriented GFA segment identifiers (e.g. `a+`, `b-`).
 
 # <a id="example"></a>3. Example
 
