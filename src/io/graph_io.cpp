@@ -41,11 +41,21 @@ void readStandard()
         input = &std::cin;
     }
 
+    const char* srcName = C.graphPath.empty() ? "<stdin>" : C.graphPath.c_str();
+
     if (!(*input >> n >> m)) {
-        throw std::runtime_error("expected: n m, then m lines u v");
+        throw std::runtime_error(
+            std::string("Invalid .graph header in ") + srcName +
+            ": expected 'n m' on first line.");
     }
 
-    C.node2name.reserve(n);
+    if (n < 0 || m < 0) {
+        throw std::runtime_error(
+            std::string("Invalid .graph header in ") + srcName +
+            ": n and m must be non-negative.");
+    }
+
+    C.node2name.reserve(static_cast<size_t>(n));
 
     struct EdgeKey {
         std::string u, v;
@@ -63,7 +73,11 @@ void readStandard()
     for (int i = 0; i < m; ++i) {
         std::string u, v;
         if (!(*input >> u >> v)) {
-            throw std::runtime_error("edge line missing");
+            std::ostringstream oss;
+            oss << "Unexpected end of file while reading edge " << (i + 1)
+                << " of " << m << " in " << srcName
+                << " (expected 'u v' on each line).";
+            throw std::runtime_error(oss.str());
         }
         edges.insert({u, v});
     }
@@ -145,8 +159,22 @@ void readGFA()
         if (line[0] == 'S') {
             std::istringstream iss(line);
             std::string tok, id, seq;
-            iss >> tok >> id >> seq;
-            if (id.empty()) continue;
+            if (!(iss >> tok >> id >> seq)) {
+                std::ostringstream oss;
+                oss << "Invalid GFA S-line in '" << C.graphPath
+                    << "': expected at least 3 whitespace-separated fields. Line: "
+                    << line;
+                throw std::runtime_error(oss.str());
+            }
+            if (tok != "S") {
+                continue;
+            }
+            if (id.empty()) {
+                std::ostringstream oss;
+                oss << "Invalid GFA S-line in '" << C.graphPath
+                    << "': empty segment ID. Line: " << line;
+                throw std::runtime_error(oss.str());
+            }
 
             if (C.bubbleType == Context::BubbleType::SNARL) {
                 have_segment.insert(id);
@@ -190,15 +218,33 @@ void readGFA()
             return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
         }
     };
-
-    // Count unordered pairs to detect multi-edges (used for SNARL path)
     std::unordered_map<std::pair<std::string, std::string>, int, PairHash> pair_count;
     for (const std::string& e : raw_edges) {
         std::istringstream iss(e);
         std::string tok, from, to, ovl_str;
         char o1 = 0, o2 = 0;
-        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) continue;
+        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) {
+            std::ostringstream oss;
+            oss << "Invalid GFA L-line in '" << C.graphPath
+                << "': expected at least 6 whitespace-separated fields. Line: "
+                << e;
+            throw std::runtime_error(oss.str());
+        }
         if (tok != "L") continue;
+
+        if ((o1 != '+' && o1 != '-') || (o2 != '+' && o2 != '-')) {
+            std::ostringstream oss;
+            oss << "Invalid orientation in GFA L-line in '" << C.graphPath
+                << "': expected '+' or '-'. Line: " << e;
+            throw std::runtime_error(oss.str());
+        }
+        if (!have_segment.count(from) || !have_segment.count(to)) {
+            std::ostringstream oss;
+            oss << "GFA L-line in '" << C.graphPath
+                << "' references undefined segment(s): '" << from
+                << "' or '" << to << "'. Line: " << e;
+            throw std::runtime_error(oss.str());
+        }
 
         auto key = (from < to) ? std::make_pair(from, to) : std::make_pair(to, from);
         pair_count[key]++;
@@ -249,23 +295,19 @@ void readGFA()
         std::string tok, from, to, ovl_str;
         char o1 = 0, o2 = 0;
 
-        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) continue;
+        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) {
+            std::ostringstream oss;
+            oss << "Invalid GFA L-line in '" << C.graphPath
+                << "' while building graph. Line: " << e;
+            throw std::runtime_error(oss.str());
+        }
         if (tok != "L") continue;
 
         if (C.bubbleType == Context::BubbleType::SUPERBUBBLE) {
-            // Superbubbles: we support two variants depending on inputFormat:
-            //   - Gfa:     bidirected doubled graph (existing behavior)
-            //   - GfaDirected: directed graph (no mirrored edge)
             ensure(from + "+"); ensure(from + "-");
             ensure(to   + "+"); ensure(to   + "-");
 
-            if (!((o1 == '+' || o1 == '-') && (o2 == '+' || o2 == '-'))) {
-                continue;
-            }
-
             if (C.inputFormat == Context::InputFormat::Gfa) {
-                // Existing bidirected doubled representation:
-                // For each L-line, add (from o1 -> to o2) and its mirror.
                 const std::string u1 = from + std::string(1, o1);
                 const std::string v1 = to   + std::string(1, o2);
                 add_edge_double(u1, v1);
@@ -275,8 +317,6 @@ void readGFA()
                 add_edge_double(u2, v2);
 
             } else if (C.inputFormat == Context::InputFormat::GfaDirected) {
-                // New: directed interpretation of GFA.
-                // Only add the edge as given by GFA, no mirrored edge.
                 const std::string u = from + std::string(1, o1);
                 const std::string v = to   + std::string(1, o2);
                 add_edge_double(u, v);
@@ -426,7 +466,6 @@ void readGraph() {
                     "InputFormat::Auto should have been resolved in readArgs()");
         }
     } catch (...) {
-        // On error, restore graphPath and clean up temp file before rethrowing
         if (usingTempFile) {
             C.graphPath = originalPath;
             std::remove(tempPath.c_str());
@@ -613,8 +652,15 @@ void writeSuperbubbles() {
                 }
                 std::cout << std::endl;
             }
+            if (!std::cout) {
+                throw std::runtime_error("Error while writing snarls to standard output");
+            }
         } else {
             std::ofstream out(C.outputPath);
+            if (!out) {
+                throw std::runtime_error("Failed to open output file '" +
+                                         C.outputPath + "' for writing");
+            }
             out << C.snarls.size() << "\n";
             for (auto &s : C.snarls) {
                 for (auto &v : s) {
@@ -622,18 +668,17 @@ void writeSuperbubbles() {
                 }
                 out << "\n";
             }
+            if (!out) {
+                throw std::runtime_error("Error while writing snarls to output file '" +
+                                         C.outputPath + "'");
+            }
         }
         return;
     }
 
     // SUPERBUBBLE mode
-    // We only apply the special GFA-bidirected projection when:
-    //   - inputFormat == Gfa
-    //   - and we are not in directed-superbubbles mode.
     if (C.inputFormat == Context::InputFormat::Gfa &&
         !C.directedSuperbubbles) {
-        // This block canonicalizes bidirected superbubbles found on a doubled
-        // GFA graph into undirected segment pairs without +/- orientation.
 
         auto has_orient = [](const std::string& s) {
             return !s.empty() && (s.back()=='+' || s.back()=='-');
@@ -687,10 +732,6 @@ void writeSuperbubbles() {
             }
         }
     } else {
-        // Default: just map node IDs to names without GFA-specific
-        // bidirected canonicalization. This is what we want for:
-        //   - standard .graph input
-        //   - any future GFA-directed mode for directed-superbubbles.
         for (auto &w : C.superbubbles) {
             res.push_back({C.node2name[w.first], C.node2name[w.second]});
         }
@@ -701,11 +742,22 @@ void writeSuperbubbles() {
         for (auto &p : res) {
             std::cout << p.first << " " << p.second << "\n";
         }
+        if (!std::cout) {
+            throw std::runtime_error("Error while writing superbubbles to standard output");
+        }
     } else {
         std::ofstream out(C.outputPath);
+        if (!out) {
+            throw std::runtime_error("Failed to open output file '" +
+                                     C.outputPath + "' for writing");
+        }
         out << res.size() << "\n";
         for (auto &p : res) {
             out << p.first << " " << p.second << "\n";
+        }
+        if (!out) {
+            throw std::runtime_error("Error while writing superbubbles to output file '" +
+                                     C.outputPath + "'");
         }
     }
 }

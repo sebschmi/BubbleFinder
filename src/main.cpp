@@ -28,6 +28,9 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 
+#include <cerrno>
+#include <cstring>
+
 #ifdef __APPLE__
 #  include <mach/mach.h>
 #endif
@@ -266,7 +269,7 @@ static std::string nextArgOrDie(const std::vector<std::string>& a,
     }
     return a[i];
 }
-
+    
 static std::string toLowerCopy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) {
@@ -322,6 +325,56 @@ detectCompressionAndCoreExt(const std::string &path,
     return comp;
 }
 
+
+// -----------------------------------------------------------------------------
+// Path checks (input/output)
+// -----------------------------------------------------------------------------
+
+static bool inputFileReadable(const std::string &path, std::string &errOut) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) {
+        errOut = std::string("stat failed: ") + std::strerror(errno);
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        errOut = "path exists but is not a regular file";
+        return false;
+    }
+    if (access(path.c_str(), R_OK) != 0) {
+        errOut = std::string("no read permission: ") + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+static bool outputParentDirWritable(const std::string &path, std::string &errOut) {
+    std::string dir;
+    auto pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        dir = ".";          
+    } else if (pos == 0) {
+        dir = "/";          
+    } else {
+        dir = path.substr(0, pos);
+    }
+
+    struct stat st{};
+    if (stat(dir.c_str(), &st) != 0) {
+        errOut = std::string("cannot stat output directory '") + dir +
+                 "': " + std::strerror(errno);
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errOut = "'" + dir + "' is not a directory";
+        return false;
+    }
+    if (access(dir.c_str(), W_OK) != 0) {
+        errOut = std::string("no write permission on '") + dir +
+                 "': " + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
 
 // -----------------------------------------------------------------------------
 // Argument parsing
@@ -399,10 +452,33 @@ void readArgs(int argc, char** argv) {
             g_report_json_path = nextArgOrDie(args, i, "--report-json");
 
         } else if (s == "-j") {
-            C.threads = std::stoi(nextArgOrDie(args, i, "-j"));
+            const std::string v = nextArgOrDie(args, i, "-j");
+            try {
+                C.threads = std::stoi(v);
+            } catch (const std::exception &) {
+                std::cerr << "Error: invalid value for -j <threads>: '" << v
+                          << "'. Expected a positive integer.\n";
+                std::exit(1);
+            }
+            if (C.threads <= 0) {
+                std::cerr << "Error: -j <threads> must be a positive integer (got "
+                          << C.threads << ").\n";
+                std::exit(1);
+            }
 
         } else if (s == "-m") {
-            C.stackSize = std::stoull(nextArgOrDie(args, i, "-m"));
+            const std::string v = nextArgOrDie(args, i, "-m");
+            try {
+                C.stackSize = std::stoull(v);
+            } catch (const std::exception &) {
+                std::cerr << "Error: invalid value for -m <bytes>: '" << v
+                          << "'. Expected a positive integer (number of bytes).\n";
+                std::exit(1);
+            }
+            if (C.stackSize == 0) {
+                std::cerr << "Error: -m <bytes> must be a positive integer.\n";
+                std::exit(1);
+            }
 
         } else if (s == "-sanity") {
             std::exit(0);
@@ -5168,6 +5244,26 @@ int main(int argc, char** argv) {
     logger::init();
 
     readArgs(argc, argv);
+
+    readArgs(argc, argv);
+
+    {
+        std::string err;
+
+        if (!inputFileReadable(ctx().graphPath, err)) {
+            std::cerr << "Error: cannot open input graph file '"
+                      << ctx().graphPath << "' for reading: "
+                      << err << "\n";
+            return 1;
+        }
+
+        if (!outputParentDirWritable(ctx().outputPath, err)) {
+            std::cerr << "Error: cannot write output file '"
+                      << ctx().outputPath << "': "
+                      << err << "\n";
+            return 1;
+        }
+    }    
 
     {
         MARK_SCOPE_MEM("io/read_graph");
