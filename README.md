@@ -174,19 +174,25 @@ For `superbubbles`, these pairs are obtained after running the superbubble algor
 
 ## <a id="gfa-format-and-bidirected-graphs"></a>GFA format and bidirected graphs
 
-If you look at `example/tiny1.png` you'll notice that the bidirected edge `{a+, b+}` appearing in the graph image has been encoded as:
+The tiny example `example/tiny1.gfa` is interpreted as the following bidirected graph:
+
+<p align="center">
+  <img src="example/tiny1.png" alt="Tiny bidirected example graph (tiny1.gfa)">
+</p>
+
+In this graph, the bidirected edge `{a+, b+}` is represented in the GFA file by the link:
 
 ```text
 L	a	+	b	-	0M
 ```
 
-This is because in GFA, links are directed. So, the rule is that to compute snarls from a GFA file, for every link
+This is because GFA links are directed. To build the bidirected graph on which snarls are computed, we apply the following rule to every GFA link
 
 ```text
 a x b y
 ```
 
-in the GFA file (where `x, y ∈ {+, -}`), we flip the second sign `y` as `¬y`, and make a bidirected edge `{a x, b ¬y}`. Then we compute snarls in this bidirected graph.
+(where `x, y ∈ {+, -}`): we flip the second orientation `y` to `¬y` and create the bidirected edge `{a x, b ¬y}`. All snarls are then computed on this bidirected graph.
 
 ## <a id="orientation-projection"></a>Orientation projection
 
