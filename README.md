@@ -13,9 +13,8 @@ BubbleFinder supports two main modes:
 ## Table of Contents
 - [1. Installation](#installation)
 - [2. Running](#running)
-  - [Output formats](#output-formats)
-- [3. Example](#example)
-- [4. Development](#development)
+  - [Output format](#output-format)
+- [3. Development](#development)
   - [GFA format and bidirected graphs](#gfa-format-and-bidirected-graphs)
   - [Orientation projection](#orientation-projection)
   - [Algorithm correctness](#algorithm-correctness)
@@ -98,32 +97,38 @@ General options:
       Show this help message and exit
 ```
 
-## <a id="output-formats"></a>2.1 Output formats
+## <a id="output-format"></a>2.1 Output format
 
-All commands produce plain text output with the same high‑level structure:
+All commands write plain text with the same global structure:
 
-- **First line**: a single integer `N` – the number of result lines that follow.
-- **Lines 2..N+1**: one result per line.
+- **First line**: a single integer `N`, the number of *result lines* that follow.
+- **Lines 2..N+1**: one *result line* per line.
 
-There are **two** output formats, depending on the command:
+Each result line encodes one or more **unordered pairs of endpoints**.  
+What an "endpoint" looks like depends on the command:
 
-1. **Snarl format** (used by `snarls`)
-2. **Pair format** (used by `superbubbles` and `directed-superbubbles`)
+- `snarls`: endpoints are **oriented incidences**, e.g. `a+`, `d-`.
+- `superbubbles` / `directed-superbubbles`: endpoints are **segment IDs without orientation**, e.g. `a`, `e`.
 
-### 2.1.1 Snarl format (`snarls`)
+The only difference between commands is:
+
+- `snarls` may output **cliques** (a line with ≥ 2 endpoints encodes all pairs between them),
+- `superbubbles` and `directed-superbubbles` always output **exactly one pair per line**.
+
+### 2.1.1 Snarls (`snarls` command)
 
 Used by the `snarls` command.
 
 - After the header, each line contains **at least two incidences**, separated by whitespace.
 - An **incidence** is a segment (or node) ID followed by an orientation sign, e.g. `a+`, `d-`.
 
-You can generate an example output on the tiny graph in `example/tiny1.gfa` with:
+Example on the tiny graph in `example/tiny1.gfa`:
 
 ```bash
 ./BubbleFinder snarls -g example/tiny1.gfa -o example/tiny1.snarls --gfa
 ```
 
-This produces a file `example/tiny1.snarls` containing:
+This produces:
 
 ```text
 2
@@ -134,23 +139,22 @@ a+ d- f+ g-
 Interpretation:
 
 - The first line `2` means: **2 result lines follow**.
-- On each subsequent line, **every unordered pair of incidences is a snarl**.
-  - From `g+ k-` you get the single snarl `{g+, k-}`.
-  - From `a+ d- f+ g-` you get all pairs:
+- Each result line with `k ≥ 2` incidences encodes **all unordered pairs among them**:
+  - `g+ k-` encodes the single pair `{g+, k-}`.
+  - `a+ d- f+ g-` encodes the clique of pairs:
     `{a+, d-}`, `{a+, f+}`, `{a+, g-}`, `{d-, f+}`, `{d-, g-}`, `{f+, g-}`.
 
-So a single line encodes a whole *clique* of snarls.
+So the snarl output is just a compact way to write many pairs at once:  
+**one line = all pairs between the listed incidences**.
 
-### <a id="pair-format"></a>2.1.2 Pair format (`superbubbles`, `directed-superbubbles`)
+### 2.1.2 Superbubbles (`superbubbles`, `directed-superbubbles`)
 
 Used by:
 
-- `superbubbles` (bidirected graphs from GFA)
-- `directed-superbubbles` (directed graphs: `--graph` or `--gfa-directed`)
+- `superbubbles` (bidirected graphs from GFA),
+- `directed-superbubbles` (directed graphs: `--graph` or `--gfa-directed`).
 
-Structure:
-
-- After the header, each line contains **exactly two identifiers**:
+Here each result line contains **exactly two tokens**, e.g.:
 
 ```text
 3
@@ -161,27 +165,12 @@ b e
 
 Interpretation:
 
-- Each line `u v` is an **unordered pair of segment IDs** `{u, v}`.
-- IDs are segment names from GFA `S` records (no `+/-` sign).
-- For `superbubbles`, these pairs are obtained after orientation projection on the doubled directed graph (see [Orientation projection](#orientation-projection)).
+- Each line `u v` is a single **unordered pair of segment IDs** `{u, v}`.
+- IDs are segment names from GFA `S` records (no `+/-` orientation).
 
+For `superbubbles`, these pairs are obtained after running the superbubble algorithm on the **doubled directed graph** and then applying the **orientation projection** (see [Orientation projection](#orientation-projection)).
 
-# <a id="example"></a>3. Example
-
-The repository contains a small toy graph in `example/tiny1.gfa`, visualized below:
-
-![Tiny example - 1](example/tiny1.png)
-
-This is exactly the graph used in the **snarl format example** in [Section 2.1.1](#output-formats).  
-Running:
-
-```bash
-./BubbleFinder snarls -g example/tiny1.gfa -o example/tiny1.snarls --gfa
-```
-
-produces the snarl output explained in that section.
-
-# <a id="development"></a>4. Development
+# <a id="development"></a>3. Development
 
 ## <a id="gfa-format-and-bidirected-graphs"></a>GFA format and bidirected graphs
 
@@ -214,7 +203,7 @@ The final output is a single unordered pair of segment IDs, e.g. `a e`. This pro
   <img src="example/projection-example.svg" alt="Orientation projection example">
 </p>
 
-In this example, the directed graph on segments has three superbubbles with endpoints `(a, b)`, `(b, e)` and `(e, f)`. After running the superbubble algorithm on the doubled graph and applying the orientation projection, BubbleFinder reports exactly these three pairs in its **pair format output** (see [Pair format](#pair-format)).
+In this example, the directed graph on segments has three superbubbles with endpoints `(a, b)`, `(b, e)` and `(e, f)`. After running the superbubble algorithm on the doubled graph and applying the orientation projection, BubbleFinder reports exactly these three pairs in its standard output format (see [Output format](#output-format)).
 
 ## <a id="algorithm-correctness"></a>Algorithm correctness 
 
