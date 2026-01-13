@@ -5245,8 +5245,6 @@ int main(int argc, char** argv) {
 
     readArgs(argc, argv);
 
-    readArgs(argc, argv);
-
     {
         std::string err;
 

@@ -58,8 +58,24 @@ endif()
 add_subdirectory(src/util)  # sbutil
 add_subdirectory(src/io)    # sbio
 
+# 4bis. Ajouter les includes pour clsd et src
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/clsd
+)
+
 # 5. main executable
-add_executable(BubbleFinder src/main.cpp src/fas.cpp)
+add_executable(BubbleFinder
+    src/main.cpp
+    src/fas.cpp
+    src/util/clsd_interface.cpp        
+    external/clsd/graph.cc
+    external/clsd/dfs.cc
+    external/clsd/detect.cc
+    external/clsd/cycle.cc
+    external/clsd/config.cc
+)
+
 target_include_directories(BubbleFinder PRIVATE src)
 
 target_link_libraries(BubbleFinder PRIVATE
