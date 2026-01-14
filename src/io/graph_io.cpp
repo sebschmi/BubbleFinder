@@ -140,11 +140,9 @@ void readGFA()
     std::ifstream in(C.graphPath);
     if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
-    // [AJOUT] Nettoyage préalable pour le stockages des données brutes
     C.gfaSegmentIds.clear();
     C.gfaLinkLines.clear();
 
-    // Initialisation de la map des types d'incidences pour Snarls/Ultrabubbles
     if (C.bubbleType == Context::BubbleType::SNARL ||
         C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
         C._edge2types.init(C.G,
@@ -155,7 +153,6 @@ void readGFA()
     std::vector<std::string> raw_edges;
     raw_edges.reserve(1 << 16);
 
-    // Helper pour créer les nœuds lazy (Superbubble)
     auto ensure = [&](const std::string& name){
         if (!C.name2node.count(name)) {
             auto id = C.G.newNode();
@@ -168,34 +165,27 @@ void readGFA()
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
 
-        // Lecture des Segments (S)
         if (line[0] == 'S') {
             std::istringstream iss(line);
             std::string tok, id, seq;
             if (!(iss >> tok >> id >> seq)) {
-                // On peut loguer une erreur ou continuer, ici on continue par sécurité
                 continue;
             }
             if (tok != "S") continue;
             if (id.empty()) continue;
 
-            // [FIX] Protection contre double S-line (évite de créer des nœuds fantômes)
             if (C.name2node.count(id)) continue;
 
-            // [AJOUT] Stockage de l'ID brut pour l'aux-graph (recompute snarls)
             C.gfaSegmentIds.push_back(id);
 
-            // Création des nœuds selon le mode
             if (C.bubbleType == Context::BubbleType::SNARL ||
                 C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
-                // 1 segment = 1 nœud OGDF
                 have_segment.insert(id);
                 auto newNode = C.G.newNode();
                 C.name2node[id]      = newNode;
                 C.node2name[newNode] = id;
 
             } else {
-                // SUPERBUBBLE : 1 segment = 2 nœuds (id+, id-)
                 have_segment.insert(id);
                 ensure(id + "+");
                 ensure(id + "-");
@@ -203,7 +193,6 @@ void readGFA()
             continue;
         }
 
-        // Lecture des Liens (L) -> Stockage temporaire
         if (line[0] == 'L') {
             raw_edges.push_back(line);
             continue;
@@ -212,15 +201,12 @@ void readGFA()
 
     in.close();
 
-    // [AJOUT] Copie des liens bruts pour l'aux-graph
     C.gfaLinkLines = raw_edges;
 
 
-    // --- Définition des structures de hachage et helpers pour la 2ème passe ---
 
     auto flip = [](char c){ return c == '+' ? '-' : '+'; };
 
-    // Pour SUPERBUBBLE
     struct EdgeKey {
         std::string u, v;
         bool operator==(const EdgeKey& o) const { return u == o.u && v == o.v; }
@@ -234,7 +220,6 @@ void readGFA()
     };
     std::unordered_set<EdgeKey, EdgeKeyHash> seen;
 
-    // Pour SNARL (comptage des multi-edges pour insérer _trash)
     struct PairHash {
         std::size_t operator()(const std::pair<std::string,std::string>& p) const noexcept {
             std::size_t h1 = std::hash<std::string>{}(p.first);
@@ -259,7 +244,6 @@ void readGFA()
         }
     }
 
-    // Pour ULTRABUBBLE (Déduplication bidirectionnelle stricte)
     struct BiEdgeKey {
         std::string u;
         EdgePartType su;
@@ -285,7 +269,6 @@ void readGFA()
         seen_bidir_ultrabubble.reserve(raw_edges.size() * 2);
     }
 
-    // --- Lambdas d'ajout d'arêtes ---
 
     auto add_edge_double = [&](const std::string& u, const std::string& v){
         EdgeKey key{u, v};
@@ -324,7 +307,6 @@ void readGFA()
         }
     };
 
-    // [CORRECTION] Gestion propre de la canonicalisation pour Ultrabubbles
     auto add_edge_ultrabubble = [&](const std::string& u_in,
                                     const std::string& v_in,
                                     EdgePartType t1_in,
@@ -335,8 +317,6 @@ void readGFA()
         EdgePartType su = t1_in;
         EdgePartType sv = t2_in;
 
-        // Canonicalisation basée sur l'index OGDF
-        // Si on swap les noeuds, on DOIT swapper les signes associés
         if (u->index() > v->index()) {
             std::swap(u, v);
             std::swap(su, sv); 
@@ -347,14 +327,13 @@ void readGFA()
 
         BiEdgeKey key{u_name, su, v_name, sv};
         if (!seen_bidir_ultrabubble.insert(key).second) {
-            return; // doublon strict déjà traité
+            return; 
         }
 
         ogdf::edge e = C.G.newEdge(u, v);
         C._edge2types[e] = std::make_pair(su, sv);
     };
 
-    // --- Deuxième passe : Création des arêtes ---
 
     for (const std::string& e : raw_edges) {
         std::istringstream iss(e);
@@ -710,10 +689,6 @@ project_bubblegun_pairs_from_doubled() {
 
 void writeSuperbubbles() {
     auto &C = ctx();
-
-    // ------------------------------------------------------------------
-    // 1. Cas SNARL : sortie déjà définie en termes de C.snarls (incidences)
-    // ------------------------------------------------------------------
     if (C.bubbleType == Context::BubbleType::SNARL) {
         if (C.outputPath.empty()) {
             std::cout << C.snarls.size() << "\n";
@@ -747,34 +722,10 @@ void writeSuperbubbles() {
         return;
     }
 
-    // ------------------------------------------------------------------
-    // 2. Cas ULTRABUBBLE : utiliser C.ultrabubbleIncidences
-    // ------------------------------------------------------------------
     if (C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
-        auto pair_hash = [](const std::pair<std::string,std::string> &p) -> std::size_t {
-            std::size_t h1 = std::hash<std::string>{}(p.first);
-            std::size_t h2 = std::hash<std::string>{}(p.second);
-            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
-        };
-        std::unordered_set<std::pair<std::string,std::string>, decltype(pair_hash)>
-            seen(0, pair_hash);
-
-        std::vector<std::pair<std::string,std::string>> res;
-        res.reserve(C.ultrabubbleIncidences.size());
-
-        for (auto &p : C.ultrabubbleIncidences) {
-            std::string a = p.first;
-            std::string b = p.second;
-            if (b < a) std::swap(a, b);
-            std::pair<std::string,std::string> key{a,b};
-            if (seen.insert(key).second) {
-                res.emplace_back(std::move(key));
-            }
-        }
-
         if (C.outputPath.empty()) {
-            std::cout << res.size() << "\n";
-            for (auto &p : res) {
+            std::cout << C.ultrabubbleIncidences.size() << "\n";
+            for (auto &p : C.ultrabubbleIncidences) {
                 std::cout << p.first << " " << p.second << "\n";
             }
             if (!std::cout) {
@@ -784,23 +735,20 @@ void writeSuperbubbles() {
             std::ofstream out(C.outputPath);
             if (!out) {
                 throw std::runtime_error("Failed to open output file '" +
-                                         C.outputPath + "' for writing");
+                                        C.outputPath + "' for writing");
             }
-            out << res.size() << "\n";
-            for (auto &p : res) {
+            out << C.ultrabubbleIncidences.size() << "\n";
+            for (auto &p : C.ultrabubbleIncidences) {
                 out << p.first << " " << p.second << "\n";
             }
             if (!out) {
                 throw std::runtime_error("Error while writing ultrabubbles to output file '" +
-                                         C.outputPath + "'");
+                                        C.outputPath + "'");
             }
         }
         return;
     }
 
-    // ------------------------------------------------------------------
-    // 3. Cas SUPERBUBBLE (comportement existant)
-    // ------------------------------------------------------------------
 
     std::vector<std::pair<std::string, std::string>> res;
 

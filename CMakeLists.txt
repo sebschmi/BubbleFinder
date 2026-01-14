@@ -146,3 +146,4 @@ message(STATUS "Native optimizations (-march=native): ${SB_NATIVE_OPTIMIZATIONS}
 # 10. Tests / brute-force tools
 add_executable(snarls_bf src/snarls_bruteforce.cpp)
 add_executable(superbubbles_bf src/superbubbles_bruteforce.cpp)
+add_executable(ultrabubbles_bf src/ultrabubbles_bruteforce.cpp)
