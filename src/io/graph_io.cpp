@@ -137,11 +137,8 @@ void readGFA()
     if (C.graphPath.empty())
         throw std::runtime_error("GFA input needs -g <file>");
 
-    std::ifstream in(C.graphPath);
-    if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
-
     C.gfaSegmentIds.clear();
-    C.gfaLinkLines.clear();
+    C.gfaLinkLines.clear(); 
 
     if (C.bubbleType == Context::BubbleType::SNARL ||
         C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
@@ -149,9 +146,19 @@ void readGFA()
                            std::make_pair(EdgePartType::NONE, EdgePartType::NONE));
     }
 
-    std::unordered_set<std::string> have_segment;
-    std::vector<std::string> raw_edges;
-    raw_edges.reserve(1 << 16);
+    auto flip = [](char c){ return c == '+' ? '-' : '+'; };
+
+    auto parse_L = [&](const std::string& line,
+                       std::string& from, char& o1,
+                       std::string& to,   char& o2) -> bool
+    {
+        if (line.empty() || line[0] != 'L') return false;
+        std::istringstream iss(line);
+        std::string tok, ovl_str;
+        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) return false;
+        if (tok != "L") return false;
+        return true;
+    };
 
     auto ensure = [&](const std::string& name){
         if (!C.name2node.count(name)) {
@@ -161,51 +168,60 @@ void readGFA()
         }
     };
 
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
+    std::unordered_set<std::string> have_segment;
+    {
+        std::ifstream in(C.graphPath);
+        if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
-        if (line[0] == 'S') {
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            if (line[0] != 'S') continue;
+
             std::istringstream iss(line);
             std::string tok, id, seq;
-            if (!(iss >> tok >> id >> seq)) {
-                continue;
-            }
+            if (!(iss >> tok >> id >> seq)) continue;
             if (tok != "S") continue;
             if (id.empty()) continue;
 
-            if (C.name2node.count(id)) continue;
+            if (have_segment.insert(id).second) {
+                C.gfaSegmentIds.push_back(id);
 
-            C.gfaSegmentIds.push_back(id);
-
-            if (C.bubbleType == Context::BubbleType::SNARL ||
-                C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
-                have_segment.insert(id);
-                auto newNode = C.G.newNode();
-                C.name2node[id]      = newNode;
-                C.node2name[newNode] = id;
-
-            } else {
-                have_segment.insert(id);
-                ensure(id + "+");
-                ensure(id + "-");
+                if (C.bubbleType == Context::BubbleType::SNARL ||
+                    C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
+                    ensure(id);
+                } else {
+                    ensure(id + "+");
+                    ensure(id + "-");
+                }
             }
-            continue;
-        }
-
-        if (line[0] == 'L') {
-            raw_edges.push_back(line);
-            continue;
         }
     }
 
-    in.close();
+    struct PairHash {
+        std::size_t operator()(const std::pair<std::string,std::string>& p) const noexcept {
+            std::size_t h1 = std::hash<std::string>{}(p.first);
+            std::size_t h2 = std::hash<std::string>{}(p.second);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+        }
+    };
+    std::unordered_map<std::pair<std::string, std::string>, int, PairHash> pair_count_snarl;
 
-    C.gfaLinkLines = raw_edges;
+    if (C.bubbleType == Context::BubbleType::SNARL) {
+        std::ifstream in(C.graphPath);
+        if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
+        std::string line, from, to;
+        char o1=0, o2=0;
+        while (std::getline(in, line)) {
+            if (!parse_L(line, from, o1, to, o2)) continue;
 
-
-    auto flip = [](char c){ return c == '+' ? '-' : '+'; };
+            if (have_segment.count(from) && have_segment.count(to)) {
+                auto key = (from < to) ? std::make_pair(from, to) : std::make_pair(to, from);
+                pair_count_snarl[key]++;
+            }
+        }
+    }
 
     struct EdgeKey {
         std::string u, v;
@@ -218,31 +234,47 @@ void readGFA()
             return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
         }
     };
-    std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+    std::unordered_set<EdgeKey, EdgeKeyHash> seen_doubled;
 
-    struct PairHash {
-        std::size_t operator()(const std::pair<std::string,std::string>& p) const noexcept {
-            std::size_t h1 = std::hash<std::string>{}(p.first);
-            std::size_t h2 = std::hash<std::string>{}(p.second);
-            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+    auto add_edge_double = [&](const std::string& u, const std::string& v){
+        EdgeKey key{u, v};
+        if (seen_doubled.insert(key).second) {
+            ensure(u); ensure(v);
+            C.G.newEdge(C.name2node[u], C.name2node[v]);
         }
     };
-    std::unordered_map<std::pair<std::string, std::string>, int, PairHash> pair_count_snarl;
 
-    if (C.bubbleType == Context::BubbleType::SNARL) {
-        for (const std::string& e : raw_edges) {
-            std::istringstream iss(e);
-            std::string tok, from, to, ovl_str;
-            char o1 = 0, o2 = 0;
-            if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) continue;
-            if (tok != "L") continue;
-            
-            if (have_segment.count(from) && have_segment.count(to)) {
-                auto key = (from < to) ? std::make_pair(from, to) : std::make_pair(to, from);
-                pair_count_snarl[key]++;
-            }
+    // SNARL
+    auto add_edge_snarl = [&](std::string u, std::string v,
+                              EdgePartType t1, EdgePartType t2)
+    {
+        ensure(u); ensure(v);
+
+        if (u > v) {
+            std::swap(u, v);
+            std::swap(t1, t2);
         }
-    }
+        auto key = std::make_pair(u, v);
+        bool multi = pair_count_snarl[key] > 1;
+
+        if (!multi) {
+            ogdf::edge e = C.G.newEdge(C.name2node[u], C.name2node[v]);
+            C._edge2types[e] = std::make_pair(t1, t2);
+            return;
+        }
+
+        auto mid_node = C.G.newNode();
+        C.node2name[mid_node] = "_trash";
+
+        {
+            ogdf::edge e1 = C.G.newEdge(C.name2node[u], mid_node);
+            C._edge2types[e1] = std::make_pair(t1, EdgePartType::PLUS);
+        }
+        {
+            ogdf::edge e2 = C.G.newEdge(mid_node, C.name2node[v]);
+            C._edge2types[e2] = std::make_pair(EdgePartType::PLUS, t2);
+        }
+    };
 
     struct BiEdgeKey {
         std::string u;
@@ -266,52 +298,16 @@ void readGFA()
     };
     std::unordered_set<BiEdgeKey, BiEdgeKeyHash> seen_bidir_ultrabubble;
     if (C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
-        seen_bidir_ultrabubble.reserve(raw_edges.size() * 2);
+
     }
-
-
-    auto add_edge_double = [&](const std::string& u, const std::string& v){
-        EdgeKey key{u, v};
-        if (seen.insert(key).second) {
-            C.G.newEdge(C.name2node[u], C.name2node[v]);
-        }
-    };
-
-    auto add_edge_snarl = [&](std::string& u, std::string& v, 
-                              EdgePartType t1, EdgePartType t2) 
-    {
-        if (u > v) {
-            std::swap(u, v);
-            std::swap(t1, t2);
-        }
-        auto key = std::make_pair(u, v);
-        bool multi = pair_count_snarl[key] > 1;
-
-        if (!multi) {
-            ogdf::edge e = C.G.newEdge(C.name2node[u], C.name2node[v]);
-            C._edge2types[e] = std::make_pair(t1, t2);
-            return;
-        }
-
-        std::string mid_name = "_trash";
-        auto mid_node = C.G.newNode();
-        C.node2name[mid_node] = mid_name;
-
-        {
-            ogdf::edge e1 = C.G.newEdge(C.name2node[u], mid_node);
-            C._edge2types[e1] = std::make_pair(t1, EdgePartType::PLUS);
-        }
-        {
-            ogdf::edge e2 = C.G.newEdge(mid_node, C.name2node[v]);
-            C._edge2types[e2] = std::make_pair(EdgePartType::PLUS, t2);
-        }
-    };
 
     auto add_edge_ultrabubble = [&](const std::string& u_in,
                                     const std::string& v_in,
                                     EdgePartType t1_in,
                                     EdgePartType t2_in)
     {
+        ensure(u_in); ensure(v_in);
+
         ogdf::node u = C.name2node[u_in];
         ogdf::node v = C.name2node[v_in];
         EdgePartType su = t1_in;
@@ -319,63 +315,61 @@ void readGFA()
 
         if (u->index() > v->index()) {
             std::swap(u, v);
-            std::swap(su, sv); 
+            std::swap(su, sv);
         }
 
         const std::string& u_name = C.node2name[u];
         const std::string& v_name = C.node2name[v];
 
         BiEdgeKey key{u_name, su, v_name, sv};
-        if (!seen_bidir_ultrabubble.insert(key).second) {
-            return; 
-        }
+        if (!seen_bidir_ultrabubble.insert(key).second) return;
 
         ogdf::edge e = C.G.newEdge(u, v);
         C._edge2types[e] = std::make_pair(su, sv);
     };
 
+    {
+        std::ifstream in(C.graphPath);
+        if (!in) throw std::runtime_error("Cannot open " + C.graphPath);
 
-    for (const std::string& e : raw_edges) {
-        std::istringstream iss(e);
-        std::string tok, from, to, ovl_str;
-        char o1 = 0, o2 = 0;
+        std::string line, from, to;
+        char o1=0, o2=0;
 
-        if (!(iss >> tok >> from >> o1 >> to >> o2 >> ovl_str)) {
-             throw std::runtime_error("Invalid GFA L-line: " + e);
-        }
-        if (tok != "L") continue;
+        while (std::getline(in, line)) {
+            if (!parse_L(line, from, o1, to, o2)) continue;
 
-        if (C.bubbleType == Context::BubbleType::SUPERBUBBLE) {
-            ensure(from + "+"); ensure(from + "-");
-            ensure(to   + "+"); ensure(to   + "-");
+            if (C.bubbleType == Context::BubbleType::SUPERBUBBLE) {
+                ensure(from + "+"); ensure(from + "-");
+                ensure(to   + "+"); ensure(to   + "-");
 
-            if (C.inputFormat == Context::InputFormat::Gfa) {
-                const std::string u1 = from + std::string(1, o1);
-                const std::string v1 = to   + std::string(1, o2);
-                add_edge_double(u1, v1);
+                if (C.inputFormat == Context::InputFormat::Gfa) {
+                    const std::string u1 = from + std::string(1, o1);
+                    const std::string v1 = to   + std::string(1, o2);
+                    add_edge_double(u1, v1);
 
-                const std::string u2 = to   + std::string(1, flip(o2));
-                const std::string v2 = from + std::string(1, flip(o1));
-                add_edge_double(u2, v2);
+                    const std::string u2 = to   + std::string(1, flip(o2));
+                    const std::string v2 = from + std::string(1, flip(o1));
+                    add_edge_double(u2, v2);
 
-            } else if (C.inputFormat == Context::InputFormat::GfaDirected) {
-                const std::string u = from + std::string(1, o1);
-                const std::string v = to   + std::string(1, o2);
-                add_edge_double(u, v);
-            } else {
-                throw std::logic_error("Unexpected inputFormat in readGFA() for SUPERBUBBLE");
+                } else if (C.inputFormat == Context::InputFormat::GfaDirected) {
+                    const std::string u = from + std::string(1, o1);
+                    const std::string v = to   + std::string(1, o2);
+                    add_edge_double(u, v);
+
+                } else {
+                    throw std::logic_error("Unexpected inputFormat in readGFA() for SUPERBUBBLE");
+                }
+
+            } else if (C.bubbleType == Context::BubbleType::SNARL) {
+                auto t1 = (o1 == '+' ? EdgePartType::PLUS  : EdgePartType::MINUS);
+                auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
+                add_edge_snarl(from, to, t1, t2);
+
+            } else if (C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
+                auto t1 = (o1 == '+' ? EdgePartType::PLUS  : EdgePartType::MINUS);
+                auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
+                add_edge_ultrabubble(from, to, t1, t2);
             }
-
-        } else if (C.bubbleType == Context::BubbleType::SNARL) {
-            auto t1 = (o1 == '+' ? EdgePartType::PLUS  : EdgePartType::MINUS);
-            auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
-            add_edge_snarl(from, to, t1, t2);
-
-        } else if (C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
-            auto t1 = (o1 == '+' ? EdgePartType::PLUS  : EdgePartType::MINUS);
-            auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
-            // On appelle le helper qui gère le swap correctement
-            add_edge_ultrabubble(from, to, t1, t2);
         }
     }
 }
@@ -723,10 +717,25 @@ void writeSuperbubbles() {
     }
 
     if (C.bubbleType == Context::BubbleType::ULTRABUBBLE) {
+
+        auto unpack = [](std::uint32_t p) -> std::pair<std::uint32_t,bool> {
+            return { (p >> 1), (p & 1u) != 0u };
+        };
+
+        auto write_one = [&](std::ostream &os, std::uint32_t packed) {
+            auto [gid, plus] = unpack(packed);
+            ogdf::node v = C.nodeByGlobalId.at((size_t)gid);
+            const std::string &name = C.node2name[v];
+            os << name << (plus ? '+' : '-');
+        };
+
         if (C.outputPath.empty()) {
-            std::cout << C.ultrabubbleIncidences.size() << "\n";
-            for (auto &p : C.ultrabubbleIncidences) {
-                std::cout << p.first << " " << p.second << "\n";
+            std::cout << C.ultrabubbleIncPacked.size() << "\n";
+            for (auto &p : C.ultrabubbleIncPacked) {
+                write_one(std::cout, p.first);
+                std::cout << " ";
+                write_one(std::cout, p.second);
+                std::cout << "\n";
             }
             if (!std::cout) {
                 throw std::runtime_error("Error while writing ultrabubbles to standard output");
@@ -737,9 +746,12 @@ void writeSuperbubbles() {
                 throw std::runtime_error("Failed to open output file '" +
                                         C.outputPath + "' for writing");
             }
-            out << C.ultrabubbleIncidences.size() << "\n";
-            for (auto &p : C.ultrabubbleIncidences) {
-                out << p.first << " " << p.second << "\n";
+            out << C.ultrabubbleIncPacked.size() << "\n";
+            for (auto &p : C.ultrabubbleIncPacked) {
+                write_one(out, p.first);
+                out << " ";
+                write_one(out, p.second);
+                out << "\n";
             }
             if (!out) {
                 throw std::runtime_error("Error while writing ultrabubbles to output file '" +

@@ -98,6 +98,10 @@ struct Context
 
     std::unordered_set<std::vector<std::string>, VectorStringHash, VectorStringEqual> snarls;
 
+
+    std::vector<ogdf::node> nodeByGlobalId;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ultrabubbleIncPacked;
+
     Context();
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;

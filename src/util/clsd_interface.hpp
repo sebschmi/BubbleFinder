@@ -10,6 +10,8 @@
 #include "../../external/clsd/config.h"
 
 std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(
-    const std::vector<std::pair<int,int>>& edges
-);
+compute_superbubbles_from_edges(int n,
+                                const std::vector<std::pair<int,int>>& edges);
+
+std::vector<std::pair<int,int>>
+compute_superbubbles_from_edges(const std::vector<std::pair<int,int>>& edges);

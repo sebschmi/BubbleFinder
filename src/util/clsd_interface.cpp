@@ -1,102 +1,80 @@
 #include "clsd_interface.hpp"
 
-#include <unordered_map>
-#include <set>
+#include <array>
 #include <string>
-#include <utility>
-#include <cstdlib> 
+#include <vector>
+#include <stdexcept>
+#include <algorithm>
+
+static inline int infer_n_from_edges(const std::vector<std::pair<int,int>>& edges) {
+    int mx = -1;
+    for (auto [u,v] : edges) {
+        if (u > mx) mx = u;
+        if (v > mx) mx = v;
+    }
+    return mx + 1;
+}
 
 std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(
-    const std::vector<std::pair<int,int>>& edges
-) {
-    std::set<int> node_set;
-    for (const auto& e : edges) {
-        node_set.insert(e.first);
-        node_set.insert(e.second);
-    }
+compute_superbubbles_from_edges(const std::vector<std::pair<int,int>>& edges)
+{
+    if (edges.empty()) return {};
+    return compute_superbubbles_from_edges(infer_n_from_edges(edges), edges);
+}
 
-    std::unordered_map<int, unsigned long> id2index;
-    id2index.reserve(node_set.size());
+std::vector<std::pair<int,int>>
+compute_superbubbles_from_edges(int n,
+                                const std::vector<std::pair<int,int>>& edges)
+{
+    if (n <= 0 || edges.empty()) return {};
 
-    unsigned long idx = 0;
-    for (int nid : node_set) {
-        id2index[nid] = idx++;
-    }
+    using U = unsigned long;
 
-    std::unordered_map<std::string, long unsigned int*> str2int;
-    str2int.reserve(node_set.size());
-
-    for (int nid : node_set) {
-        std::string sid = std::to_string(nid);
-        long unsigned int* ele = new long unsigned int[3];
-        ele[0] = id2index[nid];  
-        ele[1] = 0;              
-        ele[2] = 0;              
-        str2int[sid] = ele;
-    }
-
-    for (const auto& e : edges) {
-        int u = e.first;
-        int v = e.second;
-
-        auto it_u = id2index.find(u);
-        auto it_v = id2index.find(v);
-        if (it_u == id2index.end() || it_v == id2index.end()) {
-            continue;
+    for (auto [u,v] : edges) {
+        if (u < 0 || v < 0 || u >= n || v >= n) {
+            throw std::runtime_error("CLSD wrapper: edge endpoint out of range");
         }
-
-        std::string su = std::to_string(u);
-        std::string sv = std::to_string(v);
-
-        str2int[su][1]++; 
-        str2int[sv][2]++; 
-    
     }
 
-    std::vector<Vertex> vertices(node_set.size());
+    std::vector<std::string> ids((size_t)n);
+    std::vector<std::array<U,3>> ele((size_t)n);
 
-    for (const auto& p : str2int) {
-        const std::string& sid = p.first;
-        long unsigned int* ele = p.second; 
-        std::pair<std::string, long unsigned int*> arg(sid, ele);
-        vertices[ele[0]].init(arg);
+    for (int i = 0; i < n; ++i) {
+        ids[(size_t)i] = std::to_string(i);
+        ele[(size_t)i] = { (U)i, 0UL, 0UL };
     }
 
-    for (const auto& e : edges) {
-        int u = e.first;
-        int v = e.second;
+    for (auto [u,v] : edges) {
+        ele[(size_t)u][1]++; 
+        ele[(size_t)v][2]++; 
+    }
 
-        auto it_u = id2index.find(u);
-        auto it_v = id2index.find(v);
-        if (it_u == id2index.end() || it_v == id2index.end()) {
-            continue;
-        }
+    std::vector<Vertex> vertices((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        std::pair<std::string, U*> arg(ids[(size_t)i], ele[(size_t)i].data());
+        vertices[(size_t)i].init(arg);
+    }
 
-        unsigned long iu = it_u->second;
-        unsigned long iv = it_v->second;
 
-        Vertex* from = &vertices[iu];
-        Vertex* to   = &vertices[iv];
-
+    for (auto [u,v] : edges) {
+        Vertex* from = &vertices[(size_t)u];
+        Vertex* to   = &vertices[(size_t)v];
         from->addSuc(to);
         to->addPre(from);
     }
 
-    for (Vertex& v : vertices) {
-        v.resetCounter();
-    }
+    for (Vertex& v : vertices) v.resetCounter();
 
     Config conf;
-    conf.setVertices(static_cast<long unsigned int>(vertices.size()));
-    conf.setEdges(static_cast<long unsigned int>(edges.size()));
+    conf.setVertices((U)vertices.size());
+    conf.setEdges((U)edges.size());
     conf.setMultiedges(0);
 
     conf.startClock();
 
     for (Vertex& v : vertices) {
         if (v.isSource()) {
-            Vertex* start;
+            Vertex* start = nullptr;
             create_postorder(&v, &start);
             conf.addOrder(start, &v, false);
             detect(start, &v, conf);
@@ -113,22 +91,13 @@ compute_superbubbles_from_edges(
     conf.endClock();
 
     std::vector<std::pair<int,int>> result;
-
     const auto& bubs = conf.getSuperbubbles();
     result.reserve(bubs.size());
 
     for (const auto& sb : bubs) {
-        Vertex* entrance = sb.entrance;
-        Vertex* exit     = sb.exit;
-
-        int ent_id = std::stoi(entrance->getID());
-        int ex_id  = std::stoi(exit->getID());
-
+        int ent_id = std::stoi(sb.entrance->getID());
+        int ex_id  = std::stoi(sb.exit->getID());
         result.emplace_back(ent_id, ex_id);
-    }
-
-    for (auto& p : str2int) {
-        delete[] p.second;
     }
 
     return result;

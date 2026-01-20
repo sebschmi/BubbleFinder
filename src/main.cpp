@@ -24,6 +24,7 @@
 #include <queue>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 #include <sys/resource.h>
 #include <sys/time.h>
@@ -5464,14 +5465,21 @@ namespace solver {
             auto &C = ctx();
             ogdf::Graph &G = C.G;
 
-            ogdf::EdgeArray<std::pair<EdgePartType,EdgePartType>> etype(G);
-            for (ogdf::edge e : G.edges) etype[e] = C._edge2types(e);
+            const ogdf::EdgeArray<std::pair<EdgePartType,EdgePartType>> &etype = C._edge2types;
 
             const int original_n = G.numberOfNodes();
             ogdf::NodeArray<int> nodeId(G, -1);
+
+            C.nodeByGlobalId.clear();
+            C.nodeByGlobalId.resize((size_t)original_n, nullptr);
+
             {
                 int id = 0;
-                for (ogdf::node v : G.nodes) nodeId[v] = id++;
+                for (ogdf::node v : G.nodes) {
+                    nodeId[v] = id;
+                    C.nodeByGlobalId[(size_t)id] = v;
+                    ++id;
+                }
                 OGDF_ASSERT(id == original_n);
             }
 
@@ -5493,13 +5501,13 @@ namespace solver {
 
             ogdf::NodeArray<int> plus_dir(G, 0);
 
-            std::vector<std::vector<std::pair<std::string,std::string>>> incidencesByCC(comps.size());
+            using PackedInc = std::pair<std::uint32_t, std::uint32_t>;
+            std::vector<std::vector<PackedInc>> incidencesByCC(comps.size());
 
             std::atomic<size_t> next{0};
             std::atomic<bool> abort{false};
             std::exception_ptr eptr = nullptr;
             std::mutex ep_mtx;
-
 
             int T = std::min<int>(C.threads, (int)comps.size());
             if (T <= 0) T = 1;
@@ -5525,8 +5533,8 @@ namespace solver {
                                     orient_emit_iterative_cc(
                                         v, true,
                                         plus_dir,
-                                        nodeId,   
-                                        localId,  
+                                        nodeId,
+                                        localId,
                                         etype,
                                         out
                                     );
@@ -5548,11 +5556,9 @@ namespace solver {
                             directed_edges.erase(std::unique(directed_edges.begin(), directed_edges.end()),
                                                 directed_edges.end());
 
+                            // CLSD
                             std::vector<std::pair<int,int>> superbubbles;
-                            // { std::lock_guard<std::mutex> lk(clsd_mtx);
-                            //   superbubbles = compute_superbubbles_from_edges(directed_edges);
-                            // }
-                            superbubbles = compute_superbubbles_from_edges(directed_edges);
+                            superbubbles = compute_superbubbles_from_edges(out.nextId, directed_edges);
 
                             auto &inc = incidencesByCC[ci];
                             inc.reserve(superbubbles.size());
@@ -5561,24 +5567,23 @@ namespace solver {
                                 int xid = sb.first;
                                 int yid = sb.second;
 
-                                // ignore intermédiaires
                                 if (xid < 0 || yid < 0) continue;
                                 if (xid >= k || yid >= k) continue;
 
                                 ogdf::node x = cc[xid];
                                 ogdf::node y = cc[yid];
 
-                                std::string xname = C.node2name[x];
-                                std::string yname = C.node2name[y];
+                                const int xg = nodeId[x];
+                                const int yg = nodeId[y];
 
-                                char xsign = "-+"[ plus_dir[x] == 1 ];
-                                char ysign = "+-"[ plus_dir[y] == 1 ];
+                                const bool xplus = (plus_dir[x] == 1);
+                                const bool yplus = (plus_dir[y] != 1);
 
-                                int xg = nodeId[x];
-                                int yg = nodeId[y];
+                                const std::uint32_t xpack = (std::uint32_t(xg) << 1) | (xplus ? 1u : 0u);
+                                const std::uint32_t ypack = (std::uint32_t(yg) << 1) | (yplus ? 1u : 0u);
 
-                                if (xg > yg) inc.emplace_back(yname + ysign, xname + xsign);
-                                else         inc.emplace_back(xname + xsign, yname + ysign);
+                                if (xg > yg) inc.emplace_back(ypack, xpack);
+                                else         inc.emplace_back(xpack, ypack);
                             }
                         }
                     } catch (...) {
@@ -5592,19 +5597,18 @@ namespace solver {
             for (auto &th : threads) th.join();
             if (eptr) std::rethrow_exception(eptr);
 
-            // merge final
-            C.ultrabubbleIncidences.clear();
+            C.ultrabubbleIncPacked.clear();
             size_t total = 0;
             for (auto &v : incidencesByCC) total += v.size();
-            C.ultrabubbleIncidences.reserve(total);
+            C.ultrabubbleIncPacked.reserve(total);
 
             for (size_t ci = 0; ci < incidencesByCC.size(); ++ci) {
                 for (auto &p : incidencesByCC[ci]) {
-                    C.ultrabubbleIncidences.emplace_back(std::move(p));
+                    C.ultrabubbleIncPacked.emplace_back(p);
                 }
             }
 
-            std::cout << "ULTRABUBBLES found: " << C.ultrabubbleIncidences.size() << "\n";
+            std::cout << "ULTRABUBBLES found: " << C.ultrabubbleIncPacked.size() << "\n";
         }
     }
 }
