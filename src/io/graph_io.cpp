@@ -25,6 +25,9 @@ void readStandard()
     if (C.bubbleType == Context::BubbleType::SNARL) {
         throw std::runtime_error("Standard graph input not supported for snarls, use GFA input");
     }
+    if (C.bubbleType == Context::BubbleType::SPQR_TREE_ONLY) {
+        throw std::runtime_error("Standard graph input not supported for spqr-tree-only, use GFA input");
+    }
 
     int n, m;
 
@@ -176,7 +179,7 @@ void readGFA()
                 throw std::runtime_error(oss.str());
             }
 
-            if (C.bubbleType == Context::BubbleType::SNARL) {
+            if (C.bubbleType == Context::BubbleType::SNARL || C.bubbleType == Context::BubbleType::SPQR_TREE_ONLY) {
                 have_segment.insert(id);
                 auto newNode = C.G.newNode();
                 C.name2node[id] = newNode;
@@ -325,7 +328,7 @@ void readGFA()
                 throw std::logic_error("Unexpected inputFormat in readGFA() for SUPERBUBBLE");
             }
 
-        } else if (C.bubbleType == Context::BubbleType::SNARL) {
+        } else if (C.bubbleType == Context::BubbleType::SNARL || C.bubbleType == Context::BubbleType::SPQR_TREE_ONLY) {
             auto t1 = (o1 == '+' ? EdgePartType::PLUS  : EdgePartType::MINUS);
             auto t2 = (o2 == '+' ? EdgePartType::MINUS : EdgePartType::PLUS);
             add_edge_bidirected(from, to, t1, t2);
@@ -457,6 +460,10 @@ void readGraph() {
                 if (C.bubbleType == Context::BubbleType::SNARL) {
                     throw std::runtime_error(
                         "Standard .graph input is not supported for snarls, use GFA input");
+                }
+                if (C.bubbleType == Context::BubbleType::SPQR_TREE_ONLY) {
+                    throw std::runtime_error(
+                        "Standard .graph input is not supported for spqr-tree-only, use GFA input");
                 }
                 readStandard();
                 break;
@@ -641,6 +648,11 @@ project_bubblegun_pairs_from_doubled() {
 
 void writeSuperbubbles() {
     auto &C = ctx();
+
+    if (C.bubbleType == Context::BubbleType::SPQR_TREE_ONLY) {
+        throw std::runtime_error("Cannot write superbubbles when bubbleType is SPQR_TREE_ONLY");
+    }
+
     std::vector<std::pair<std::string, std::string>> res;
 
     if (C.bubbleType == Context::BubbleType::SNARL) {
