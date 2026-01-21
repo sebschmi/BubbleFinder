@@ -1,7 +1,7 @@
 name: Bruteforce tests
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
@@ -43,4 +43,13 @@ jobs:
             --bruteforce-bin ./build/superbubbles_bf \
             --bubblefinder-bin ./build/BubbleFinder \
             --n-graphs 10000 \
+            --threads 1 4
+
+      - name: Run bruteforce tests (ultrabubbles)
+        run: |
+          python3 src/bruteforce.py \
+            --bruteforce-bin ./build/ultrabubbles_bf \
+            --bubblefinder-bin ./build/BubbleFinder \
+            --n-graphs 10000 \
+            --min-tips-per-cc 1 \
             --threads 1 4
