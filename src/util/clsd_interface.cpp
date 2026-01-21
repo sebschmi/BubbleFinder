@@ -15,17 +15,34 @@ static inline int infer_n_from_edges(const std::vector<std::pair<int,int>>& edge
     return mx + 1;
 }
 
-std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(const std::vector<std::pair<int,int>>& edges)
-{
-    if (edges.empty()) return {};
-    return compute_superbubbles_from_edges(infer_n_from_edges(edges), edges);
+static ClsdTree clone_tree(const supertree* t) {
+    ClsdTree r;
+    r.entrance = std::stoi(t->entrance->getID());
+    r.exit     = std::stoi(t->exit->getID());
+    r.children.reserve(t->childreen.size());
+    for (auto* c : t->childreen) {
+        r.children.push_back(clone_tree(c));
+    }
+    return r;
 }
 
 std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(int n,
-                                const std::vector<std::pair<int,int>>& edges)
-{
+compute_superbubbles_from_edges(
+    const std::vector<std::pair<int,int>>& edges,
+    std::vector<ClsdTree>* out_trees
+) {
+    if (out_trees) out_trees->clear();
+    if (edges.empty()) return {};
+    return compute_superbubbles_from_edges(infer_n_from_edges(edges), edges, out_trees);
+}
+
+std::vector<std::pair<int,int>>
+compute_superbubbles_from_edges(
+    int n,
+    const std::vector<std::pair<int,int>>& edges,
+    std::vector<ClsdTree>* out_trees
+) {
+    if (out_trees) out_trees->clear();
     if (n <= 0 || edges.empty()) return {};
 
     using U = unsigned long;
@@ -45,8 +62,8 @@ compute_superbubbles_from_edges(int n,
     }
 
     for (auto [u,v] : edges) {
-        ele[(size_t)u][1]++; 
-        ele[(size_t)v][2]++; 
+        ele[(size_t)u][1]++; // outdegree
+        ele[(size_t)v][2]++; // indegree
     }
 
     std::vector<Vertex> vertices((size_t)n);
@@ -54,7 +71,6 @@ compute_superbubbles_from_edges(int n,
         std::pair<std::string, U*> arg(ids[(size_t)i], ele[(size_t)i].data());
         vertices[(size_t)i].init(arg);
     }
-
 
     for (auto [u,v] : edges) {
         Vertex* from = &vertices[(size_t)u];
@@ -69,6 +85,7 @@ compute_superbubbles_from_edges(int n,
     conf.setVertices((U)vertices.size());
     conf.setEdges((U)edges.size());
     conf.setMultiedges(0);
+    conf.trees = (out_trees != nullptr); 
 
     conf.startClock();
 
@@ -98,6 +115,14 @@ compute_superbubbles_from_edges(int n,
         int ent_id = std::stoi(sb.entrance->getID());
         int ex_id  = std::stoi(sb.exit->getID());
         result.emplace_back(ent_id, ex_id);
+    }
+
+    if (out_trees != nullptr) {
+        const auto& roots = conf.getTrees(); 
+        out_trees->reserve(roots.size());
+        for (auto* rt : roots) {
+            out_trees->push_back(clone_tree(rt));
+        }
     }
 
     return result;

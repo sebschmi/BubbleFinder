@@ -199,7 +199,9 @@ static void usage(const char* prog, int exitCode) {
         { "directed-superbubbles",
           "Directed superbubbles (directed graph)" },
         { "snarls",
-          "Snarls (typically on bidirected graphs from GFA)" }
+          "Snarls (typically on bidirected graphs from GFA)" },
+        { "ultrabubbles",
+        "Ultrabubbles (requires: each connected component has at least one tip; bidirected -> oriented directed graph -> superbubbles)" }
     };
 
     static const OptionHelp options[] = {
@@ -210,6 +212,7 @@ static void usage(const char* prog, int exitCode) {
         { "--gfa-directed", nullptr, "Force GFA input interpreted as directed graph" },
         { "--graph", nullptr,
           "Force .graph text format (see 'Format options' above)" },
+        { "--clsd-trees", nullptr, "Compute CLSD superbubble trees" },
         { "--report-json", "<file>", "Write JSON metrics report" },
         { "-m", "<bytes>",           "Stack size in bytes" },
         { "-h, --help", nullptr,     "Show this help message and exit" }
@@ -411,7 +414,7 @@ void readArgs(int argc, char** argv) {
         C.directedSuperbubbles = false;
     } else {
         std::cerr << "Error: unknown command '" << cmd
-                  << "'. Expected one of: superbubbles, directed-superbubbles, snarls.\n\n";
+                << "'. Expected one of: superbubbles, directed-superbubbles, snarls, ultrabubbles.\n\n";
         usage(args[0].c_str(), 1);
     }
 
@@ -456,7 +459,8 @@ void readArgs(int argc, char** argv) {
 
         } else if (s == "--report-json") {
             g_report_json_path = nextArgOrDie(args, i, "--report-json");
-
+        } else if (s == "--clsd-trees") {
+            C.clsdTrees = true;
         } else if (s == "-j") {
             const std::string v = nextArgOrDie(args, i, "-j");
             try {
@@ -5558,10 +5562,55 @@ namespace solver {
 
                             // CLSD
                             std::vector<std::pair<int,int>> superbubbles;
-                            superbubbles = compute_superbubbles_from_edges(out.nextId, directed_edges);
+
+                            std::vector<ClsdTree> trees;
+                            std::vector<ClsdTree>* trees_ptr = (C.clsdTrees ? &trees : nullptr);
+                            superbubbles = compute_superbubbles_from_edges(out.nextId, directed_edges, trees_ptr);
+                            if (C.clsdTrees && !trees.empty()) {
+                                auto hierarchy = [&](auto&& self, const ClsdTree& t, std::string &res) -> void {
+                                    int xid = t.entrance;
+                                    int yid = t.exit;
+
+                                    bool valid = (xid >= 0 && xid < k) && (yid >= 0 && yid < k);
+
+                                    std::string X="", Y="";
+                                    if (valid) {
+                                        ogdf::node x = cc[xid];
+                                        ogdf::node y = cc[yid];
+
+                                        std::string xname = C.node2name[x];
+                                        std::string yname = C.node2name[y];
+
+                                        char xsign = "-+"[ plus_dir[x] == 1 ];
+                                        char ysign = "+-"[ plus_dir[y] == 1 ];
+
+                                        X = xname + xsign;
+                                        Y = yname + ysign;
+                                    }
+
+                                    if (valid && !t.children.empty()) res += "(";
+
+                                    for (size_t i = 0; i < t.children.size(); ++i) {
+                                        self(self, t.children[i], res);
+                                        if (i + 1 < t.children.size() && valid) res += ",";
+                                    }
+
+                                    if (valid && !t.children.empty()) res += ")";
+
+                                    if (valid) res += "<" + X + "," + Y + ">";
+                                };
+
+                                for (const auto& tr : trees) {
+                                    std::string res;
+                                    hierarchy(hierarchy, tr, res);
+                                    std::cout << res << "\n";
+                                }
+                            }
 
                             auto &inc = incidencesByCC[ci];
                             inc.reserve(superbubbles.size());
+
+                            std::cout << 121321 << std::endl;
 
                             for (auto &sb : superbubbles) {
                                 int xid = sb.first;

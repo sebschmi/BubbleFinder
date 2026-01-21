@@ -9,9 +9,21 @@
 #include "../../external/clsd/cycle.h"
 #include "../../external/clsd/config.h"
 
-std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(int n,
-                                const std::vector<std::pair<int,int>>& edges);
+struct ClsdTree {
+    int entrance = -1;
+    int exit     = -1;
+    std::vector<ClsdTree> children;
+};
 
 std::vector<std::pair<int,int>>
-compute_superbubbles_from_edges(const std::vector<std::pair<int,int>>& edges);
+compute_superbubbles_from_edges(
+    int n,
+    const std::vector<std::pair<int,int>>& edges,
+    std::vector<ClsdTree>* out_trees = nullptr
+);
+
+std::vector<std::pair<int,int>>
+compute_superbubbles_from_edges(
+    const std::vector<std::pair<int,int>>& edges,
+    std::vector<ClsdTree>* out_trees = nullptr
+);

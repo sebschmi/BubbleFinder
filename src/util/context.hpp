@@ -46,6 +46,7 @@ struct Context
 
     std::string graphPath   = "";
     std::string outputPath  = "";
+    std::string ultrabubbleTreeOutputPath = "";
     bool        gfaInput    = false;  // kept for backward compatibility
     bool        doubleGraph = false;
     LogLevel    logLevel    = LOG_INFO;
@@ -67,6 +68,8 @@ struct Context
     bool        directedSuperbubbles = false;
     InputFormat inputFormat = InputFormat::Auto;
     Compression compression = Compression::None;
+
+    bool clsdTrees = false; 
 
     ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> _edge2types; 
     ogdf::EdgeArray<std::pair<int, int>>                   _edge2cnt;   
