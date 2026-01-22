@@ -5,12 +5,13 @@
 
 `BubbleFinder` exploits the [SPQR trees](https://en.wikipedia.org/wiki/SPQR_tree) of the biconnected components of the undirected counterparts of the input bidirected graph, and traverses them efficiently to identify all snarls and superbubbles.
 
-BubbleFinder supports four commands:
+BubbleFinder supports five commands:
 
 - `snarls`: computes **all** snarls and is supposed to replicate the behavior of [vg snarl](https://github.com/vgteam/vg) (when run with parameters `-a -T`). Note that `vg snarl` prunes some snarls to output only a linear number of snarls; thus `BubbleFinder` finds more snarls than `vg snarl`.
 - `superbubbles`: computes superbubbles in a (virtually) doubled representation of the bidirected graph and is supposed to replicate the behavior of [BubbleGun](https://github.com/fawaz-dabbaghieh/bubble_gun). Since superbubbles are classically defined on **directed** graphs, BubbleFinder first runs the algorithm on this doubled directed representation, then projects the results back to unordered pairs of segment IDs (see [Orientation projection](#orientation-projection)). Notice that BubbleGun also reports weak superbubbles, i.e. for a bubble with entry `s` and exit `t`, it also reports the structures which also have an edge from `t` to `s` (thus the interior of the bubble is not acyclic).
 - `directed-superbubbles`: computes superbubbles on a **directed** input graph (`--graph` or `--gfa-directed`).
 - `ultrabubbles`: computes ultrabubbles by orienting each connected component with a DFS procedure and then running the [clsd](https://github.com/Fabianexe/clsd/tree/c49598fcb149b2c224a4625e0bf4b870f27ec166) superbubble algorithm on the resulting directed skeleton; **requires at least one tip per connected component in the input graph**.
+- `spqr-tree`: outputs the connected components, BC-tree (blocks / cut vertices), and SPQR decomposition of each biconnected block in the **SPQR tree file format** `.spqr` **v0.1** as specified here: https://github.com/sebschmi/SPQR-tree-file-format.
 
 As an additional feature, BubbleFinder can also output a **tree hierarchy of ultrabubbles** using `--clsd-trees <file>` (see [Ultrabubble hierarchy (CLSD trees)](#ultrabubble-hierarchy)). This hierarchy is derived from the directed superbubble decomposition computed on the oriented directed skeleton ([Gärtner & Stadler, 2019](#ref-gartner2019direct)). We then transform this superbubble hierarchy into an ultrabubble hierarchy by removing bubbles whose entrance or exit corresponds to an auxiliary vertex introduced during skeleton construction, and by reconnecting their children to the removed bubble’s parent.
 
@@ -27,7 +28,8 @@ As an additional feature, BubbleFinder can also output a **tree hierarchy of ult
     - [2.3.1. Snarls (`snarls` command)](#snarls-output)
     - [2.3.2. Superbubbles (`superbubbles`, `directed-superbubbles`)](#superbubbles-output)
     - [2.3.3. Ultrabubbles (`ultrabubbles`)](#ultrabubbles-output)
-    - [2.3.4. Ultrabubble hierarchy (CLSD trees)](#ultrabubble-hierarchy)
+    - [2.3.4. Ultrabubble hierarchy](#ultrabubble-hierarchy)
+    - [2.3.5. SPQR-tree output (`spqr-tree`)](#spqr-tree-output)
 - [3. Development](#development)
   - [GFA format and bidirected graphs](#gfa-format-and-bidirected-graphs)
   - [Orientation projection](#orientation-projection)
@@ -81,6 +83,7 @@ Available commands are:
   - `directed-superbubbles` - Find directed superbubbles (directed graph)
   - `snarls` - Find snarls (typically on bidirected graphs from GFA)
   - `ultrabubbles` - Find ultrabubbles (typically on bidirected graphs from GFA)
+  - `spqr-tree` - Output the connected components, BC-tree and SPQR decomposition in `.spqr` v0.1 format
 
 ## <a id="input"></a>2.1. Input data
 
@@ -113,6 +116,8 @@ Input files can be compressed with gzip, bzip2 or xz. Compression is auto-detect
 .bz2        -> bzip2
 .xz         -> xz
 ```
+
+**Note on `spqr-tree`:** the `spqr-tree` command currently requires **GFA input** (`--gfa` or autodetected from `.gfa`). The internal `.graph` format is not supported for `spqr-tree`.
 
 ## <a id="options"></a>2.2. Command line options
 
@@ -235,25 +240,40 @@ g+ k-
 
 Interpretation:
 
-- each result line contains **exactly two tokens** (two oriented incidences),
-- each line encodes one **unordered pair** of oriented incidences `{u±, v±}`.
+- each result line contains exactly two oriented incidences,
+- each line encodes one unordered pair of oriented incidences `{u±, v±}`.
 
-### <a id="ultrabubble-hierarchy"></a>2.3.4 Ultrabubble hierarchy (CLSD trees)
+### <a id="ultrabubble-hierarchy"></a>2.3.4 Ultrabubble hierarchy
 
-To also output the **hierarchical decomposition** (nesting structure) of ultrabubbles, run `ultrabubbles` with `--clsd-trees <file>`.
+To also output the hierarchical decomposition (/nesting structure) of ultrabubbles, run `ultrabubbles` with `--clsd-trees <file>`.
 
-#### Serialization format (`--clsd-trees` output file)
+#### `--clsd-trees` output file
 
 Each line corresponds to one rooted tree and follows a parenthesized representation:
 
-- a **leaf** bubble is printed as:
+- a leaf bubble is printed as:
   - `<X,Y>`
-- an **internal** bubble with children is printed as:
+- an internal bubble with children is printed as:
   - `(child1,child2,...,childk)<X,Y>`
 
 where `X` and `Y` are oriented incidences such as `a+` or `d-`.
 
 Implementation detail (relevant for interpretation): during construction of the directed skeleton, BubbleFinder may introduce auxiliary intermediate vertices. The CLSD decomposition is computed on that skeleton, and the reported ultrabubble decomposition is obtained by removing bubbles whose entrance or exit is such an introduced vertex. Their children are connected upward in the resulting hierarchy.
+
+### <a id="spqr-tree-output"></a>2.3.5 SPQR-tree output (`spqr-tree`)
+
+The `spqr-tree` command writes a `.spqr` file according to the **SPQR tree file format** specification:
+
+- Specification repository: https://github.com/sebschmi/SPQR-tree-file-format
+- Version used by BubbleFinder: **v0.1**
+
+BubbleFinder writes the header line:
+
+```text
+H v0.1 https://github.com/sebschmi/SPQR-tree-file-format
+```
+
+For details on the line types and semantics (H/G/N/B/C/S/P/R/V/E), please refer to the specification repository above, which contains the format documentation and examples.
 
 # <a id="development"></a>3. Development
 
