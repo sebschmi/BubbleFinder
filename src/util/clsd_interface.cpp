@@ -47,7 +47,7 @@ compute_superbubbles_from_edges(
 
     using U = unsigned long;
 
-    for (auto [u,v] : edges) {
+    for (auto [u, v] : edges) {
         if (u < 0 || v < 0 || u >= n || v >= n) {
             throw std::runtime_error("CLSD wrapper: edge endpoint out of range");
         }
@@ -61,18 +61,26 @@ compute_superbubbles_from_edges(
         ele[(size_t)i] = { (U)i, 0UL, 0UL };
     }
 
-    for (auto [u,v] : edges) {
+    for (auto [u, v] : edges) {
         ele[(size_t)u][1]++; // outdegree
         ele[(size_t)v][2]++; // indegree
     }
 
     std::vector<Vertex> vertices((size_t)n);
+
+    std::vector<int> sources;
+    sources.reserve((size_t)n);
+
     for (int i = 0; i < n; ++i) {
         std::pair<std::string, U*> arg(ids[(size_t)i], ele[(size_t)i].data());
         vertices[(size_t)i].init(arg);
+
+        if (ele[(size_t)i][2] == 0UL) {
+            sources.push_back(i);
+        }
     }
 
-    for (auto [u,v] : edges) {
+    for (auto [u, v] : edges) {
         Vertex* from = &vertices[(size_t)u];
         Vertex* to   = &vertices[(size_t)v];
         from->addSuc(to);
@@ -85,18 +93,18 @@ compute_superbubbles_from_edges(
     conf.setVertices((U)vertices.size());
     conf.setEdges((U)edges.size());
     conf.setMultiedges(0);
-    conf.trees = (out_trees != nullptr); 
+    conf.trees = (out_trees != nullptr);
 
     conf.startClock();
 
-    for (Vertex& v : vertices) {
-        if (v.isSource()) {
-            Vertex* start = nullptr;
-            create_postorder(&v, &start);
-            conf.addOrder(start, &v, false);
-            detect(start, &v, conf);
-            finish(start, &v, false);
-        }
+    for (int si : sources) {
+        Vertex& v = vertices[(size_t)si];
+
+        Vertex* start = nullptr;
+        create_postorder(&v, &start);
+        conf.addOrder(start, &v, false);
+        detect(start, &v, conf);
+        finish(start, &v, false);
     }
 
     for (Vertex& v : vertices) {
@@ -118,7 +126,7 @@ compute_superbubbles_from_edges(
     }
 
     if (out_trees != nullptr) {
-        const auto& roots = conf.getTrees(); 
+        const auto& roots = conf.getTrees();
         out_trees->reserve(roots.size());
         for (auto* rt : roots) {
             out_trees->push_back(clone_tree(rt));
