@@ -5906,7 +5906,8 @@ namespace solver
                 // Create subgraph for this component
                 ogdf::Graph ccGraph;
                 ogdf::NodeArray<ogdf::node> ccToOrig(ccGraph);
-                ogdf::NodeArray<ogdf::node> origToCc(C.G, nullptr);
+                // A node array allocates space for all nodes in the original graph, even if there is just one node in the component.
+                std::unordered_map<ogdf::node, ogdf::node> origToCc;
 
                 for (ogdf::node v : ccNodes[ccIdx])
                 {
