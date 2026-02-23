@@ -5933,7 +5933,7 @@ namespace solver
                         ogdf::node tgt = e->target();
 
                         // Only add edge if both endpoints are in this component
-                        if (origToCc[src] && origToCc[tgt])
+                        if (origToCc.count(src) && origToCc.count(tgt))
                         {
                             ccGraph.newEdge(origToCc[src], origToCc[tgt]);
                         }
