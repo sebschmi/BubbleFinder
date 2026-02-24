@@ -5908,6 +5908,7 @@ namespace solver
                 ogdf::NodeArray<ogdf::node> ccToOrig(ccGraph);
                 // A node array allocates space for all nodes in the original graph, even if there is just one node in the component.
                 std::unordered_map<ogdf::node, ogdf::node> origToCc;
+                origToCc.reserve(ccNodes[ccIdx].size());
 
                 for (ogdf::node v : ccNodes[ccIdx])
                 {
