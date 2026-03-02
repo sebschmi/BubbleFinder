@@ -6058,40 +6058,9 @@ namespace solver
                         blockEdgeToCC[eBlock] = e;
                     }
 
-                    if (blockGraph.numberOfNodes() < 2 || blockGraph.numberOfEdges() < 1)
+                    if (blockGraph.numberOfNodes() < 3)
                     {
-                        continue;
-                    }
-
-                    if (blockGraph.numberOfNodes() < 3 || blockGraph.numberOfEdges() < 3)
-                    {
-                        std::string spqrName =
-                            "S" + std::to_string(ccIdx) + "_" + std::to_string(bNode->index()) + "_TRIV";
-
-                        out << "S " << spqrName << " " << blockName;
-                        for (ogdf::node vCC : blockNodesSet)
-                        {
-                            ogdf::node vOrig = ccToOrig[vCC];
-                            out << " " << C.node2name[vOrig];
-                        }
-                        out << "\n";
-
-                        int eIdx = 0;
-                        for (ogdf::edge eCC : blockEdges)
-                        {
-                            ogdf::node v1Orig = ccToOrig[eCC->source()];
-                            ogdf::node v2Orig = ccToOrig[eCC->target()];
-
-                            std::string eName =
-                                "E" + std::to_string(ccIdx) + "_" +
-                                std::to_string(bNode->index()) + "_" +
-                                std::to_string(eIdx++);
-
-                            out << "E " << eName << " " << spqrName << " " << blockName
-                                << " " << C.node2name[v1Orig]
-                                << " " << C.node2name[v2Orig] << "\n";
-                        }
-
+                        // Do write compute SPQR tree if the block is too small.
                         continue;
                     }
 
