@@ -5876,8 +5876,14 @@ namespace solver
 
             std::ostream &out = *out_ptr;
 
+            // We assign a unique indices to identifiers.
+            int block_index = 0;
+            int eIdx = 0;
+            int spqrIdx = 0;
+            int vIdx = 0;
+
             // Write header
-            out << "H v0.2 https://github.com/sebschmi/SPQR-tree-file-format\n";
+            out << "H v0.3 https://github.com/sebschmi/SPQR-tree-file-format\n";
 
             // Compute connected components
             ogdf::NodeArray<int> component(C.G, -1);
@@ -5950,23 +5956,14 @@ namespace solver
 
                 if (ccGraph.numberOfNodes() == 1)
                 {
-                    // Handle components with single node separately
-
-                    ogdf::node soleNode = *(ccGraph.nodes.begin());
-                    ogdf::node origNode = ccToOrig[soleNode];
-                    std::string blockName = "B" + std::to_string(ccIdx) + "_0";
-                    out << "B " << blockName << " " << compName << " "
-                        << C.node2name[origNode] << "\n";
-
-                    out << "C " << C.node2name[origNode] << " " << blockName << "\n";
-
-                    // The SPQR tree is not defined on components with a single node.
+                    // Print no BC-tree for components with a single node.
                     continue;
                 }
 
                 // Compute biconnected components (blocks)
                 ogdf::BCTree bc(ccGraph);
-                std::map<ogdf::node, std::string> bcNodeToBlockName;
+                std::unordered_map<ogdf::node, int> bcNodeToBlockIndex;
+                std::unordered_map<ogdf::node, std::string> bcNodeToBlockName;
 
                 // Write B-lines and collect block info
                 for (ogdf::node bNode : bc.bcTree().nodes)
@@ -5976,7 +5973,8 @@ namespace solver
                         continue;
                     }
 
-                    std::string blockName = "B" + std::to_string(ccIdx) + "_" + std::to_string(bNode->index());
+                    bcNodeToBlockIndex[bNode] = block_index;
+                    std::string blockName = "B" + std::to_string(ccIdx) + "_" + std::to_string(block_index++);
                     bcNodeToBlockName[bNode] = blockName;
 
                     out << "B " << blockName << " " << compName;
@@ -6060,140 +6058,140 @@ namespace solver
 
                     if (blockGraph.numberOfNodes() < 3)
                     {
-                        // Do write compute SPQR tree if the block is too small.
+                        // Do not compute SPQR tree if the block is too small.
+                        // Instead, assign its edges directly to the block.
+                        for (ogdf::edge edge : blockEdges)
+                        {
+                            std::string eName = "E" + std::to_string(ccIdx) + "_" +
+                                                std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(eIdx++);
+
+                            out << "E " << eName << " " << bcNodeToBlockIndex[bNode] << " "
+                                << C.node2name[edge->source()] << " " << C.node2name[edge->target()] << "\n";
+                        }
+
                         continue;
                     }
 
-                    try
+                    ogdf::StaticSPQRTree spqr(blockGraph);
+
+                    std::unordered_map<ogdf::node, int> spqrNodeIndices;
+                    std::unordered_map<ogdf::node, std::string> spqrNodeNames;
+
+                    // Write S/P/R-lines
+                    for (ogdf::node treeNode : spqr.tree().nodes)
                     {
-                        ogdf::StaticSPQRTree spqr(blockGraph);
-
-                        std::map<ogdf::node, std::string> spqrNodeNames;
-                        int spqrIdx = 0;
-
-                        // Write S/P/R-lines
-                        for (ogdf::node treeNode : spqr.tree().nodes)
+                        char typeChar;
+                        switch (spqr.typeOf(treeNode))
                         {
-                            char typeChar;
-                            switch (spqr.typeOf(treeNode))
-                            {
-                            case ogdf::SPQRTree::NodeType::SNode:
-                                typeChar = 'S';
-                                break;
-                            case ogdf::SPQRTree::NodeType::PNode:
-                                typeChar = 'P';
-                                break;
-                            case ogdf::SPQRTree::NodeType::RNode:
-                                typeChar = 'R';
-                                break;
-                            default:
-                                typeChar = 'S';
-                                break;
-                            }
-
-                            std::string spqrName = std::string(1, typeChar) + std::to_string(ccIdx) + "_" +
-                                                std::to_string(bNode->index()) + "_" + std::to_string(spqrIdx++);
-                            spqrNodeNames[treeNode] = spqrName;
-
-                            out << typeChar << " " << spqrName << " " << blockName;
-
-                            // Get nodes in skeleton
-                            const ogdf::Graph &skel = spqr.skeleton(treeNode).getGraph();
-                            std::unordered_set<ogdf::node> skelNodesInOrig;
-
-                            for (ogdf::node skelNode : skel.nodes)
-                            {
-                                ogdf::node blockNode = spqr.skeleton(treeNode).original(skelNode);
-                                if (blockNode)
-                                {
-                                    ogdf::node ccNode = blockToCC[blockNode];
-                                    ogdf::node origNode = ccToOrig[ccNode];
-                                    skelNodesInOrig.insert(origNode);
-                                }
-                            }
-
-                            for (ogdf::node origNode : skelNodesInOrig)
-                            {
-                                out << " " << C.node2name[origNode];
-                            }
-                            out << "\n";
+                        case ogdf::SPQRTree::NodeType::SNode:
+                            typeChar = 'S';
+                            break;
+                        case ogdf::SPQRTree::NodeType::PNode:
+                            typeChar = 'P';
+                            break;
+                        case ogdf::SPQRTree::NodeType::RNode:
+                            typeChar = 'R';
+                            break;
+                        default:
+                            typeChar = 'S';
+                            break;
                         }
 
-                        // Write V-lines (virtual edges in SPQR tree)
-                        int vIdx = 0;
-                        for (ogdf::edge treeEdge : spqr.tree().edges)
+                        spqrNodeIndices[treeNode] = spqrIdx;
+                        std::string spqrName = std::string(1, typeChar) + std::to_string(ccIdx) + "_" +
+                                            std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(spqrIdx++);
+                        spqrNodeNames[treeNode] = spqrName;
+
+                        out << typeChar << " " << spqrName << " " << blockName;
+
+                        // Get nodes in skeleton
+                        const ogdf::Graph &skel = spqr.skeleton(treeNode).getGraph();
+                        std::unordered_set<ogdf::node> skelNodesInOrig;
+
+                        for (ogdf::node skelNode : skel.nodes)
                         {
-                            ogdf::node src = treeEdge->source();
-                            ogdf::node tgt = treeEdge->target();
-
-                            std::string vName = "V" + std::to_string(ccIdx) + "_" +
-                                                std::to_string(bNode->index()) + "_" + std::to_string(vIdx++);
-
-                            const ogdf::Skeleton &skelSrc = spqr.skeleton(src);
-
-                            ogdf::edge virtualEdge = nullptr;
-                            for (ogdf::edge e : skelSrc.getGraph().edges)
+                            ogdf::node blockNode = spqr.skeleton(treeNode).original(skelNode);
+                            if (blockNode)
                             {
-                                if (skelSrc.isVirtual(e) && skelSrc.twinTreeNode(e) == tgt)
-                                {
-                                    virtualEdge = e;
-                                    break;
-                                }
-                            }
-
-                            if (virtualEdge)
-                            {
-                                ogdf::node v1Skel = virtualEdge->source();
-                                ogdf::node v2Skel = virtualEdge->target();
-
-                                ogdf::node v1Block = skelSrc.original(v1Skel);
-                                ogdf::node v2Block = skelSrc.original(v2Skel);
-
-                                if (v1Block && v2Block)
-                                {
-                                    ogdf::node v1CC = blockToCC[v1Block];
-                                    ogdf::node v2CC = blockToCC[v2Block];
-                                    ogdf::node v1Orig = ccToOrig[v1CC];
-                                    ogdf::node v2Orig = ccToOrig[v2CC];
-
-                                    out << "V " << vName << " " << spqrNodeNames[src] << " "
-                                        << spqrNodeNames[tgt] << " " << C.node2name[v1Orig]
-                                        << " " << C.node2name[v2Orig] << "\n";
-                                }
+                                ogdf::node ccNode = blockToCC[blockNode];
+                                ogdf::node origNode = ccToOrig[ccNode];
+                                skelNodesInOrig.insert(origNode);
                             }
                         }
 
-                        // Write E-lines (real edges)
-                        int eIdx = 0;
-                        for (ogdf::node treeNode : spqr.tree().nodes)
+                        for (ogdf::node origNode : skelNodesInOrig)
                         {
-                            const ogdf::Skeleton &skel = spqr.skeleton(treeNode);
+                            out << " " << C.node2name[origNode];
+                        }
+                        out << "\n";
+                    }
 
-                            for (ogdf::edge skelEdge : skel.getGraph().edges)
+                    // Write V-lines (virtual edges in SPQR tree)
+                    for (ogdf::edge treeEdge : spqr.tree().edges)
+                    {
+                        ogdf::node src = treeEdge->source();
+                        ogdf::node tgt = treeEdge->target();
+
+                        std::string vName = "V" + std::to_string(ccIdx) + "_" +
+                                            std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(vIdx++);
+
+                        const ogdf::Skeleton &skelSrc = spqr.skeleton(src);
+
+                        ogdf::edge virtualEdge = nullptr;
+                        for (ogdf::edge e : skelSrc.getGraph().edges)
+                        {
+                            if (skelSrc.isVirtual(e) && skelSrc.twinTreeNode(e) == tgt)
                             {
-                                if (!skel.isVirtual(skelEdge))
-                                {
-                                    ogdf::edge blockEdge = skel.realEdge(skelEdge);
-                                    ogdf::edge ccEdge = blockEdgeToCC[blockEdge];
-                                    ogdf::node v1CC = ccEdge->source();
-                                    ogdf::node v2CC = ccEdge->target();
-                                    ogdf::node v1Orig = ccToOrig[v1CC];
-                                    ogdf::node v2Orig = ccToOrig[v2CC];
+                                virtualEdge = e;
+                                break;
+                            }
+                        }
 
-                                    std::string eName = "E" + std::to_string(ccIdx) + "_" +
-                                                        std::to_string(bNode->index()) + "_" + std::to_string(eIdx++);
+                        if (virtualEdge)
+                        {
+                            ogdf::node v1Skel = virtualEdge->source();
+                            ogdf::node v2Skel = virtualEdge->target();
 
-                                    out << "E " << eName << " " << spqrNodeNames[treeNode] << " "
-                                        << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
-                                }
+                            ogdf::node v1Block = skelSrc.original(v1Skel);
+                            ogdf::node v2Block = skelSrc.original(v2Skel);
+
+                            if (v1Block && v2Block)
+                            {
+                                ogdf::node v1CC = blockToCC[v1Block];
+                                ogdf::node v2CC = blockToCC[v2Block];
+                                ogdf::node v1Orig = ccToOrig[v1CC];
+                                ogdf::node v2Orig = ccToOrig[v2CC];
+
+                                out << "V " << vName << " " << spqrNodeNames[src] << " "
+                                    << spqrNodeNames[tgt] << " " << C.node2name[v1Orig]
+                                    << " " << C.node2name[v2Orig] << "\n";
                             }
                         }
                     }
-                    catch (...)
+
+                    // Write E-lines (real edges)
+                    for (ogdf::node treeNode : spqr.tree().nodes)
                     {
-                        // If SPQR tree computa<tion fails (e.g., graph not biconnected),
-                        // just skip this block>
-                        continue;
+                        const ogdf::Skeleton &skel = spqr.skeleton(treeNode);
+
+                        for (ogdf::edge skelEdge : skel.getGraph().edges)
+                        {
+                            if (!skel.isVirtual(skelEdge))
+                            {
+                                ogdf::edge blockEdge = skel.realEdge(skelEdge);
+                                ogdf::edge ccEdge = blockEdgeToCC[blockEdge];
+                                ogdf::node v1CC = ccEdge->source();
+                                ogdf::node v2CC = ccEdge->target();
+                                ogdf::node v1Orig = ccToOrig[v1CC];
+                                ogdf::node v2Orig = ccToOrig[v2CC];
+
+                                std::string eName = "E" + std::to_string(ccIdx) + "_" + std::to_string(bcNodeToBlockIndex[bNode])
+                                        + "_" + std::to_string(spqrNodeIndices[treeNode]) + "_" + std::to_string(eIdx++);
+
+                                out << "E " << eName << " " << spqrNodeNames[treeNode] << " "
+                                    << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
+                            }
+                        }
                     }
                 }
             }
