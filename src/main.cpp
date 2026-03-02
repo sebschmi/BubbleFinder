@@ -5877,7 +5877,7 @@ namespace solver
             std::ostream &out = *out_ptr;
 
             // Write header
-            out << "H v0.1 https://github.com/sebschmi/SPQR-tree-file-format\n";
+            out << "H v0.2 https://github.com/sebschmi/SPQR-tree-file-format\n";
 
             // Compute connected components
             ogdf::NodeArray<int> component(C.G, -1);
@@ -6184,8 +6184,7 @@ namespace solver
                                                         std::to_string(bNode->index()) + "_" + std::to_string(eIdx++);
 
                                     out << "E " << eName << " " << spqrNodeNames[treeNode] << " "
-                                        << blockName << " " << C.node2name[v1Orig] << " "
-                                        << C.node2name[v2Orig] << "\n";
+                                        << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
                                 }
                             }
                         }
