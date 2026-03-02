@@ -7,6 +7,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <stack>
 #include <cassert>
 #include <chrono>
@@ -5906,7 +5907,9 @@ namespace solver
                 // Create subgraph for this component
                 ogdf::Graph ccGraph;
                 ogdf::NodeArray<ogdf::node> ccToOrig(ccGraph);
-                ogdf::NodeArray<ogdf::node> origToCc(C.G, nullptr);
+                // A node array allocates space for all nodes in the original graph, even if there is just one node in the component.
+                std::unordered_map<ogdf::node, ogdf::node> origToCc;
+                origToCc.reserve(ccNodes[ccIdx].size());
 
                 for (ogdf::node v : ccNodes[ccIdx])
                 {
@@ -5932,9 +5935,11 @@ namespace solver
                         ogdf::node tgt = e->target();
 
                         // Only add edge if both endpoints are in this component
-                        if (origToCc[src] && origToCc[tgt])
+                        auto itSrc = origToCc.find(src);
+                        auto itTgt = origToCc.find(tgt);
+                        if (itSrc != origToCc.end() && itTgt != origToCc.end())
                         {
-                            ccGraph.newEdge(origToCc[src], origToCc[tgt]);
+                            ccGraph.newEdge(itSrc->second, itTgt->second);
                         }
                         else
                         {
