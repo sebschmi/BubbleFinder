@@ -5883,7 +5883,7 @@ namespace solver
             int vIdx = 0;
 
             // Write header
-            out << "H v0.3 https://github.com/sebschmi/SPQR-tree-file-format\n";
+            out << "H v0.4 https://github.com/sebschmi/SPQR-tree-file-format\n";
 
             // Compute connected components
             ogdf::NodeArray<int> component(C.G, -1);
@@ -5956,7 +5956,26 @@ namespace solver
 
                 if (ccGraph.numberOfNodes() == 1)
                 {
-                    // Print no BC-tree for components with a single node.
+                    // Do not compute BC tree if the component is too small.
+                    // Instead, assign its edges directly to the component.
+                    ogdf::node node = ccNodes[ccIdx][0];
+
+                    std::set<ogdf::edge> processedEdges;
+                    for (ogdf::adjEntry adj : node->adjEntries)
+                    {
+                        ogdf::edge e = adj->theEdge();
+                        if (processedEdges.count(e))
+                        {
+                            continue;
+                        }
+                        processedEdges.insert(e);
+
+                        assert((e->source() == node) || (e->target() == node));
+
+                        std::string eName = "E" + std::to_string(ccIdx) + "_" + std::to_string(eIdx++);
+                        out << "E " << eName << " " << compName << " " << C.node2name[node] << " " << C.node2name[node] << "\n";
+                    }
+
                     continue;
                 }
 
