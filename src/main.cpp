@@ -6062,9 +6062,8 @@ namespace solver
                         // Instead, assign its edges directly to the block.
                         for (ogdf::edge edge : blockEdges)
                         {
-                            ogdf::edge ccEdge = blockEdgeToCC[edge];
-                            ogdf::node v1CC = ccEdge->source();
-                            ogdf::node v2CC = ccEdge->target();
+                            ogdf::node v1CC = edge->source();
+                            ogdf::node v2CC = edge->target();
                             ogdf::node v1Orig = ccToOrig[v1CC];
                             ogdf::node v2Orig = ccToOrig[v2CC];
 
