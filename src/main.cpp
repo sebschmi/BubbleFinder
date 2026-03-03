@@ -6062,11 +6062,17 @@ namespace solver
                         // Instead, assign its edges directly to the block.
                         for (ogdf::edge edge : blockEdges)
                         {
+                            ogdf::edge ccEdge = blockEdgeToCC[edge];
+                            ogdf::node v1CC = ccEdge->source();
+                            ogdf::node v2CC = ccEdge->target();
+                            ogdf::node v1Orig = ccToOrig[v1CC];
+                            ogdf::node v2Orig = ccToOrig[v2CC];
+
                             std::string eName = "E" + std::to_string(ccIdx) + "_" +
                                                 std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(eIdx++);
 
                             out << "E " << eName << " " << bcNodeToBlockIndex[bNode] << " "
-                                << C.node2name[edge->source()] << " " << C.node2name[edge->target()] << "\n";
+                                << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
                         }
 
                         continue;
