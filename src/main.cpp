@@ -6272,7 +6272,7 @@ namespace solver
                                 if (e->source() == e->target())
                                 {
                                     std::string eName = "E" + std::to_string(ccIdx) + "_" + std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(spqrNodeIndices[treeNode]) + "_" + std::to_string(eIdx++);
-                                    out << "E " << eName << " " << blockName << " " << C.node2name[vOrig] << " " << C.node2name[vOrig] << "\n";
+                                    out << "E " << eName << " " << spqrNodeNames[treeNode] << " " << C.node2name[vOrig] << " " << C.node2name[vOrig] << "\n";
                                 }
                             }
                         }
