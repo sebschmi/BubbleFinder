@@ -6070,7 +6070,7 @@ namespace solver
                             std::string eName = "E" + std::to_string(ccIdx) + "_" +
                                                 std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(eIdx++);
 
-                            out << "E " << eName << " " << bcNodeToBlockIndex[bNode] << " "
+                            out << "E " << eName << " " << blockName << " "
                                 << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
                         }
 
