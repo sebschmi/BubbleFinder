@@ -5916,6 +5916,8 @@ namespace solver
                 // A node array allocates space for all nodes in the original graph, even if there is just one node in the component.
                 std::unordered_map<ogdf::node, ogdf::node> origToCc;
                 origToCc.reserve(ccNodes[ccIdx].size());
+                // Each self loop should be written at most once, even if it appears in multiple blocks or SPQR nodes.
+                std::unordered_set<ogdf::node> selfLoopsWritten;
 
                 for (ogdf::node v : ccNodes[ccIdx])
                 {
@@ -6003,7 +6005,7 @@ namespace solver
                     for (ogdf::edge e : bc.hEdges(bNode))
                     {
                         ogdf::edge origEdge = bc.original(e);
-                        if (!origEdge) continue;
+                        assert(origEdge);
                         blockNodes.insert(origEdge->source());
                         blockNodes.insert(origEdge->target());
                     }
@@ -6091,6 +6093,34 @@ namespace solver
 
                             out << "E " << eName << " " << blockName << " "
                                 << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
+                        }
+
+                        // Write self-loops.
+                        for (ogdf::node v : blockNodesSet)
+                        {
+                            ogdf::node vOrig = ccToOrig[v];
+                            if (selfLoopsWritten.count(vOrig))
+                            {
+                                continue;
+                            }
+                            selfLoopsWritten.insert(vOrig);
+
+                            std::unordered_set<ogdf::edge> edgesWritten;
+                            for (ogdf::adjEntry adj : vOrig->adjEntries)
+                            {
+                                ogdf::edge e = adj->theEdge();
+                                if (edgesWritten.count(e))
+                                {
+                                    continue;
+                                }
+                                edgesWritten.insert(e);
+
+                                if (e->source() == e->target())
+                                {
+                                    std::string eName = "E" + std::to_string(ccIdx) + "_" + std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(eIdx++);
+                                    out << "E " << eName << " " << blockName << " " << C.node2name[vOrig] << " " << C.node2name[vOrig] << "\n";
+                                }
+                            }
                         }
 
                         continue;
@@ -6214,6 +6244,36 @@ namespace solver
 
                                 out << "E " << eName << " " << spqrNodeNames[treeNode] << " "
                                     << C.node2name[v1Orig] << " " << C.node2name[v2Orig] << "\n";
+                            }
+                        }
+
+                        // Write self-loops.
+                        for (ogdf::node v : skel.getGraph().nodes)
+                        {
+                            ogdf::node blockNode = skel.original(v);
+                            ogdf::node ccNode = blockToCC[blockNode];
+                            ogdf::node vOrig = ccToOrig[ccNode];
+                            if (selfLoopsWritten.count(vOrig))
+                            {
+                                continue;
+                            }
+                            selfLoopsWritten.insert(vOrig);
+
+                            std::unordered_set<ogdf::edge> edgesWritten;
+                            for (ogdf::adjEntry adj : vOrig->adjEntries)
+                            {
+                                ogdf::edge e = adj->theEdge();
+                                if (edgesWritten.count(e))
+                                {
+                                    continue;
+                                }
+                                edgesWritten.insert(e);
+
+                                if (e->source() == e->target())
+                                {
+                                    std::string eName = "E" + std::to_string(ccIdx) + "_" + std::to_string(bcNodeToBlockIndex[bNode]) + "_" + std::to_string(spqrNodeIndices[treeNode]) + "_" + std::to_string(eIdx++);
+                                    out << "E " << eName << " " << blockName << " " << C.node2name[vOrig] << " " << C.node2name[vOrig] << "\n";
+                                }
                             }
                         }
                     }
