@@ -7,7 +7,9 @@
 
 #include "gbz_parser.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <unordered_set>
 #include <unordered_map>
@@ -21,6 +23,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <vector>
 
 using namespace ogdf;
@@ -410,15 +413,28 @@ void readGFA()
     if (C.graphPath.empty())
         throw std::runtime_error("GFA input needs -g <file>");
 
+    const bool gfaReadStats = (std::getenv("BF_GFA_READ_STATS") != nullptr);
+    const auto parseStart = std::chrono::steady_clock::now();
     auto bg = parse_graph_input(C.graphPath, (int)C.threads);
+    const auto parseEnd = std::chrono::steady_clock::now();
     if (bg.n_nodes == 0) { logger::info("Empty graph"); return; }
 
+    const auto buildStart = std::chrono::steady_clock::now();
     switch (C.bubbleType) {
         case Context::BubbleType::ULTRABUBBLE:
             if (C.doubledUltrabubbles) {
                 buildSuperbubbleGraph(bg, false);
             } else {
                 buildUltrabubbleLightGraph(bg);
+                if (gfaReadStats) {
+                    const auto buildEnd = std::chrono::steady_clock::now();
+                    auto parseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        parseEnd - parseStart).count();
+                    auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        buildEnd - buildStart).count();
+                    std::cerr << "[gfa_read] parse_ms=" << parseMs
+                              << " build_ms=" << buildMs << "\n";
+                }
                 return;
             }
             break;
@@ -433,6 +449,15 @@ void readGFA()
             break;
         default:
             break;
+    }
+    const auto buildEnd = std::chrono::steady_clock::now();
+    if (gfaReadStats) {
+        auto parseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            parseEnd - parseStart).count();
+        auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            buildEnd - buildStart).count();
+        std::cerr << "[gfa_read] parse_ms=" << parseMs
+                  << " build_ms=" << buildMs << "\n";
     }
 
     logger::info("OGDF graph built: {} nodes, {} edges", C.G.numberOfNodes(), C.G.numberOfEdges());
@@ -983,6 +1008,385 @@ void writeAllSnarls_buffered(std::ostream &out, const SnarlSet &snarls)
     flushStringBuf(out, buf);
 }
 
+struct FastSnarlOutputTables {
+    std::vector<const std::string*> node_names;
+    std::vector<uint8_t> is_trash;
+    std::vector<int32_t> unique_plus;
+    std::vector<int32_t> unique_minus;
+};
+
+inline uint64_t packFastPairKey(uint32_t a_idx, uint8_t a_sign,
+                                uint32_t b_idx, uint8_t b_sign)
+{
+    uint64_t a = (static_cast<uint64_t>(a_idx) << 1) |
+                 static_cast<uint64_t>(a_sign);
+    uint64_t b = (static_cast<uint64_t>(b_idx) << 1) |
+                 static_cast<uint64_t>(b_sign);
+    if (a > b) std::swap(a, b);
+    return (a << 32) | b;
+}
+
+inline uint64_t packFastPairEndpointKeys(uint64_t a, uint64_t b)
+{
+    if (a > b) std::swap(a, b);
+    return (a << 32) | b;
+}
+
+inline uint32_t fastEndpointIdx(uint64_t key)
+{
+    return static_cast<uint32_t>(key >> 1);
+}
+
+inline uint8_t fastEndpointSign(uint64_t key)
+{
+    return static_cast<uint8_t>(key & 1u);
+}
+
+inline bool parseFastEndpoint(const Context &C,
+                              const std::string &s,
+                              uint32_t &idx,
+                              uint8_t &sign)
+{
+    if (s.size() < 2) return false;
+    char c = s.back();
+    if (c == '+') {
+        sign = 0;
+    } else if (c == '-') {
+        sign = 1;
+    } else {
+        return false;
+    }
+
+    std::string name(s.data(), s.size() - 1);
+    if (name == "_trash") return false;
+    auto it = C.name2node.find(name);
+    if (it == C.name2node.end()) return false;
+    idx = static_cast<uint32_t>(it->second.idx);
+    return true;
+}
+
+FastSnarlOutputTables buildFastSnarlOutputTables(Context &C)
+{
+    size_t max_idx = 0;
+    for (ogdf::node n : C.G.nodes) {
+        max_idx = std::max(max_idx, static_cast<size_t>(n.idx));
+    }
+
+    FastSnarlOutputTables t;
+    t.node_names.assign(max_idx + 1, nullptr);
+    t.is_trash.assign(max_idx + 1, 0);
+    t.unique_plus.assign(max_idx + 1, -1);
+    t.unique_minus.assign(max_idx + 1, -1);
+
+    for (const auto &kv : C.node2name) {
+        const uint32_t idx = static_cast<uint32_t>(kv.first.idx);
+        if (idx >= t.node_names.size()) continue;
+        t.node_names[idx] = &kv.second;
+        if (kv.second == "_trash") {
+            t.is_trash[idx] = 1;
+        }
+    }
+
+    for (ogdf::node u : C.G.nodes) {
+        ogdf::node nbrPlus{nullptr};
+        ogdf::node nbrMinus{nullptr};
+        int countPlus = 0;
+        int countMinus = 0;
+
+        C.G.forEachAdj(u, [&](ogdf::node other, ogdf::edge e) {
+            EdgePartType typeAtU = (C.G.source(e) == u)
+                ? C._edge2types[e].first
+                : C._edge2types[e].second;
+            int *cnt = nullptr;
+            ogdf::node *slot = nullptr;
+            if (typeAtU == EdgePartType::PLUS) {
+                cnt = &countPlus;
+                slot = &nbrPlus;
+            } else if (typeAtU == EdgePartType::MINUS) {
+                cnt = &countMinus;
+                slot = &nbrMinus;
+            } else {
+                return;
+            }
+
+            if (*cnt > 1) return;
+
+            if (other.idx < t.is_trash.size() && t.is_trash[other.idx]) {
+                C.G.forEachAdj(other, [&](ogdf::node real, ogdf::edge) {
+                    if (real == u) return;
+                    if (*cnt > 1) return;
+                    if (*cnt == 0 || *slot == real) {
+                        *slot = real;
+                        if (*cnt == 0) (*cnt)++;
+                    } else {
+                        (*cnt)++;
+                    }
+                });
+            } else {
+                if (*cnt == 0 || *slot == other) {
+                    *slot = other;
+                    if (*cnt == 0) (*cnt)++;
+                } else {
+                    (*cnt)++;
+                }
+            }
+        });
+
+        const uint32_t uidx = static_cast<uint32_t>(u.idx);
+        if (uidx >= t.unique_plus.size()) continue;
+        if (countPlus == 1 && nbrPlus) {
+            t.unique_plus[uidx] = static_cast<int32_t>(nbrPlus.idx);
+        }
+        if (countMinus == 1 && nbrMinus) {
+            t.unique_minus[uidx] = static_cast<int32_t>(nbrMinus.idx);
+        }
+    }
+
+    return t;
+}
+
+inline bool fastEndpointLess(const FastSnarlOutputTables &t,
+                             uint32_t a_idx,
+                             uint8_t a_sign,
+                             uint32_t b_idx,
+                             uint8_t b_sign)
+{
+    const std::string *a_name = t.node_names[a_idx];
+    const std::string *b_name = t.node_names[b_idx];
+    if (!a_name || !b_name) {
+        if (a_idx != b_idx) return a_idx < b_idx;
+        return a_sign < b_sign;
+    }
+    const int cmp = a_name->compare(*b_name);
+    if (cmp != 0) return cmp < 0;
+    return (a_sign == 0 ? '+' : '-') < (b_sign == 0 ? '+' : '-');
+}
+
+inline bool fastEndpointKeyLess(const FastSnarlOutputTables &t,
+                                uint64_t a,
+                                uint64_t b)
+{
+    return fastEndpointLess(t,
+                            fastEndpointIdx(a), fastEndpointSign(a),
+                            fastEndpointIdx(b), fastEndpointSign(b));
+}
+
+inline bool fastPairIsTrivial(const FastSnarlOutputTables &t, uint64_t key)
+{
+    const uint32_t a = static_cast<uint32_t>(key >> 32);
+    const uint32_t b = static_cast<uint32_t>(key & 0xffffffffu);
+    const uint32_t a_idx = a >> 1;
+    const uint8_t a_sign = static_cast<uint8_t>(a & 1u);
+    const uint32_t b_idx = b >> 1;
+    const uint8_t b_sign = static_cast<uint8_t>(b & 1u);
+
+    if (a_idx >= t.unique_plus.size() || b_idx >= t.unique_plus.size()) {
+        return false;
+    }
+    const int32_t a_nbr = (a_sign == 0) ? t.unique_plus[a_idx] : t.unique_minus[a_idx];
+    const int32_t b_nbr = (b_sign == 0) ? t.unique_plus[b_idx] : t.unique_minus[b_idx];
+    return a_nbr == static_cast<int32_t>(b_idx) &&
+           b_nbr == static_cast<int32_t>(a_idx);
+}
+
+inline bool fastEndpointPairIsTrivial(const FastSnarlOutputTables &t,
+                                      uint64_t a,
+                                      uint64_t b)
+{
+    return fastPairIsTrivial(t, packFastPairEndpointKeys(a, b));
+}
+
+inline void appendFastEndpoint(const FastSnarlOutputTables &t,
+                               uint32_t idx,
+                               uint8_t sign,
+                               std::string &buf)
+{
+    const std::string *name = (idx < t.node_names.size()) ? t.node_names[idx] : nullptr;
+    if (name) {
+        buf.append(*name);
+    } else {
+        buf.append(std::to_string(idx));
+    }
+    buf.push_back(sign == 0 ? '+' : '-');
+}
+
+inline void appendFastEndpointKey(const FastSnarlOutputTables &t,
+                                  uint64_t key,
+                                  std::string &buf)
+{
+    appendFastEndpoint(t, fastEndpointIdx(key), fastEndpointSign(key), buf);
+}
+
+void appendFallbackStringSnarlsToFastPairs(Context &C)
+{
+    if (C.snarls.empty()) return;
+
+    thread_local std::vector<std::pair<uint32_t, uint8_t>> endpoints;
+    for (const auto &s : C.snarls) {
+        endpoints.clear();
+        endpoints.reserve(s.size());
+        for (const std::string &endpoint : s) {
+            uint32_t idx = 0;
+            uint8_t sign = 255;
+            if (!parseFastEndpoint(C, endpoint, idx, sign)) {
+                throw std::runtime_error(
+                    "fast snarl output encountered a non-packable endpoint");
+            }
+            endpoints.emplace_back(idx, sign);
+        }
+        if (endpoints.size() == 2) {
+            C.fastSnarlPairs.push_back(packFastPairKey(
+                endpoints[0].first, endpoints[0].second,
+                endpoints[1].first, endpoints[1].second));
+        } else if (endpoints.size() > 2) {
+            std::vector<uint64_t> clique;
+            clique.reserve(endpoints.size());
+            for (const auto &endpoint : endpoints) {
+                clique.push_back((static_cast<uint64_t>(endpoint.first) << 1) |
+                                 static_cast<uint64_t>(endpoint.second));
+            }
+            C.fastSnarlCliques.push_back(std::move(clique));
+        }
+    }
+    C.snarls.clear();
+}
+
+void writeFastSnarlPairs(std::ostream &out, Context &C)
+{
+    appendFallbackStringSnarlsToFastPairs(C);
+
+    auto tables = buildFastSnarlOutputTables(C);
+    auto &pairs = C.fastSnarlPairs;
+    auto &cliques = C.fastSnarlCliques;
+
+    auto endpointLess = [&](uint64_t a, uint64_t b) {
+        return fastEndpointKeyLess(tables, a, b);
+    };
+    auto cliqueLess = [&](const std::vector<uint64_t> &a,
+                          const std::vector<uint64_t> &b) {
+        return std::lexicographical_compare(a.begin(), a.end(),
+                                            b.begin(), b.end(),
+                                            endpointLess);
+    };
+
+    for (auto &clique : cliques) {
+        std::sort(clique.begin(), clique.end(), endpointLess);
+        clique.erase(std::unique(clique.begin(), clique.end()), clique.end());
+    }
+    cliques.erase(std::remove_if(cliques.begin(), cliques.end(),
+                                 [](const std::vector<uint64_t> &clique) {
+                                     return clique.size() < 2;
+                                 }),
+                  cliques.end());
+    std::sort(cliques.begin(), cliques.end(), cliqueLess);
+    cliques.erase(std::unique(cliques.begin(), cliques.end()), cliques.end());
+
+    std::vector<uint64_t> coveredPairs;
+    std::vector<std::vector<uint64_t>> outputCliques;
+    std::vector<uint64_t> cliquePairs;
+
+    for (auto &clique : cliques) {
+        cliquePairs.clear();
+        cliquePairs.reserve(clique.size() * (clique.size() - 1) / 2);
+        bool canCompact = true;
+
+        for (size_t i = 0; i < clique.size(); ++i) {
+            for (size_t j = i + 1; j < clique.size(); ++j) {
+                uint64_t key = packFastPairEndpointKeys(clique[i], clique[j]);
+                if (fastPairIsTrivial(tables, key)) {
+                    canCompact = false;
+                } else {
+                    cliquePairs.push_back(key);
+                }
+            }
+        }
+
+        std::sort(cliquePairs.begin(), cliquePairs.end());
+        cliquePairs.erase(std::unique(cliquePairs.begin(), cliquePairs.end()),
+                          cliquePairs.end());
+
+        if (canCompact) {
+            bool overlaps = false;
+            for (uint64_t key : cliquePairs) {
+                if (std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) {
+                    overlaps = true;
+                    break;
+                }
+            }
+
+            if (!overlaps) {
+                outputCliques.push_back(std::move(clique));
+
+                std::vector<uint64_t> merged;
+                merged.reserve(coveredPairs.size() + cliquePairs.size());
+                std::merge(coveredPairs.begin(), coveredPairs.end(),
+                           cliquePairs.begin(), cliquePairs.end(),
+                           std::back_inserter(merged));
+                merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+                coveredPairs.swap(merged);
+                continue;
+            }
+        }
+
+        pairs.insert(pairs.end(), cliquePairs.begin(), cliquePairs.end());
+    }
+
+    std::sort(pairs.begin(), pairs.end());
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+
+    size_t pair_count = 0;
+    for (uint64_t key : pairs) {
+        if (!fastPairIsTrivial(tables, key) &&
+            !std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) {
+            ++pair_count;
+        }
+    }
+
+    std::string buf;
+    buf.reserve(kIoChunkHighWater + 4096);
+    buf.append(std::to_string(pair_count + outputCliques.size()));
+    buf.push_back('\n');
+
+    for (const auto &clique : outputCliques) {
+        for (size_t i = 0; i < clique.size(); ++i) {
+            if (i) buf.push_back(' ');
+            appendFastEndpointKey(tables, clique[i], buf);
+        }
+        buf.push_back('\n');
+
+        if (buf.size() >= kIoChunkHighWater) {
+            flushStringBuf(out, buf);
+        }
+    }
+
+    for (uint64_t key : pairs) {
+        if (fastPairIsTrivial(tables, key)) continue;
+        if (std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) continue;
+
+        const uint32_t a = static_cast<uint32_t>(key >> 32);
+        const uint32_t b = static_cast<uint32_t>(key & 0xffffffffu);
+        uint32_t a_idx = a >> 1;
+        uint8_t a_sign = static_cast<uint8_t>(a & 1u);
+        uint32_t b_idx = b >> 1;
+        uint8_t b_sign = static_cast<uint8_t>(b & 1u);
+
+        if (!fastEndpointLess(tables, a_idx, a_sign, b_idx, b_sign)) {
+            std::swap(a_idx, b_idx);
+            std::swap(a_sign, b_sign);
+        }
+
+        appendFastEndpoint(tables, a_idx, a_sign, buf);
+        buf.push_back(' ');
+        appendFastEndpoint(tables, b_idx, b_sign, buf);
+        buf.push_back('\n');
+
+        if (buf.size() >= kIoChunkHighWater) {
+            flushStringBuf(out, buf);
+        }
+    }
+    flushStringBuf(out, buf);
+}
+
 }  
 
 void writeSuperbubbles()
@@ -1021,6 +1425,31 @@ void writeSuperbubbles()
         }
         else
         {
+            if (C.fastSnarlPairsEnabled)
+            {
+                if (C.outputPath.empty())
+                {
+                    writeFastSnarlPairs(std::cout, C);
+                    if (!std::cout) {
+                        throw std::runtime_error("Error while writing snarls to standard output");
+                    }
+                }
+                else
+                {
+                    std::ofstream out(C.outputPath, std::ios::out | std::ios::binary);
+                    if (!out) {
+                        throw std::runtime_error("Failed to open output file '" +
+                                                 C.outputPath + "' for writing");
+                    }
+                    writeFastSnarlPairs(out, C);
+                    if (!out) {
+                        throw std::runtime_error("Error while writing snarls to output file '" +
+                                                 C.outputPath + "'");
+                    }
+                }
+                return;
+            }
+
             struct RealNbrKey {
                 uint32_t node_idx;
                 uint8_t sign;  // 0 = PLUS, 1 = MINUS

@@ -272,6 +272,16 @@ add_custom_command(
             ${SPQR_RUST_DIR}/src/ffi.rs
             ${SPQR_RUST_DIR}/src/spqr_format.rs
             ${SPQR_RUST_DIR}/src/verify.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/mod.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/adj.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/arena.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/ffi.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/integration.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/iso.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/pmap.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/reconstruct.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/reduction.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/types.rs
     COMMENT "Building spqr-rust (cargo --release)"
     VERBATIM)
 

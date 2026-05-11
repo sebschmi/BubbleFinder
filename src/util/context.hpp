@@ -16,10 +16,12 @@ enum class EdgePartType
     MINUS,
     NONE
 };
-struct UBEdge {
-    uint32_t neighbor; // index of the neighbor node
-    uint8_t  type_self; // EdgePartType at this node  (0=PLUS, 1=MINUS)
-    uint8_t  type_neigh; // EdgePartType at the neighbor (0 = PLUS, 1=MINUS)
+
+struct UBEdge
+{
+    uint32_t neighbor;
+    uint8_t type_self;
+    uint8_t type_neigh;
 };
 
 struct Context
@@ -32,7 +34,6 @@ struct Context
         LOG_DEBUG
     };
 
-
     enum BubbleType
     {
         SUPERBUBBLE,
@@ -43,10 +44,10 @@ struct Context
 
     enum class InputFormat
     {
-        Auto,        
-        Gfa,         
-        GfaDirected, 
-        Graph       
+        Auto,
+        Gfa,
+        GfaDirected,
+        Graph
     };
 
     enum class Compression
@@ -55,6 +56,14 @@ struct Context
         Gzip,
         Bzip2,
         Xz
+    };
+
+    enum class SpCompressMode
+    {
+        Off,
+        On,
+        Instrument,
+        MacroDirectDebug
     };
 
     struct PairHash
@@ -73,19 +82,19 @@ struct Context
 
     std::string graphPath = "";
     std::string outputPath = "";
-
     std::string ultrabubbleTreeOutputPath = "";
 
     std::vector<bool> ubIsTip;
 
-    bool gfaInput = false; // kept for backward compatibility
+    bool gfaInput = false; // legacy flag
     bool doubleGraph = false;
     bool doubledUltrabubbles = false;
+
     LogLevel logLevel = LOG_INFO;
     bool timingEnabled = true;
     unsigned threads = 1;
-    std::size_t stackSize = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 
+    std::size_t stackSize = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 
     std::vector<std::pair<std::string, std::string>> ultrabubbleIncidences;
     std::vector<std::string> gfaSegmentIds;
@@ -93,6 +102,7 @@ struct Context
 
     BubbleType bubbleType = SUPERBUBBLE;
     bool directedSuperbubbles = true;
+
     InputFormat inputFormat = InputFormat::Auto;
     Compression compression = Compression::None;
 
@@ -100,6 +110,11 @@ struct Context
     std::string clsdTreesPath;
 
     bool includeTrivial = false;
+
+    SpCompressMode spCompressMode = SpCompressMode::Off;
+    std::string spCompressInstrumentCsv = "";
+
+    bool skipCanonicalizeRoot = false;
 
     ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> _edge2types;
     ogdf::EdgeArray<std::pair<int, int>> _edge2cnt;
@@ -109,6 +124,7 @@ struct Context
 
     std::unordered_map<std::string, ogdf::node> name2node;
     std::unordered_map<ogdf::node, std::string> node2name;
+
     std::vector<std::pair<ogdf::node, ogdf::node>> superbubbles;
 
     struct VectorStringHash
@@ -117,10 +133,12 @@ struct Context
         {
             std::size_t h = 0;
             std::hash<std::string> hasher;
+
             for (const auto &s : v)
             {
                 h ^= hasher(s) + 0x9e3779b9 + (h << 6) + (h >> 2);
             }
+
             return h;
         }
     };
@@ -136,19 +154,24 @@ struct Context
 
     std::unordered_set<std::vector<std::string>, VectorStringHash, VectorStringEqual> snarls;
 
+    bool fastSnarlPairsEnabled = false;
+    std::vector<std::uint64_t> fastSnarlPairs;
+    std::vector<std::vector<std::uint64_t>> fastSnarlCliques;
+
     std::vector<ogdf::node> nodeByGlobalId;
 
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ultrabubbleIncPacked;
 
     uint32_t ubNumNodes = 0;
+
     std::vector<std::string> ubNodeNames;
-    std::vector<uint32_t> ubOffset;   
-    std::vector<UBEdge> ubEdges;    
+    std::vector<uint32_t> ubOffset;
+    std::vector<UBEdge> ubEdges;
     std::vector<std::string> ubClsdText;
 
     inline const UBEdge* adjBegin(uint32_t v) const { return ubEdges.data() + ubOffset[v]; }
-    inline const UBEdge* adjEnd(uint32_t v)   const { return ubEdges.data() + ubOffset[v+1]; }
-    inline uint32_t adjDeg(uint32_t v)   const { return ubOffset[v+1] - ubOffset[v]; }
+    inline const UBEdge* adjEnd(uint32_t v) const { return ubEdges.data() + ubOffset[v + 1]; }
+    inline uint32_t adjDeg(uint32_t v) const { return ubOffset[v + 1] - ubOffset[v]; }
 
     Context();
     Context(const Context &) = delete;
