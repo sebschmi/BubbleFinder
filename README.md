@@ -37,6 +37,9 @@ BubbleFinder first builds the undirected version of the input bidirected graph, 
 > `snarls` computes **all** snarls and aims to replicate the behavior of [`vg snarls -a -T`](https://github.com/vgteam/vg), **but** `vg` outputs only a pruned, linear-size *snarl decomposition*.  
 > Therefore, `BubbleFinder` may output **more** snarls than `vg snarls`.
 
+> [!NOTE]
+> **Empirical performance (snarls & superbubbles).** Benchmarks and theory are reported in [Sena, Politov et al., 2025](#ref-sena-politov2025).
+
 ### Ultrabubbles via linear-time orientation + reduction to weak superbubbles
 
 Ultrabubbles use a different approach (not SPQR-based). BubbleFinder first orients the bidirected graph into a directed graph using a DFS-based procedure, then runs a linear-time directed weak superbubble algorithm on the result and maps the output back to ultrabubbles in the original bidirected graph.
