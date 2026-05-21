@@ -1,10 +1,8 @@
 #pragma once
-// Compatibility layer: replaces OGDF with spqr-rust, to rename
-
-#include "../../external/spqr-rust/include/ogdf_compat.hpp"
+#include "../../external/spqr-rust/include/spqr_compat.hpp"
 #include <cassert>
 
-namespace ogdf {
+namespace spqr_compat {
     using spqr::node;
     using spqr::edge;
     using spqr::adjEntry;
@@ -23,12 +21,12 @@ namespace ogdf {
     using spqr::isAcyclic;
     using spqr::strongComponents;
 
-    template<typename T> using NodeArray = spqr::ogdf_compat::NodeArray<T>;
-    template<typename T> using EdgeArray = spqr::ogdf_compat::EdgeArray<T>;
+    template<typename T> using NodeArray = spqr::NodeArray<T>;
+    template<typename T> using EdgeArray = spqr::EdgeArray<T>;
 }
 
-using namespace ogdf;
+using namespace spqr_compat;
 
-#ifndef OGDF_ASSERT
-#define OGDF_ASSERT(x) assert(x)
+#ifndef SPQR_RUST_ASSERT
+#define SPQR_RUST_ASSERT(x) assert(x)
 #endif

@@ -31,6 +31,9 @@ struct BiLink {
 struct BiGraph {
     uint32_t                 n_nodes = 0;
     std::vector<std::string> node_names;
+    std::vector<uint64_t>    numeric_node_names;
+    std::vector<uint8_t>     numeric_node_name_valid;
+    std::vector<std::pair<uint32_t, std::string>> string_node_names;
     std::vector<BiLink>      links;
 };
 

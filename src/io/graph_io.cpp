@@ -15,9 +15,11 @@
 #include <unordered_map>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <charconv>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
@@ -25,8 +27,11 @@
 #include <iostream>
 #include <iterator>
 #include <vector>
+#if defined(_OPENMP) && defined(__GLIBCXX__)
+#include <parallel/algorithm>
+#endif
 
-using namespace ogdf;
+using namespace spqr_compat;
 
 namespace GraphIO {
 
@@ -144,19 +149,19 @@ void readStandard()
     }
     std::vector<std::pair<uint32_t, uint32_t>>().swap(edges_raw);
 
-    std::vector<ogdf::node> id2node(n, nullptr);
+    std::vector<spqr_compat::node> id2node(n, nullptr);
     C.node2name.reserve(n);
     C.name2node.reserve(n);
     for (const auto &e : edges_ordered) {
         if (!id2node[e.first]) {
-            ogdf::node v = C.G.newNode();
+            spqr_compat::node v = C.G.newNode();
             id2node[e.first] = v;
             std::string name = std::to_string(e.first);
             C.node2name[v] = name;
             C.name2node[std::move(name)] = v;
         }
         if (!id2node[e.second]) {
-            ogdf::node v = C.G.newNode();
+            spqr_compat::node v = C.G.newNode();
             id2node[e.second] = v;
             std::string name = std::to_string(e.second);
             C.node2name[v] = name;
@@ -176,8 +181,8 @@ void readStandard()
         if (has_rev) {
             processed.insert(revkey);
 
-            ogdf::node t1 = C.G.newNode();
-            ogdf::node t2 = C.G.newNode();
+            spqr_compat::node t1 = C.G.newNode();
+            spqr_compat::node t2 = C.G.newNode();
             C.node2name[t1] = "_trash";
             C.node2name[t2] = "_trash";
 
@@ -196,69 +201,354 @@ namespace {
 inline char flipSign(char c) { return c == '+' ? '-' : '+'; }
 inline EdgePartType charToType(char c) { return c == '+' ? EdgePartType::PLUS : EdgePartType::MINUS; }
 
-std::vector<ogdf::node> createNodes(BiGraph& bg) {
-    auto &C = ctx();
-    std::vector<ogdf::node> id2node(bg.n_nodes);
-    C.name2node.reserve(bg.n_nodes);
+void ensureStringNodeNames(BiGraph& bg)
+{
+    if (bg.node_names.size() == bg.n_nodes) return;
+    if (bg.numeric_node_names.size() != bg.n_nodes ||
+        bg.numeric_node_name_valid.size() != bg.n_nodes) return;
+    bg.node_names.resize(bg.n_nodes);
+    size_t sparse_i = 0;
     for (uint32_t i = 0; i < bg.n_nodes; ++i) {
-        ogdf::node v = C.G.newNode();
-        id2node[i] = v;
-        C.node2name[v] = bg.node_names[i];
-        C.name2node[bg.node_names[i]] = v;
+        if (bg.numeric_node_name_valid[i]) {
+            bg.node_names[i] = std::to_string(bg.numeric_node_names[i]);
+        } else {
+            while (sparse_i < bg.string_node_names.size() &&
+                   bg.string_node_names[sparse_i].first < i) {
+                ++sparse_i;
+            }
+            if (sparse_i < bg.string_node_names.size() &&
+                bg.string_node_names[sparse_i].first == i) {
+                bg.node_names[i] = bg.string_node_names[sparse_i].second;
+            }
+        }
     }
-    C.gfaSegmentIds = std::move(bg.node_names);
+    std::vector<uint64_t>().swap(bg.numeric_node_names);
+    std::vector<uint8_t>().swap(bg.numeric_node_name_valid);
+    std::vector<std::pair<uint32_t, std::string>>().swap(bg.string_node_names);
+}
+
+std::string biGraphNodeName(const BiGraph& bg, uint32_t i)
+{
+    if (bg.node_names.size() == bg.n_nodes) {
+        return bg.node_names[i];
+    }
+    if (bg.numeric_node_names.size() == bg.n_nodes &&
+        bg.numeric_node_name_valid.size() == bg.n_nodes &&
+        bg.numeric_node_name_valid[i]) {
+        return std::to_string(bg.numeric_node_names[i]);
+    }
+    auto it = std::lower_bound(
+        bg.string_node_names.begin(), bg.string_node_names.end(), i,
+        [](const std::pair<uint32_t, std::string>& item, uint32_t value) {
+            return item.first < value;
+        });
+    if (it != bg.string_node_names.end() && it->first == i) {
+        return it->second;
+    }
+    return std::to_string(i);
+}
+
+bool useCompactSnarlNameTables(const Context &C)
+{
+    return C.bubbleType == Context::BubbleType::SNARL &&
+           C.includeTrivial &&
+           C.spCompressMode == Context::SpCompressMode::MacroDirectDebug &&
+           std::getenv("BF_DISABLE_FAST_SNARL_OUTPUT") == nullptr &&
+           std::getenv("BF_DEBUG_TAGGED_SNARLS") == nullptr &&
+           std::getenv("BF_FORCE_SNARL_NAME_INDEX") == nullptr &&
+           std::getenv("BF_FORCE_SNARL_NODE2NAME") == nullptr;
+}
+
+void ensureCompactNodeSlot(Context &C, spqr_compat::node v)
+{
+    const size_t idx = static_cast<size_t>(v.idx);
+    if (C.nodeNumericNamesByIndex.empty() && idx >= C.nodeNamesByIndex.size()) {
+        C.nodeNamesByIndex.resize(idx + 1);
+    }
+    if (!C.nodeNumericNamesByIndex.empty() && idx >= C.nodeNumericNamesByIndex.size()) {
+        C.nodeNumericNamesByIndex.resize(idx + 1);
+    }
+    if (!C.nodeNumericNameValidByIndex.empty() && idx >= C.nodeNumericNameValidByIndex.size()) {
+        C.nodeNumericNameValidByIndex.resize(idx + 1, 0);
+    }
+    if (idx >= C.isTrashNodeByIndex.size()) {
+        C.isTrashNodeByIndex.resize(idx + 1, 0);
+    }
+}
+
+void setCompactNodeName(Context &C, spqr_compat::node v, std::string name)
+{
+    ensureCompactNodeSlot(C, v);
+    const size_t idx = static_cast<size_t>(v.idx);
+    if (idx >= C.nodeNamesByIndex.size()) {
+        C.nodeNamesByIndex.resize(idx + 1);
+    }
+    C.isTrashNodeByIndex[idx] = (name == "_trash") ? 1 : 0;
+    if (!C.nodeNumericNamesByIndex.empty() && idx < C.nodeNumericNamesByIndex.size()) {
+        C.nodeNumericNamesByIndex[idx] = 0;
+    }
+    if (!C.nodeNumericNameValidByIndex.empty() && idx < C.nodeNumericNameValidByIndex.size()) {
+        C.nodeNumericNameValidByIndex[idx] = 0;
+    }
+    if (C.isTrashNodeByIndex[idx]) {
+        C.nodeNamesByIndex[idx].clear();
+    } else {
+        C.nodeNamesByIndex[idx] = std::move(name);
+    }
+}
+
+void setCompactNumericNodeName(Context &C, spqr_compat::node v, uint64_t name)
+{
+    ensureCompactNodeSlot(C, v);
+    const size_t idx = static_cast<size_t>(v.idx);
+    if (idx < C.nodeNamesByIndex.size()) {
+        C.nodeNamesByIndex[idx].clear();
+    }
+    C.nodeNumericNamesByIndex[idx] = name;
+    if (!C.nodeNumericNameValidByIndex.empty()) {
+        C.nodeNumericNameValidByIndex[idx] = 1;
+    }
+    C.isTrashNodeByIndex[idx] = 0;
+}
+
+void setCompactTrashNode(Context &C, spqr_compat::node v)
+{
+    ensureCompactNodeSlot(C, v);
+    const size_t idx = static_cast<size_t>(v.idx);
+    if (idx < C.nodeNamesByIndex.size()) {
+        C.nodeNamesByIndex[idx].clear();
+    }
+    if (!C.nodeNumericNamesByIndex.empty() && idx < C.nodeNumericNamesByIndex.size()) {
+        C.nodeNumericNamesByIndex[idx] = 0;
+    }
+    if (!C.nodeNumericNameValidByIndex.empty() && idx < C.nodeNumericNameValidByIndex.size()) {
+        C.nodeNumericNameValidByIndex[idx] = 0;
+    }
+    C.isTrashNodeByIndex[idx] = 1;
+}
+
+std::vector<spqr_compat::node> createNodes(BiGraph& bg, size_t extra_nodes = 0) {
+    auto &C = ctx();
+    std::vector<spqr_compat::node> id2node(bg.n_nodes);
+    const bool compact_names = useCompactSnarlNameTables(C);
+    const bool bg_has_numeric_names =
+        bg.numeric_node_names.size() == bg.n_nodes &&
+        bg.numeric_node_name_valid.size() == bg.n_nodes;
+    const bool build_name_index =
+        !(C.bubbleType == Context::BubbleType::SNARL &&
+          C.includeTrivial &&
+          std::getenv("BF_FORCE_SNARL_NAME_INDEX") == nullptr);
+    if (build_name_index) {
+        C.name2node.reserve(bg.n_nodes);
+    }
+    if (compact_names) {
+        C.nodeNamesByIndex.clear();
+        C.nodeNumericNamesByIndex.clear();
+        C.nodeNumericNameValidByIndex.clear();
+        C.sparseNodeNamesByIndex.clear();
+        C.isTrashNodeByIndex.clear();
+        if (bg_has_numeric_names) {
+            C.nodeNumericNamesByIndex.resize(static_cast<size_t>(bg.n_nodes) + extra_nodes);
+            C.nodeNumericNameValidByIndex.resize(static_cast<size_t>(bg.n_nodes) + extra_nodes, 0);
+            C.sparseNodeNamesByIndex.reserve(bg.string_node_names.size());
+        } else {
+            C.nodeNamesByIndex.resize(static_cast<size_t>(bg.n_nodes) + extra_nodes);
+        }
+        C.isTrashNodeByIndex.resize(static_cast<size_t>(bg.n_nodes) + extra_nodes, 0);
+    } else {
+        C.node2name.reserve(static_cast<size_t>(bg.n_nodes) + extra_nodes);
+    }
+    spqr_compat::node first = C.G.newNodes(bg.n_nodes);
+    for (uint32_t i = 0; i < bg.n_nodes; ++i) {
+        spqr_compat::node v(first.index() + i);
+        id2node[i] = v;
+        if (compact_names) {
+            if (bg_has_numeric_names) {
+                if (bg.numeric_node_name_valid[i]) {
+                    setCompactNumericNodeName(C, v, bg.numeric_node_names[i]);
+                }
+            } else {
+                setCompactNodeName(C, v, std::move(bg.node_names[i]));
+            }
+        } else {
+            std::string name = bg_has_numeric_names
+                ? biGraphNodeName(bg, i)
+                : std::move(bg.node_names[i]);
+            auto it = C.node2name.emplace(v, std::move(name)).first;
+            if (build_name_index) {
+                C.name2node.emplace(it->second, v);
+            }
+        }
+    }
+    if (compact_names && bg_has_numeric_names && !bg.string_node_names.empty()) {
+        for (auto &item : bg.string_node_names) {
+            spqr_compat::node v(first.index() + item.first);
+            C.sparseNodeNamesByIndex.emplace(static_cast<uint32_t>(v.idx),
+                                             std::move(item.second));
+        }
+    }
+    std::vector<std::string>().swap(bg.node_names);
+    std::vector<uint64_t>().swap(bg.numeric_node_names);
+    std::vector<uint8_t>().swap(bg.numeric_node_name_valid);
+    std::vector<std::pair<uint32_t, std::string>>().swap(bg.string_node_names);
     return id2node;
 }
 
 
 void buildSnarlGraph(BiGraph& bg) {
     auto &C = ctx();
-    auto id2node = createNodes(bg);
-    C._edge2types.init(C.G, std::make_pair(EdgePartType::NONE, EdgePartType::NONE));
-
     auto encodePair = [](uint32_t a, uint32_t b) -> uint64_t {
         return (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
     };
+    const size_t link_count = bg.links.size();
 
-    std::unordered_set<uint64_t> seen;
-    std::unordered_set<uint64_t> multis;
-    seen.reserve(bg.links.size());
-    for (auto& lk : bg.links) {
-        uint32_t a = std::min(lk.src, lk.dst), b = std::max(lk.src, lk.dst);
-        uint64_t key = encodePair(a, b);
-        if (!seen.insert(key).second) {
-            multis.insert(key);
+    std::vector<uint64_t> pair_keys;
+    pair_keys.resize(link_count);
+    #pragma omp parallel for schedule(static) if(pair_keys.size() > 100000)
+    for (int64_t i = 0; i < static_cast<int64_t>(link_count); ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        const auto& lk = bg.links[idx];
+        const uint32_t src = lk.src;
+        const uint32_t dst = lk.dst;
+        uint32_t a = std::min(src, dst), b = std::max(src, dst);
+        pair_keys[static_cast<size_t>(i)] = encodePair(a, b);
+    }
+
+#if defined(_OPENMP) && defined(__GLIBCXX__)
+    __gnu_parallel::sort(pair_keys.begin(), pair_keys.end());
+#else
+    std::sort(pair_keys.begin(), pair_keys.end());
+#endif
+    std::vector<uint64_t> multis;
+    for (size_t i = 1; i < pair_keys.size(); ++i) {
+        if (pair_keys[i] == pair_keys[i - 1] &&
+            (multis.empty() || multis.back() != pair_keys[i])) {
+            multis.push_back(pair_keys[i]);
         }
     }
-    { std::unordered_set<uint64_t>().swap(seen); }
+    std::vector<uint64_t>().swap(pair_keys);
 
     auto is_multi = [&](uint32_t a, uint32_t b) -> bool {
         uint32_t lo = std::min(a, b), hi = std::max(a, b);
-        return multis.count(encodePair(lo, hi)) > 0;
+        return std::binary_search(multis.begin(), multis.end(), encodePair(lo, hi));
     };
 
-    for (auto& lk : bg.links) {
-        EdgePartType t1 = charToType(lk.orient_src);
-        EdgePartType t2 = charToType(flipSign(lk.orient_dst));
-        uint32_t u = lk.src, v = lk.dst;
-        if (u > v) { std::swap(u, v); std::swap(t1, t2); }
+    const size_t worker_count =
+        (C.threads > 1 && link_count > 100000)
+            ? std::min<size_t>(static_cast<size_t>(C.threads), link_count)
+            : 1;
 
-        if (!is_multi(u, v)) {
-            ogdf::edge e = C.G.newEdge(id2node[u], id2node[v]);
-            C._edge2types[e] = {t1, t2};
-        } else {
-            ogdf::node mid = C.G.newNode();
-            C.node2name[mid] = "_trash";
-            ogdf::edge e1 = C.G.newEdge(id2node[u], mid);
-            C._edge2types[e1] = {t1, EdgePartType::PLUS};
-            ogdf::edge e2 = C.G.newEdge(mid, id2node[v]);
-            C._edge2types[e2] = {EdgePartType::PLUS, t2};
+    std::vector<uint8_t> link_is_multi;
+    std::vector<size_t> chunk_multi(worker_count, 0);
+    std::vector<size_t> chunk_out_base(worker_count, 0);
+    std::vector<size_t> chunk_mid_base(worker_count, 0);
+
+    if (!multis.empty()) {
+        link_is_multi.resize(link_count, 0);
+        #pragma omp parallel for schedule(static) if(worker_count > 1)
+        for (int64_t tid_i = 0; tid_i < static_cast<int64_t>(worker_count); ++tid_i) {
+            const size_t tid = static_cast<size_t>(tid_i);
+            const size_t begin = (link_count * tid) / worker_count;
+            const size_t end = (link_count * (tid + 1)) / worker_count;
+            size_t local_multi = 0;
+            for (size_t i = begin; i < end; ++i) {
+                const auto& lk = bg.links[i];
+                const uint32_t src = lk.src;
+                const uint32_t dst = lk.dst;
+                const bool multi = is_multi(src, dst);
+                link_is_multi[i] = static_cast<uint8_t>(multi);
+                local_multi += multi ? 1u : 0u;
+            }
+            chunk_multi[tid] = local_multi;
         }
     }
+
+    size_t multi_links = 0;
+    size_t out_edges = 0;
+    for (size_t tid = 0; tid < worker_count; ++tid) {
+        const size_t begin = (link_count * tid) / worker_count;
+        const size_t end = (link_count * (tid + 1)) / worker_count;
+        chunk_out_base[tid] = out_edges;
+        chunk_mid_base[tid] = multi_links;
+        out_edges += (end - begin) + chunk_multi[tid];
+        multi_links += chunk_multi[tid];
+    }
+
+    auto id2node = createNodes(bg, multi_links);
+    spqr_compat::node first_mid = C.G.newNodes(static_cast<uint32_t>(multi_links));
+    const bool compact_names = useCompactSnarlNameTables(C);
+    for (size_t i = 0; i < multi_links; ++i) {
+        spqr_compat::node mid(first_mid.index() + static_cast<uint32_t>(i));
+        if (compact_names) {
+            setCompactTrashNode(C, mid);
+        } else {
+            C.node2name[mid] = "_trash";
+        }
+    }
+
+    std::vector<uint32_t> endpoints(out_edges * 2);
+    std::vector<uint8_t> edge_types(out_edges);
+
+    auto packType = [](EdgePartType a, EdgePartType b) -> uint8_t {
+        return (static_cast<uint8_t>(a) << 2) | static_cast<uint8_t>(b);
+    };
+
+    #pragma omp parallel for schedule(static) if(worker_count > 1)
+    for (int64_t tid_i = 0; tid_i < static_cast<int64_t>(worker_count); ++tid_i) {
+        const size_t tid = static_cast<size_t>(tid_i);
+        const size_t begin = (link_count * tid) / worker_count;
+        const size_t end = (link_count * (tid + 1)) / worker_count;
+        size_t out_i = chunk_out_base[tid];
+        size_t mid_i = chunk_mid_base[tid];
+
+        for (size_t i = begin; i < end; ++i) {
+            const auto& lk = bg.links[i];
+            EdgePartType t1 = charToType(lk.orient_src);
+            EdgePartType t2 = charToType(flipSign(lk.orient_dst));
+            uint32_t u = lk.src;
+            uint32_t v = lk.dst;
+            if (u > v) { std::swap(u, v); std::swap(t1, t2); }
+
+            const bool multi = !link_is_multi.empty() && link_is_multi[i] != 0;
+            if (!multi) {
+                endpoints[2 * out_i] = id2node[u].index();
+                endpoints[2 * out_i + 1] = id2node[v].index();
+                edge_types[out_i] = packType(t1, t2);
+                ++out_i;
+            } else {
+                spqr_compat::node mid(first_mid.index() + static_cast<uint32_t>(mid_i++));
+                endpoints[2 * out_i] = id2node[u].index();
+                endpoints[2 * out_i + 1] = mid.index();
+                edge_types[out_i] = packType(t1, EdgePartType::PLUS);
+                ++out_i;
+
+                endpoints[2 * out_i] = mid.index();
+                endpoints[2 * out_i + 1] = id2node[v].index();
+                edge_types[out_i] = packType(EdgePartType::PLUS, t2);
+                ++out_i;
+            }
+        }
+    }
+
+    spqr_compat::edge first_edge = edge_types.empty()
+                                ? spqr_compat::edge(C.G.numberOfEdges())
+                                : C.G.newEdgesBatchFlat(endpoints.data(), static_cast<uint32_t>(edge_types.size()));
+    C._edge2types.init(C.G, std::make_pair(EdgePartType::NONE, EdgePartType::NONE));
+    #pragma omp parallel for schedule(static) if(C.threads > 1 && edge_types.size() > 100000)
+    for (int64_t i_i = 0; i_i < static_cast<int64_t>(edge_types.size()); ++i_i) {
+        const size_t i = static_cast<size_t>(i_i);
+        uint8_t t = edge_types[i];
+        C._edge2types[spqr_compat::edge(first_edge.index() + static_cast<uint32_t>(i))] = {
+            static_cast<EdgePartType>(t >> 2),
+            static_cast<EdgePartType>(t & 3)
+        };
+    }
+    std::vector<BiLink>().swap(bg.links);
 }
 
 void buildUltrabubbleLightGraph(BiGraph& bg) {
     auto &C = ctx();
+    ensureStringNodeNames(bg);
     const uint32_t N = bg.n_nodes;
     C.ubNumNodes = N;
     C.ubNodeNames = std::move(bg.node_names);
@@ -334,19 +624,19 @@ void buildUltrabubbleLightGraph(BiGraph& bg) {
 
 void buildSuperbubbleGraph(BiGraph& bg, bool directed_only) {
     auto &C = ctx();
+    ensureStringNodeNames(bg);
     C.name2node.reserve(bg.n_nodes * 2);
-    std::vector<ogdf::node> id2plus(bg.n_nodes), id2minus(bg.n_nodes);
+    std::vector<spqr_compat::node> id2plus(bg.n_nodes), id2minus(bg.n_nodes);
 
     for (uint32_t i = 0; i < bg.n_nodes; ++i) {
         std::string pn = bg.node_names[i] + "+", mn = bg.node_names[i] + "-";
-        ogdf::node vp = C.G.newNode(), vm = C.G.newNode();
+        spqr_compat::node vp = C.G.newNode(), vm = C.G.newNode();
         id2plus[i] = vp; id2minus[i] = vm;
         C.node2name[vp] = pn; C.node2name[vm] = mn;
         C.name2node[pn] = vp; C.name2node[mn] = vm;
     }
-    C.gfaSegmentIds = std::move(bg.node_names);
 
-    auto getNode = [&](uint32_t id, char o) -> ogdf::node {
+    auto getNode = [&](uint32_t id, char o) -> spqr_compat::node {
         return (o == '+') ? id2plus[id] : id2minus[id];
     };
 
@@ -356,12 +646,12 @@ void buildSuperbubbleGraph(BiGraph& bg, bool directed_only) {
     des.reserve(directed_only ? bg.links.size() : bg.links.size() * 2);
 
     for (auto& lk : bg.links) {
-        ogdf::node nSrc = getNode(lk.src, lk.orient_src);
-        ogdf::node nDst = getNode(lk.dst, lk.orient_dst);
+        spqr_compat::node nSrc = getNode(lk.src, lk.orient_src);
+        spqr_compat::node nDst = getNode(lk.dst, lk.orient_dst);
         des.push_back({(int)nSrc.index(), (int)nDst.index()});
         if (!directed_only) {
-            ogdf::node nRevSrc = getNode(lk.dst, flipSign(lk.orient_dst));
-            ogdf::node nRevDst = getNode(lk.src, flipSign(lk.orient_src));
+            spqr_compat::node nRevSrc = getNode(lk.dst, flipSign(lk.orient_dst));
+            spqr_compat::node nRevDst = getNode(lk.src, flipSign(lk.orient_src));
             des.push_back({(int)nRevSrc.index(), (int)nRevDst.index()});
         }
     }
@@ -369,8 +659,8 @@ void buildSuperbubbleGraph(BiGraph& bg, bool directed_only) {
     std::sort(des.begin(), des.end());
     des.erase(std::unique(des.begin(), des.end()), des.end());
 
-    std::unordered_map<int, ogdf::node> idx2n;
-    for (ogdf::node v : C.G.nodes) idx2n[v.index()] = v;
+    std::unordered_map<int, spqr_compat::node> idx2n;
+    for (spqr_compat::node v : C.G.nodes) idx2n[v.index()] = v;
     for (auto& d : des) C.G.newEdge(idx2n[d.u], idx2n[d.v]);
 }
 
@@ -394,7 +684,7 @@ inline bool ends_with(const std::string& s, const std::string& suffix) {
 BiGraph parse_graph_input(const std::string& path, int threads) {
     if (ends_with(path, ".gbz")) {
         logger::info("GBZ parser: reading '{}'", path);
-        auto bg = GBZParser::parse_file(path);
+        auto bg = GBZParser::parse_file(path, threads);
         logger::info("GBZ parser: {} segments, {} links", bg.n_nodes, bg.links.size());
         return bg;
     }
@@ -460,7 +750,7 @@ void readGFA()
                   << " build_ms=" << buildMs << "\n";
     }
 
-    logger::info("OGDF graph built: {} nodes, {} edges", C.G.numberOfNodes(), C.G.numberOfEdges());
+    logger::info("spqr-rust graph built: {} nodes, {} edges", C.G.numberOfNodes(), C.G.numberOfEdges());
 }
 
 namespace {
@@ -578,24 +868,24 @@ struct ChainAuditResult {
     uint64_t auditTimeMs = 0;
 };
 
-inline EdgePartType edgeTypeAtNode(const ogdf::Graph &G,
-                                   const ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
-                                   ogdf::edge e,
-                                   ogdf::node v)
+inline EdgePartType edgeTypeAtNode(const spqr_compat::Graph &G,
+                                   const spqr_compat::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
+                                   spqr_compat::edge e,
+                                   spqr_compat::node v)
 {
     if (G.source(e) == v) return e2t[e].first;
     if (G.target(e) == v) return e2t[e].second;
     return EdgePartType::NONE;
 }
 
-inline bool isContractible(const ogdf::Graph &G,
-                           const ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
-                           ogdf::node v)
+inline bool isContractible(const spqr_compat::Graph &G,
+                           const spqr_compat::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
+                           spqr_compat::node v)
 {
     int dPlus = 0, dMinus = 0, dOther = 0;
     int total = 0;
     bool hasSelfLoop = false;
-    G.forEachAdj(v, [&](ogdf::node nbr, ogdf::edge e) {
+    G.forEachAdj(v, [&](spqr_compat::node nbr, spqr_compat::edge e) {
         if (nbr == v) hasSelfLoop = true;
         ++total;
         EdgePartType t = edgeTypeAtNode(G, e2t, e, v);
@@ -609,15 +899,15 @@ inline bool isContractible(const ogdf::Graph &G,
     return dPlus == 1 && dMinus == 1;
 }
 
-inline ogdf::node otherEndOnSide(const ogdf::Graph &G,
-                                 const ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
-                                 ogdf::node v,
+inline spqr_compat::node otherEndOnSide(const spqr_compat::Graph &G,
+                                 const spqr_compat::EdgeArray<std::pair<EdgePartType, EdgePartType>> &e2t,
+                                 spqr_compat::node v,
                                  EdgePartType wantedSide,
-                                 ogdf::edge &outEdge)
+                                 spqr_compat::edge &outEdge)
 {
-    ogdf::node res = nullptr;
+    spqr_compat::node res = nullptr;
     outEdge = nullptr;
-    G.forEachAdj(v, [&](ogdf::node nbr, ogdf::edge e) {
+    G.forEachAdj(v, [&](spqr_compat::node nbr, spqr_compat::edge e) {
         if (res != nullptr) return;
         if (edgeTypeAtNode(G, e2t, e, v) == wantedSide) {
             res = nbr;
@@ -632,7 +922,7 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
     using namespace std::chrono;
     auto t0 = high_resolution_clock::now();
     auto &C = ctx();
-    const ogdf::Graph &G = C.G;
+    const spqr_compat::Graph &G = C.G;
     const auto &e2t = C._edge2types;
 
     R.totalNodes = G.numberOfNodes();
@@ -648,12 +938,12 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
     for (size_t i = 0; i < trash.size(); ++i) if (trash[i]) ++R.trashNodes;
 
     std::vector<bool> isCtr(G.numberOfNodes() + 1, false);
-    for (ogdf::node v : G.nodes) {
+    for (spqr_compat::node v : G.nodes) {
         size_t idx = static_cast<size_t>(v.idx);
         if (idx >= isCtr.size()) continue;
         if (idx < trash.size() && trash[idx]) continue;
         int total = 0;
-        G.forEachAdj(v, [&](ogdf::node, ogdf::edge) { ++total; });
+        G.forEachAdj(v, [&](spqr_compat::node, spqr_compat::edge) { ++total; });
         if (total == 0) { ++R.isolatedNodes; continue; }
         if (isContractible(G, e2t, v)) {
             isCtr[idx] = true;
@@ -668,26 +958,26 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
     std::vector<uint64_t> chainLens;
     chainLens.reserve(R.contractibleNodes / 2 + 1);
 
-    for (ogdf::node start : G.nodes) {
+    for (spqr_compat::node start : G.nodes) {
         size_t sIdx = static_cast<size_t>(start.idx);
         if (sIdx >= isCtr.size()) continue;
         if (!isCtr[sIdx]) continue;
         if (visited[sIdx]) continue;
 
-        std::vector<ogdf::node> chain;
+        std::vector<spqr_compat::node> chain;
         chain.push_back(start);
         visited[sIdx] = true;
 
-        ogdf::edge ePlus = nullptr;
-        ogdf::node curPlus = otherEndOnSide(G, e2t, start, EdgePartType::PLUS, ePlus);
+        spqr_compat::edge ePlus = nullptr;
+        spqr_compat::node curPlus = otherEndOnSide(G, e2t, start, EdgePartType::PLUS, ePlus);
         while (curPlus != nullptr) {
             size_t cIdx = static_cast<size_t>(curPlus.idx);
             if (cIdx >= isCtr.size() || !isCtr[cIdx] || visited[cIdx]) break;
             visited[cIdx] = true;
             chain.push_back(curPlus);
-            ogdf::edge nextE = nullptr;
-            ogdf::node nx = nullptr;
-            G.forEachAdj(curPlus, [&](ogdf::node nbr, ogdf::edge e) {
+            spqr_compat::edge nextE = nullptr;
+            spqr_compat::node nx = nullptr;
+            G.forEachAdj(curPlus, [&](spqr_compat::node nbr, spqr_compat::edge e) {
                 if (e == ePlus) return;
                 if (nx != nullptr) return;
                 nx = nbr;
@@ -698,16 +988,16 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
             ePlus = nextE;
         }
 
-        ogdf::edge eMinus = nullptr;
-        ogdf::node curMinus = otherEndOnSide(G, e2t, start, EdgePartType::MINUS, eMinus);
+        spqr_compat::edge eMinus = nullptr;
+        spqr_compat::node curMinus = otherEndOnSide(G, e2t, start, EdgePartType::MINUS, eMinus);
         while (curMinus != nullptr) {
             size_t cIdx = static_cast<size_t>(curMinus.idx);
             if (cIdx >= isCtr.size() || !isCtr[cIdx] || visited[cIdx]) break;
             visited[cIdx] = true;
             chain.push_back(curMinus);
-            ogdf::edge nextE = nullptr;
-            ogdf::node nx = nullptr;
-            G.forEachAdj(curMinus, [&](ogdf::node nbr, ogdf::edge e) {
+            spqr_compat::edge nextE = nullptr;
+            spqr_compat::node nx = nullptr;
+            G.forEachAdj(curMinus, [&](spqr_compat::node nbr, spqr_compat::edge e) {
                 if (e == eMinus) return;
                 if (nx != nullptr) return;
                 nx = nbr;
@@ -718,18 +1008,18 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
             eMinus = nextE;
         }
 
-        ogdf::node leftAnchor = nullptr;
-        ogdf::node rightAnchor = nullptr;
-        ogdf::edge eL = nullptr, eR = nullptr;
-        ogdf::node leftEnd = chain.back();
-        ogdf::node rightEnd = chain.front();
+        spqr_compat::node leftAnchor = nullptr;
+        spqr_compat::node rightAnchor = nullptr;
+        spqr_compat::edge eL = nullptr, eR = nullptr;
+        spqr_compat::node leftEnd = chain.back();
+        spqr_compat::node rightEnd = chain.front();
         if (chain.size() == 1) {
             leftEnd = start; rightEnd = start;
         } else {
             leftEnd = chain.back();
             rightEnd = chain.front();
         }
-        G.forEachAdj(leftEnd, [&](ogdf::node nbr, ogdf::edge e) {
+        G.forEachAdj(leftEnd, [&](spqr_compat::node nbr, spqr_compat::edge e) {
             size_t nIdx = static_cast<size_t>(nbr.idx);
             if (nIdx < isCtr.size() && isCtr[nIdx] && visited[nIdx] && nbr != leftEnd) return;
             if (nIdx >= isCtr.size() || !isCtr[nIdx]) {
@@ -737,7 +1027,7 @@ void auditDeg2ContractionPotential(ChainAuditResult &R)
                 eL = e;
             }
         });
-        G.forEachAdj(rightEnd, [&](ogdf::node nbr, ogdf::edge e) {
+        G.forEachAdj(rightEnd, [&](spqr_compat::node nbr, spqr_compat::edge e) {
             size_t nIdx = static_cast<size_t>(nbr.idx);
             if (nIdx < isCtr.size() && isCtr[nIdx] && visited[nIdx] && nbr != rightEnd) return;
             if (nIdx >= isCtr.size() || !isCtr[nIdx]) {
@@ -924,7 +1214,7 @@ void readGraph() {
 }
 
 
-void drawGraph(const ogdf::Graph &G, const std::string &file)
+void drawGraph(const spqr_compat::Graph &G, const std::string &file)
 {
     (void)G; (void)file;
     return;
@@ -986,9 +1276,191 @@ inline void flushStringBuf(std::ostream &out, std::string &buf) {
     }
 }
 
+struct ChainEdge {
+    uint64_t endpoint[2];
+    size_t next[2];
+};
+
+struct ChainOcc {
+    uint64_t key;
+    size_t edge;
+    uint8_t side;
+};
+
+void compactEndpointPairChains(std::vector<std::pair<uint64_t, uint64_t>> &pairs)
+{
+    if (pairs.size() < 2) return;
+
+    const size_t none = std::numeric_limits<size_t>::max();
+    std::vector<ChainEdge> edges;
+    edges.reserve(pairs.size());
+    std::vector<ChainOcc> occ;
+    occ.reserve(pairs.size() * 2);
+
+    for (const auto &p : pairs) {
+        size_t idx = edges.size();
+        edges.push_back({{p.first, p.second}, {none, none}});
+        occ.push_back({p.first, idx, 0});
+        occ.push_back({p.second, idx, 1});
+    }
+
+    std::sort(occ.begin(), occ.end(), [](const ChainOcc &a, const ChainOcc &b) {
+        if (a.key != b.key) return a.key < b.key;
+        if (a.edge != b.edge) return a.edge < b.edge;
+        return a.side < b.side;
+    });
+
+    auto uniqueOcc = [&](uint64_t key) -> std::pair<size_t, uint8_t> {
+        auto it = std::lower_bound(occ.begin(), occ.end(), key,
+                                   [](const ChainOcc &a, uint64_t b) {
+                                       return a.key < b;
+                                   });
+        if (it == occ.end() || it->key != key) return {none, 0};
+        auto next = it;
+        ++next;
+        if (next != occ.end() && next->key == key) return {none, 0};
+        return {it->edge, it->side};
+    };
+
+    for (size_t i = 0; i < edges.size(); ++i) {
+        for (uint8_t side = 0; side < 2; ++side) {
+            auto [other, other_side] = uniqueOcc(edges[i].endpoint[side] ^ 1ull);
+            if (other != none && other != i && edges[other].endpoint[other_side] == (edges[i].endpoint[side] ^ 1ull)) {
+                edges[i].next[side] = other;
+            }
+        }
+    }
+
+    auto degree = [&](size_t i) {
+        return (edges[i].next[0] != none ? 1 : 0) +
+               (edges[i].next[1] != none ? 1 : 0);
+    };
+
+    std::vector<uint8_t> seen(edges.size(), 0);
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    out.reserve(pairs.size());
+
+    for (size_t i = 0; i < edges.size(); ++i) {
+        if (seen[i] || degree(i) != 1) continue;
+
+        size_t cur = i;
+        uint8_t entry = edges[cur].next[0] == none ? 0 : 1;
+        uint64_t first = edges[cur].endpoint[entry];
+        uint64_t last = edges[cur].endpoint[entry ^ 1u];
+
+        while (true) {
+            seen[cur] = 1;
+            uint8_t exit_side = entry ^ 1u;
+            size_t nxt = edges[cur].next[exit_side];
+            if (nxt == none || seen[nxt]) {
+                last = edges[cur].endpoint[exit_side];
+                break;
+            }
+            int next_entry = edges[nxt].next[0] == cur ? 0 :
+                             edges[nxt].next[1] == cur ? 1 : -1;
+            if (next_entry < 0) {
+                last = edges[cur].endpoint[exit_side];
+                break;
+            }
+            cur = nxt;
+            entry = static_cast<uint8_t>(next_entry);
+        }
+
+        out.emplace_back(first, last);
+    }
+
+    for (size_t i = 0; i < edges.size(); ++i) {
+        if (!seen[i]) out.emplace_back(edges[i].endpoint[0], edges[i].endpoint[1]);
+    }
+
+    pairs.swap(out);
+}
+
+std::vector<std::pair<std::string, std::string>>
+compactStringPairChains(std::vector<std::pair<std::string, std::string>> pairs)
+{
+    if (pairs.size() < 2) return pairs;
+
+    std::unordered_map<std::string, uint64_t> ids;
+    std::vector<std::string> names;
+    ids.reserve(pairs.size() * 2);
+    names.reserve(pairs.size() * 2);
+
+    auto keyOf = [&](const std::string &s, uint64_t &key) -> bool {
+        if (s.size() < 2) return false;
+        char c = s.back();
+        if (c != '+' && c != '-') return false;
+        std::string name(s.data(), s.size() - 1);
+        uint64_t id = ids.size();
+        auto [it, inserted] = ids.emplace(name, id);
+        if (inserted) names.push_back(std::move(name));
+        key = (it->second << 1) | (c == '-' ? 1ull : 0ull);
+        return true;
+    };
+
+    std::vector<std::pair<uint64_t, uint64_t>> packed;
+    packed.reserve(pairs.size());
+    for (const auto &p : pairs) {
+        uint64_t a = 0, b = 0;
+        if (!keyOf(p.first, a) || !keyOf(p.second, b)) return pairs;
+        packed.emplace_back(a, b);
+    }
+
+    compactEndpointPairChains(packed);
+
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(packed.size());
+    for (const auto &p : packed) {
+        auto endpoint = [&](uint64_t key) {
+            std::string s = names[key >> 1];
+            s.push_back((key & 1ull) ? '-' : '+');
+            return s;
+        };
+        out.emplace_back(endpoint(p.first), endpoint(p.second));
+    }
+    return out;
+}
+
 template <typename SnarlSet>
 void writeAllSnarls_buffered(std::ostream &out, const SnarlSet &snarls)
 {
+    if (ctx().compactOutputChains) {
+        std::vector<std::pair<std::string, std::string>> pairs;
+        std::vector<std::vector<std::string>> other;
+        pairs.reserve(snarls.size());
+        for (const auto &s : snarls) {
+            if (s.size() == 2) {
+                pairs.emplace_back(s[0], s[1]);
+            } else {
+                other.emplace_back(s.begin(), s.end());
+            }
+        }
+        pairs = compactStringPairChains(std::move(pairs));
+
+        std::string buf;
+        buf.reserve(kIoChunkHighWater + 4096);
+        buf.append(std::to_string(pairs.size() + other.size()));
+        buf.push_back('\n');
+
+        for (const auto &s : other) {
+            for (const auto &v : s) {
+                buf.append(v);
+                buf.push_back(' ');
+            }
+            buf.push_back('\n');
+            if (buf.size() >= kIoChunkHighWater) flushStringBuf(out, buf);
+        }
+        for (const auto &p : pairs) {
+            buf.append(p.first);
+            buf.push_back(' ');
+            buf.append(p.second);
+            buf.push_back('\n');
+            if (buf.size() >= kIoChunkHighWater) flushStringBuf(out, buf);
+        }
+        flushStringBuf(out, buf);
+        return;
+    }
+
     std::string buf;
     buf.reserve(kIoChunkHighWater + 4096);
 
@@ -1009,11 +1481,109 @@ void writeAllSnarls_buffered(std::ostream &out, const SnarlSet &snarls)
 }
 
 struct FastSnarlOutputTables {
+    const std::vector<std::string>* compact_node_names = nullptr;
+    const std::vector<uint64_t>* compact_numeric_node_names = nullptr;
+    const std::vector<uint8_t>* compact_numeric_name_valid = nullptr;
+    const std::unordered_map<uint32_t, std::string>* sparse_node_names = nullptr;
+    const std::vector<uint8_t>* compact_is_trash = nullptr;
     std::vector<const std::string*> node_names;
     std::vector<uint8_t> is_trash;
     std::vector<int32_t> unique_plus;
     std::vector<int32_t> unique_minus;
+    size_t max_idx = 0;
 };
+
+inline bool tableIsTrash(const FastSnarlOutputTables &t, uint32_t idx)
+{
+    if (idx < t.is_trash.size() && t.is_trash[idx]) return true;
+    return t.compact_is_trash != nullptr &&
+           idx < t.compact_is_trash->size() &&
+           (*(t.compact_is_trash))[idx] != 0;
+}
+
+inline const std::string* tableStringName(const FastSnarlOutputTables &t, uint32_t idx)
+{
+    if (idx < t.node_names.size() && t.node_names[idx] != nullptr) {
+        return t.node_names[idx];
+    }
+    if (t.compact_node_names != nullptr &&
+        idx < t.compact_node_names->size() &&
+        !(*(t.compact_node_names))[idx].empty()) {
+        return &(*(t.compact_node_names))[idx];
+    }
+    if (t.sparse_node_names != nullptr) {
+        auto it = t.sparse_node_names->find(idx);
+        if (it != t.sparse_node_names->end()) {
+            return &it->second;
+        }
+    }
+    return nullptr;
+}
+
+inline bool tableNumericName(const FastSnarlOutputTables &t, uint32_t idx, uint64_t &name)
+{
+    if (tableIsTrash(t, idx)) return false;
+    if (t.compact_numeric_node_names != nullptr &&
+        idx < t.compact_numeric_node_names->size() &&
+        t.compact_numeric_name_valid != nullptr &&
+        idx < t.compact_numeric_name_valid->size() &&
+        (*(t.compact_numeric_name_valid))[idx]) {
+        name = (*(t.compact_numeric_node_names))[idx];
+        return true;
+    }
+    return false;
+}
+
+inline uint64_t decimalDivisor(uint64_t value)
+{
+    uint64_t divisor = 1;
+    while (value >= 10) {
+        value /= 10;
+        divisor *= 10;
+    }
+    return divisor;
+}
+
+inline int compareDecimalNames(uint64_t a, uint64_t b)
+{
+    uint64_t div_a = decimalDivisor(a);
+    uint64_t div_b = decimalDivisor(b);
+    while (div_a != 0 && div_b != 0) {
+        const uint64_t da = a / div_a;
+        const uint64_t db = b / div_b;
+        if (da != db) return da < db ? -1 : 1;
+        a %= div_a;
+        b %= div_b;
+        div_a /= 10;
+        div_b /= 10;
+    }
+    if (div_a == div_b) return 0;
+    return div_a == 0 ? -1 : 1;
+}
+
+inline int compareDecimalNameToString(uint64_t value, const std::string &name)
+{
+    char tmp[32];
+    auto [ptr, ec] = std::to_chars(std::begin(tmp), std::end(tmp), value);
+    if (ec != std::errc()) {
+        return -1;
+    }
+    const std::string_view numeric(tmp, static_cast<size_t>(ptr - tmp));
+    const std::string_view other(name.data(), name.size());
+    const int cmp = numeric.compare(other);
+    return cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);
+}
+
+inline void appendU64(uint64_t value, std::string &buf)
+{
+    char tmp[32];
+    auto [ptr, ec] = std::to_chars(std::begin(tmp), std::end(tmp), value);
+    if (ec == std::errc()) {
+        buf.append(tmp, ptr);
+    } else {
+        buf.append(std::to_string(value));
+    }
+}
 
 inline uint64_t packFastPairKey(uint32_t a_idx, uint8_t a_sign,
                                 uint32_t b_idx, uint8_t b_sign)
@@ -1065,40 +1635,70 @@ inline bool parseFastEndpoint(const Context &C,
     return true;
 }
 
-FastSnarlOutputTables buildFastSnarlOutputTables(Context &C)
+FastSnarlOutputTables buildFastSnarlOutputTables(Context &C, bool need_trivial_filter)
 {
     size_t max_idx = 0;
-    for (ogdf::node n : C.G.nodes) {
-        max_idx = std::max(max_idx, static_cast<size_t>(n.idx));
-    }
-
-    FastSnarlOutputTables t;
-    t.node_names.assign(max_idx + 1, nullptr);
-    t.is_trash.assign(max_idx + 1, 0);
-    t.unique_plus.assign(max_idx + 1, -1);
-    t.unique_minus.assign(max_idx + 1, -1);
-
-    for (const auto &kv : C.node2name) {
-        const uint32_t idx = static_cast<uint32_t>(kv.first.idx);
-        if (idx >= t.node_names.size()) continue;
-        t.node_names[idx] = &kv.second;
-        if (kv.second == "_trash") {
-            t.is_trash[idx] = 1;
+    if (!C.nodeNamesByIndex.empty()) {
+        max_idx = C.nodeNamesByIndex.size() - 1;
+    } else if (!C.nodeNumericNamesByIndex.empty()) {
+        max_idx = C.nodeNumericNamesByIndex.size() - 1;
+    } else {
+        for (spqr_compat::node n : C.G.nodes) {
+            max_idx = std::max(max_idx, static_cast<size_t>(n.idx));
         }
     }
 
-    for (ogdf::node u : C.G.nodes) {
-        ogdf::node nbrPlus{nullptr};
-        ogdf::node nbrMinus{nullptr};
+    FastSnarlOutputTables t;
+    t.max_idx = max_idx;
+    if (!C.nodeNamesByIndex.empty()) {
+        t.compact_node_names = &C.nodeNamesByIndex;
+    }
+    if (!C.nodeNumericNamesByIndex.empty()) {
+        t.compact_numeric_node_names = &C.nodeNumericNamesByIndex;
+    }
+    if (!C.nodeNumericNameValidByIndex.empty()) {
+        t.compact_numeric_name_valid = &C.nodeNumericNameValidByIndex;
+    }
+    if (!C.sparseNodeNamesByIndex.empty()) {
+        t.sparse_node_names = &C.sparseNodeNamesByIndex;
+    }
+    if (!C.isTrashNodeByIndex.empty()) {
+        t.compact_is_trash = &C.isTrashNodeByIndex;
+    }
+    if (need_trivial_filter) {
+        t.unique_plus.assign(max_idx + 1, -1);
+        t.unique_minus.assign(max_idx + 1, -1);
+    }
+
+    if (!C.node2name.empty()) {
+        t.node_names.assign(max_idx + 1, nullptr);
+        t.is_trash.assign(max_idx + 1, 0);
+        for (const auto &kv : C.node2name) {
+            const uint32_t idx = static_cast<uint32_t>(kv.first.idx);
+            if (idx >= t.node_names.size()) continue;
+            t.node_names[idx] = &kv.second;
+            if (kv.second == "_trash") {
+                t.is_trash[idx] = 1;
+            }
+        }
+    }
+
+    if (!need_trivial_filter) {
+        return t;
+    }
+
+    for (spqr_compat::node u : C.G.nodes) {
+        spqr_compat::node nbrPlus{nullptr};
+        spqr_compat::node nbrMinus{nullptr};
         int countPlus = 0;
         int countMinus = 0;
 
-        C.G.forEachAdj(u, [&](ogdf::node other, ogdf::edge e) {
+        C.G.forEachAdj(u, [&](spqr_compat::node other, spqr_compat::edge e) {
             EdgePartType typeAtU = (C.G.source(e) == u)
                 ? C._edge2types[e].first
                 : C._edge2types[e].second;
             int *cnt = nullptr;
-            ogdf::node *slot = nullptr;
+            spqr_compat::node *slot = nullptr;
             if (typeAtU == EdgePartType::PLUS) {
                 cnt = &countPlus;
                 slot = &nbrPlus;
@@ -1111,8 +1711,8 @@ FastSnarlOutputTables buildFastSnarlOutputTables(Context &C)
 
             if (*cnt > 1) return;
 
-            if (other.idx < t.is_trash.size() && t.is_trash[other.idx]) {
-                C.G.forEachAdj(other, [&](ogdf::node real, ogdf::edge) {
+            if (tableIsTrash(t, static_cast<uint32_t>(other.idx))) {
+                C.G.forEachAdj(other, [&](spqr_compat::node real, spqr_compat::edge) {
                     if (real == u) return;
                     if (*cnt > 1) return;
                     if (*cnt == 0 || *slot == real) {
@@ -1151,13 +1751,42 @@ inline bool fastEndpointLess(const FastSnarlOutputTables &t,
                              uint32_t b_idx,
                              uint8_t b_sign)
 {
-    const std::string *a_name = t.node_names[a_idx];
-    const std::string *b_name = t.node_names[b_idx];
-    if (!a_name || !b_name) {
+    const bool a_trash = tableIsTrash(t, a_idx);
+    const bool b_trash = tableIsTrash(t, b_idx);
+    uint64_t a_numeric = 0, b_numeric = 0;
+    const bool a_has_numeric = !a_trash && tableNumericName(t, a_idx, a_numeric);
+    const bool b_has_numeric = !b_trash && tableNumericName(t, b_idx, b_numeric);
+    const std::string *a_name = (a_trash || a_has_numeric) ? nullptr : tableStringName(t, a_idx);
+    const std::string *b_name = (b_trash || b_has_numeric) ? nullptr : tableStringName(t, b_idx);
+
+    int cmp = 0;
+    if (a_trash || b_trash) {
+        static const std::string kTrashName = "_trash";
+        const std::string *as = a_trash ? &kTrashName : a_name;
+        const std::string *bs = b_trash ? &kTrashName : b_name;
+        if (a_has_numeric && bs) {
+            cmp = compareDecimalNameToString(a_numeric, *bs);
+        } else if (b_has_numeric && as) {
+            cmp = -compareDecimalNameToString(b_numeric, *as);
+        } else if (as && bs) {
+            cmp = as->compare(*bs);
+        } else {
+            if (a_idx != b_idx) return a_idx < b_idx;
+            return a_sign < b_sign;
+        }
+    } else if (a_has_numeric && b_has_numeric) {
+        cmp = compareDecimalNames(a_numeric, b_numeric);
+    } else if (a_has_numeric && b_name) {
+        cmp = compareDecimalNameToString(a_numeric, *b_name);
+    } else if (b_has_numeric && a_name) {
+        cmp = -compareDecimalNameToString(b_numeric, *a_name);
+    } else if (a_name && b_name) {
+        cmp = a_name->compare(*b_name);
+    } else {
         if (a_idx != b_idx) return a_idx < b_idx;
         return a_sign < b_sign;
     }
-    const int cmp = a_name->compare(*b_name);
+
     if (cmp != 0) return cmp < 0;
     return (a_sign == 0 ? '+' : '-') < (b_sign == 0 ? '+' : '-');
 }
@@ -1201,11 +1830,18 @@ inline void appendFastEndpoint(const FastSnarlOutputTables &t,
                                uint8_t sign,
                                std::string &buf)
 {
-    const std::string *name = (idx < t.node_names.size()) ? t.node_names[idx] : nullptr;
-    if (name) {
-        buf.append(*name);
+    uint64_t numeric_name = 0;
+    if (tableIsTrash(t, idx)) {
+        buf.append("_trash");
+    } else if (tableNumericName(t, idx, numeric_name)) {
+        appendU64(numeric_name, buf);
     } else {
-        buf.append(std::to_string(idx));
+        const std::string *name = tableStringName(t, idx);
+        if (name) {
+            buf.append(*name);
+        } else {
+            appendU64(idx, buf);
+        }
     }
     buf.push_back(sign == 0 ? '+' : '-');
 }
@@ -1255,7 +1891,8 @@ void writeFastSnarlPairs(std::ostream &out, Context &C)
 {
     appendFallbackStringSnarlsToFastPairs(C);
 
-    auto tables = buildFastSnarlOutputTables(C);
+    const bool filter_trivial = !C.includeTrivial;
+    auto tables = buildFastSnarlOutputTables(C, filter_trivial);
     auto &pairs = C.fastSnarlPairs;
     auto &cliques = C.fastSnarlCliques;
 
@@ -1293,7 +1930,7 @@ void writeFastSnarlPairs(std::ostream &out, Context &C)
         for (size_t i = 0; i < clique.size(); ++i) {
             for (size_t j = i + 1; j < clique.size(); ++j) {
                 uint64_t key = packFastPairEndpointKeys(clique[i], clique[j]);
-                if (fastPairIsTrivial(tables, key)) {
+                if (filter_trivial && fastPairIsTrivial(tables, key)) {
                     canCompact = false;
                 } else {
                     cliquePairs.push_back(key);
@@ -1331,13 +1968,42 @@ void writeFastSnarlPairs(std::ostream &out, Context &C)
         pairs.insert(pairs.end(), cliquePairs.begin(), cliquePairs.end());
     }
 
-    std::sort(pairs.begin(), pairs.end());
+    if (C.threads > 1 && pairs.size() > 100000) {
+#if defined(_OPENMP) && defined(__GLIBCXX__)
+        __gnu_parallel::sort(pairs.begin(), pairs.end());
+#else
+        std::sort(pairs.begin(), pairs.end());
+#endif
+    } else {
+        std::sort(pairs.begin(), pairs.end());
+    }
     pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
 
     size_t pair_count = 0;
-    for (uint64_t key : pairs) {
-        if (!fastPairIsTrivial(tables, key) &&
-            !std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) {
+    std::vector<std::pair<uint64_t, uint64_t>> outputPairs;
+    const bool write_all_pairs =
+        !filter_trivial && !C.compactOutputChains && coveredPairs.empty();
+    if (C.compactOutputChains) {
+        outputPairs.reserve(pairs.size());
+        for (uint64_t key : pairs) {
+            if ((!filter_trivial || !fastPairIsTrivial(tables, key)) &&
+                !std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) {
+                outputPairs.emplace_back(static_cast<uint32_t>(key >> 32),
+                                         static_cast<uint32_t>(key & 0xffffffffu));
+            }
+        }
+        compactEndpointPairChains(outputPairs);
+        pair_count = outputPairs.size();
+    } else if (write_all_pairs) {
+        pair_count = pairs.size();
+    } else {
+        size_t covered_i = 0;
+        for (uint64_t key : pairs) {
+            if (filter_trivial && fastPairIsTrivial(tables, key)) continue;
+            while (covered_i < coveredPairs.size() && coveredPairs[covered_i] < key) {
+                ++covered_i;
+            }
+            if (covered_i < coveredPairs.size() && coveredPairs[covered_i] == key) continue;
             ++pair_count;
         }
     }
@@ -1359,15 +2025,10 @@ void writeFastSnarlPairs(std::ostream &out, Context &C)
         }
     }
 
-    for (uint64_t key : pairs) {
-        if (fastPairIsTrivial(tables, key)) continue;
-        if (std::binary_search(coveredPairs.begin(), coveredPairs.end(), key)) continue;
-
-        const uint32_t a = static_cast<uint32_t>(key >> 32);
-        const uint32_t b = static_cast<uint32_t>(key & 0xffffffffu);
-        uint32_t a_idx = a >> 1;
+    auto appendPairLine = [&](uint64_t a, uint64_t b, std::string &dst) {
+        uint32_t a_idx = static_cast<uint32_t>(a >> 1);
         uint8_t a_sign = static_cast<uint8_t>(a & 1u);
-        uint32_t b_idx = b >> 1;
+        uint32_t b_idx = static_cast<uint32_t>(b >> 1);
         uint8_t b_sign = static_cast<uint8_t>(b & 1u);
 
         if (!fastEndpointLess(tables, a_idx, a_sign, b_idx, b_sign)) {
@@ -1375,13 +2036,128 @@ void writeFastSnarlPairs(std::ostream &out, Context &C)
             std::swap(a_sign, b_sign);
         }
 
-        appendFastEndpoint(tables, a_idx, a_sign, buf);
-        buf.push_back(' ');
-        appendFastEndpoint(tables, b_idx, b_sign, buf);
-        buf.push_back('\n');
+        appendFastEndpoint(tables, a_idx, a_sign, dst);
+        dst.push_back(' ');
+        appendFastEndpoint(tables, b_idx, b_sign, dst);
+        dst.push_back('\n');
+    };
 
-        if (buf.size() >= kIoChunkHighWater) {
-            flushStringBuf(out, buf);
+    auto writePair = [&](uint64_t a, uint64_t b) {
+        appendPairLine(a, b, buf);
+
+        if (buf.size() >= kIoChunkHighWater) flushStringBuf(out, buf);
+    };
+
+    auto appendPairKeyLine = [&](uint64_t key, std::string &dst) {
+        appendPairLine(static_cast<uint32_t>(key >> 32),
+                       static_cast<uint32_t>(key & 0xffffffffu),
+                       dst);
+    };
+
+    if (C.compactOutputChains) {
+        for (auto [a, b] : outputPairs) writePair(a, b);
+    } else if (write_all_pairs) {
+        const bool use_parallel_format =
+            C.threads > 1 && pairs.size() > 100000;
+#if defined(_OPENMP)
+        if (use_parallel_format) {
+            const int workers = std::max<int>(1, static_cast<int>(C.threads));
+            const size_t block_pairs = 1ull << 19;
+            const size_t block_count = (pairs.size() + block_pairs - 1) / block_pairs;
+            std::vector<std::string> buffers;
+            for (size_t group_begin = 0; group_begin < block_count;
+                 group_begin += static_cast<size_t>(workers)) {
+                const size_t group_end = std::min(
+                    block_count, group_begin + static_cast<size_t>(workers));
+                const size_t group_size = group_end - group_begin;
+                buffers.clear();
+                buffers.resize(group_size);
+
+                #pragma omp parallel for schedule(static) num_threads(workers)
+                for (int64_t bi_i = 0; bi_i < static_cast<int64_t>(group_size); ++bi_i) {
+                    const size_t bi = static_cast<size_t>(bi_i);
+                    const size_t block = group_begin + bi;
+                    const size_t begin = block * block_pairs;
+                    const size_t end = std::min(pairs.size(), begin + block_pairs);
+                    std::string local;
+                    local.reserve((end - begin) * 32);
+                    for (size_t i = begin; i < end; ++i) {
+                        appendPairKeyLine(pairs[i], local);
+                    }
+                    buffers[bi].swap(local);
+                }
+
+                for (std::string &local : buffers) {
+                    flushStringBuf(out, local);
+                }
+            }
+        } else
+#endif
+        {
+            for (uint64_t key : pairs) {
+                appendPairKeyLine(key, buf);
+                if (buf.size() >= kIoChunkHighWater) flushStringBuf(out, buf);
+            }
+        }
+    } else {
+        const bool use_parallel_format =
+            C.threads > 1 && pairs.size() > 100000 && !C.compactOutputChains;
+#if defined(_OPENMP)
+        if (use_parallel_format) {
+            const int workers = std::max<int>(1, static_cast<int>(C.threads));
+            const size_t block_pairs = 1ull << 19;
+            const size_t block_count = (pairs.size() + block_pairs - 1) / block_pairs;
+            std::vector<std::string> buffers;
+            for (size_t group_begin = 0; group_begin < block_count;
+                 group_begin += static_cast<size_t>(workers)) {
+                const size_t group_end = std::min(
+                    block_count, group_begin + static_cast<size_t>(workers));
+                const size_t group_size = group_end - group_begin;
+                buffers.clear();
+                buffers.resize(group_size);
+
+                #pragma omp parallel for schedule(static) num_threads(workers)
+                for (int64_t bi_i = 0; bi_i < static_cast<int64_t>(group_size); ++bi_i) {
+                    const size_t bi = static_cast<size_t>(bi_i);
+                    const size_t block = group_begin + bi;
+                    const size_t begin = block * block_pairs;
+                    const size_t end = std::min(pairs.size(), begin + block_pairs);
+                    std::string local;
+                    local.reserve((end - begin) * 32);
+                    size_t covered_i = coveredPairs.empty()
+                        ? 0
+                        : static_cast<size_t>(std::lower_bound(
+                              coveredPairs.begin(), coveredPairs.end(), pairs[begin]) -
+                                              coveredPairs.begin());
+                    for (size_t i = begin; i < end; ++i) {
+                        const uint64_t key = pairs[i];
+                        if (filter_trivial && fastPairIsTrivial(tables, key)) continue;
+                        while (covered_i < coveredPairs.size() && coveredPairs[covered_i] < key) {
+                            ++covered_i;
+                        }
+                        if (covered_i < coveredPairs.size() && coveredPairs[covered_i] == key) continue;
+                        appendPairKeyLine(key, local);
+                    }
+                    buffers[bi].swap(local);
+                }
+
+                for (std::string &local : buffers) {
+                    flushStringBuf(out, local);
+                }
+            }
+        } else
+#endif
+        {
+            size_t covered_i = 0;
+            for (uint64_t key : pairs) {
+                if (filter_trivial && fastPairIsTrivial(tables, key)) continue;
+                while (covered_i < coveredPairs.size() && coveredPairs[covered_i] < key) {
+                    ++covered_i;
+                }
+                if (covered_i < coveredPairs.size() && coveredPairs[covered_i] == key) continue;
+                writePair(static_cast<uint32_t>(key >> 32),
+                          static_cast<uint32_t>(key & 0xffffffffu));
+            }
         }
     }
     flushStringBuf(out, buf);
@@ -1400,6 +2176,42 @@ void writeSuperbubbles()
 
     if (C.bubbleType == Context::BubbleType::SNARL)
     {
+        if (std::getenv("BF_DEBUG_FAST_SNARL_OUTPUT")) {
+            std::cerr << "[fast_snarl_output] enabled="
+                      << (C.fastSnarlPairsEnabled ? 1 : 0)
+                      << " include_trivial=" << (C.includeTrivial ? 1 : 0)
+                      << " sp_compress_mode=" << static_cast<int>(C.spCompressMode)
+                      << " disable_env=" << (std::getenv("BF_DISABLE_FAST_SNARL_OUTPUT") ? 1 : 0)
+                      << " pairs=" << C.fastSnarlPairs.size()
+                      << " cliques=" << C.fastSnarlCliques.size()
+                      << " string_snarls=" << C.snarls.size()
+                      << "\n";
+        }
+        if (C.fastSnarlPairsEnabled)
+        {
+            if (C.outputPath.empty())
+            {
+                writeFastSnarlPairs(std::cout, C);
+                if (!std::cout) {
+                    throw std::runtime_error("Error while writing snarls to standard output");
+                }
+            }
+            else
+            {
+                std::ofstream out(C.outputPath, std::ios::out | std::ios::binary);
+                if (!out) {
+                    throw std::runtime_error("Failed to open output file '" +
+                                             C.outputPath + "' for writing");
+                }
+                writeFastSnarlPairs(out, C);
+                if (!out) {
+                    throw std::runtime_error("Error while writing snarls to output file '" +
+                                             C.outputPath + "'");
+                }
+            }
+            return;
+        }
+
         if (C.includeTrivial)
         {
             if (C.outputPath.empty())
@@ -1425,31 +2237,6 @@ void writeSuperbubbles()
         }
         else
         {
-            if (C.fastSnarlPairsEnabled)
-            {
-                if (C.outputPath.empty())
-                {
-                    writeFastSnarlPairs(std::cout, C);
-                    if (!std::cout) {
-                        throw std::runtime_error("Error while writing snarls to standard output");
-                    }
-                }
-                else
-                {
-                    std::ofstream out(C.outputPath, std::ios::out | std::ios::binary);
-                    if (!out) {
-                        throw std::runtime_error("Failed to open output file '" +
-                                                 C.outputPath + "' for writing");
-                    }
-                    writeFastSnarlPairs(out, C);
-                    if (!out) {
-                        throw std::runtime_error("Error while writing snarls to output file '" +
-                                                 C.outputPath + "'");
-                    }
-                }
-                return;
-            }
-
             struct RealNbrKey {
                 uint32_t node_idx;
                 uint8_t sign;  // 0 = PLUS, 1 = MINUS
@@ -1462,11 +2249,11 @@ void writeSuperbubbles()
                     return (static_cast<size_t>(k.node_idx) << 1) ^ k.sign;
                 }
             };
-            std::unordered_map<RealNbrKey, ogdf::node, RealNbrKeyHash> uniqueRealNbr;
+            std::unordered_map<RealNbrKey, spqr_compat::node, RealNbrKeyHash> uniqueRealNbr;
             uniqueRealNbr.reserve(C.G.numberOfNodes() * 2);
 
             size_t max_idx = 0;
-            for (ogdf::node n : C.G.nodes) {
+            for (spqr_compat::node n : C.G.nodes) {
                 if (static_cast<size_t>(n.idx) > max_idx) max_idx = static_cast<size_t>(n.idx);
             }
             std::vector<bool> is_trash(max_idx + 1, false);
@@ -1476,16 +2263,16 @@ void writeSuperbubbles()
                 }
             }
 
-            for (ogdf::node u : C.G.nodes) {
-                ogdf::node nbrPlus{nullptr};
-                ogdf::node nbrMinus{nullptr};
+            for (spqr_compat::node u : C.G.nodes) {
+                spqr_compat::node nbrPlus{nullptr};
+                spqr_compat::node nbrMinus{nullptr};
                 int countPlus = 0, countMinus = 0;
-                C.G.forEachAdj(u, [&](ogdf::node other, ogdf::edge e) {
+                C.G.forEachAdj(u, [&](spqr_compat::node other, spqr_compat::edge e) {
                     EdgePartType typeAtU = (C.G.source(e) == u)
                         ? C._edge2types[e].first
                         : C._edge2types[e].second;
                     int *cnt;
-                    ogdf::node *slot;
+                    spqr_compat::node *slot;
                     if (typeAtU == EdgePartType::PLUS) { cnt = &countPlus;  slot = &nbrPlus;  }
                     else if (typeAtU == EdgePartType::MINUS) { cnt = &countMinus; slot = &nbrMinus; }
                     else return;
@@ -1493,7 +2280,7 @@ void writeSuperbubbles()
                     if (*cnt > 1) return;  // already disqualified
 
                     if (is_trash[other.idx]) {
-                        C.G.forEachAdj(other, [&](ogdf::node real, ogdf::edge) {
+                        C.G.forEachAdj(other, [&](spqr_compat::node real, spqr_compat::edge) {
                             if (real == u) return;
                             if (*cnt > 1) return;
                             if (*cnt == 0 || *slot == real) {
@@ -1532,7 +2319,8 @@ void writeSuperbubbles()
             std::unordered_set<std::pair<std::string, std::string>, PairHash> seen_str;
 
             std::string out_buf;
-            out_buf.reserve(400ull * 1024ull * 1024ull);
+            if (!C.compactOutputChains) out_buf.reserve(400ull * 1024ull * 1024ull);
+            std::vector<std::pair<std::string, std::string>> compact_pairs;
             size_t pair_count = 0;
 
             auto pack_key = [](uint32_t a_idx, uint8_t a_sign,
@@ -1600,10 +2388,14 @@ void writeSuperbubbles()
 
                         if (is_trivial) continue;
 
-                        out_buf.append(*pa);
-                        out_buf.push_back(' ');
-                        out_buf.append(*pb);
-                        out_buf.push_back('\n');
+                        if (C.compactOutputChains) {
+                            compact_pairs.emplace_back(*pa, *pb);
+                        } else {
+                            out_buf.append(*pa);
+                            out_buf.push_back(' ');
+                            out_buf.append(*pb);
+                            out_buf.push_back('\n');
+                        }
                         pair_count++;
                     }
                 }
@@ -1613,11 +2405,25 @@ void writeSuperbubbles()
             std::unordered_set<uint64_t>().swap(seen_num);
             std::unordered_set<std::pair<std::string, std::string>, PairHash>().swap(seen_str);
             std::vector<std::pair<uint32_t, uint8_t>>().swap(snarl_nodes);
+            if (C.compactOutputChains) compact_pairs = compactStringPairChains(std::move(compact_pairs));
 
             auto writeStreamedOutput = [&](std::ostream &os) {
-                std::string header = std::to_string(pair_count) + "\n";
+                std::string header = std::to_string(C.compactOutputChains ? compact_pairs.size() : pair_count) + "\n";
                 os.write(header.data(), static_cast<std::streamsize>(header.size()));
-                os.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+                if (C.compactOutputChains) {
+                    std::string buf;
+                    buf.reserve(kIoChunkHighWater + 4096);
+                    for (const auto &p : compact_pairs) {
+                        buf.append(p.first);
+                        buf.push_back(' ');
+                        buf.append(p.second);
+                        buf.push_back('\n');
+                        if (buf.size() >= kIoChunkHighWater) flushStringBuf(os, buf);
+                    }
+                    flushStringBuf(os, buf);
+                } else {
+                    os.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+                }
             };
 
             if (C.outputPath.empty())
@@ -1658,15 +2464,34 @@ void writeSuperbubbles()
             os << name << (plus ? '+' : '-');
         };
 
+        std::vector<std::pair<uint64_t, uint64_t>> compact_pairs;
+        if (C.compactOutputChains) {
+            compact_pairs.reserve(C.ultrabubbleIncPacked.size());
+            for (const auto &p : C.ultrabubbleIncPacked) {
+                compact_pairs.emplace_back(p.first, p.second);
+            }
+            compactEndpointPairChains(compact_pairs);
+        }
+
         if (C.outputPath.empty())
         {
-            std::cout << C.ultrabubbleIncPacked.size() << "\n";
-            for (auto &p : C.ultrabubbleIncPacked)
-            {
-                write_one(std::cout, p.first);
-                std::cout << " ";
-                write_one(std::cout, p.second);
-                std::cout << "\n";
+            std::cout << (C.compactOutputChains ? compact_pairs.size() : C.ultrabubbleIncPacked.size()) << "\n";
+            if (C.compactOutputChains) {
+                for (auto &p : compact_pairs)
+                {
+                    write_one(std::cout, static_cast<std::uint32_t>(p.first));
+                    std::cout << " ";
+                    write_one(std::cout, static_cast<std::uint32_t>(p.second));
+                    std::cout << "\n";
+                }
+            } else {
+                for (auto &p : C.ultrabubbleIncPacked)
+                {
+                    write_one(std::cout, p.first);
+                    std::cout << " ";
+                    write_one(std::cout, p.second);
+                    std::cout << "\n";
+                }
             }
             if (!std::cout)
             {
@@ -1681,13 +2506,23 @@ void writeSuperbubbles()
                 throw std::runtime_error("Failed to open output file '" +
                                          C.outputPath + "' for writing");
             }
-            out << C.ultrabubbleIncPacked.size() << "\n";
-            for (auto &p : C.ultrabubbleIncPacked)
-            {
-                write_one(out, p.first);
-                out << " ";
-                write_one(out, p.second);
-                out << "\n";
+            out << (C.compactOutputChains ? compact_pairs.size() : C.ultrabubbleIncPacked.size()) << "\n";
+            if (C.compactOutputChains) {
+                for (auto &p : compact_pairs)
+                {
+                    write_one(out, static_cast<std::uint32_t>(p.first));
+                    out << " ";
+                    write_one(out, static_cast<std::uint32_t>(p.second));
+                    out << "\n";
+                }
+            } else {
+                for (auto &p : C.ultrabubbleIncPacked)
+                {
+                    write_one(out, p.first);
+                    out << " ";
+                    write_one(out, p.second);
+                    out << "\n";
+                }
             }
             if (!out)
             {
@@ -1776,6 +2611,8 @@ void writeSuperbubbles()
             res.push_back({C.node2name[w.first], C.node2name[w.second]});
         }
     }
+
+    if (C.compactOutputChains) res = compactStringPairChains(std::move(res));
 
     if (C.outputPath.empty())
     {

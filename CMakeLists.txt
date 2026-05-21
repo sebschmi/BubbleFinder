@@ -240,6 +240,17 @@ target_link_libraries(sbio PUBLIC gbwtgraph)
 
 message(STATUS "GBZ support: ON (always enabled)")
 
+add_executable(chunk_gbz
+    external/gbz/gbwtgraph/src/chunk_gbz.cpp)
+target_link_libraries(chunk_gbz PRIVATE gbwtgraph)
+target_compile_features(chunk_gbz PRIVATE cxx_std_17)
+
+add_executable(gbz_component_stats
+    src/tools/gbz_component_stats.cpp)
+target_include_directories(gbz_component_stats PRIVATE src)
+target_link_libraries(gbz_component_stats PRIVATE gbwtgraph)
+target_compile_features(gbz_component_stats PRIVATE cxx_std_17)
+
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src

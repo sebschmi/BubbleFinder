@@ -1,6 +1,6 @@
 #pragma once
 
-#include "util/ogdf_all.hpp"
+#include "util/spqr_rust_all.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -74,11 +74,11 @@ struct Context
         }
     };
 
-    ogdf::Graph G;
-    ogdf::NodeArray<int> inDeg;
-    ogdf::NodeArray<int> outDeg;
-    ogdf::NodeArray<bool> isEntry;
-    ogdf::NodeArray<bool> isExit;
+    spqr_compat::Graph G;
+    spqr_compat::NodeArray<int> inDeg;
+    spqr_compat::NodeArray<int> outDeg;
+    spqr_compat::NodeArray<bool> isEntry;
+    spqr_compat::NodeArray<bool> isExit;
 
     std::string graphPath = "";
     std::string outputPath = "";
@@ -110,22 +110,30 @@ struct Context
     std::string clsdTreesPath;
 
     bool includeTrivial = false;
+    bool compactOutputChains = false;
+    bool spqrWeakUltrabubbles = false;
+    bool weakSuperbubbles = false;
 
     SpCompressMode spCompressMode = SpCompressMode::Off;
     std::string spCompressInstrumentCsv = "";
 
     bool skipCanonicalizeRoot = false;
 
-    ogdf::EdgeArray<std::pair<EdgePartType, EdgePartType>> _edge2types;
-    ogdf::EdgeArray<std::pair<int, int>> _edge2cnt;
-    ogdf::NodeArray<bool> _goodCutVertices;
+    spqr_compat::EdgeArray<std::pair<EdgePartType, EdgePartType>> _edge2types;
+    spqr_compat::EdgeArray<std::pair<int, int>> _edge2cnt;
+    spqr_compat::NodeArray<bool> _goodCutVertices;
 
     std::unordered_set<std::pair<int, int>, PairHash> _edges;
 
-    std::unordered_map<std::string, ogdf::node> name2node;
-    std::unordered_map<ogdf::node, std::string> node2name;
+    std::unordered_map<std::string, spqr_compat::node> name2node;
+    std::unordered_map<spqr_compat::node, std::string> node2name;
+    std::vector<std::string> nodeNamesByIndex;
+    std::vector<std::uint64_t> nodeNumericNamesByIndex;
+    std::vector<std::uint8_t> nodeNumericNameValidByIndex;
+    std::unordered_map<std::uint32_t, std::string> sparseNodeNamesByIndex;
+    std::vector<std::uint8_t> isTrashNodeByIndex;
 
-    std::vector<std::pair<ogdf::node, ogdf::node>> superbubbles;
+    std::vector<std::pair<spqr_compat::node, spqr_compat::node>> superbubbles;
 
     struct VectorStringHash
     {
@@ -158,7 +166,7 @@ struct Context
     std::vector<std::uint64_t> fastSnarlPairs;
     std::vector<std::vector<std::uint64_t>> fastSnarlCliques;
 
-    std::vector<ogdf::node> nodeByGlobalId;
+    std::vector<spqr_compat::node> nodeByGlobalId;
 
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ultrabubbleIncPacked;
 
