@@ -3962,7 +3962,7 @@ namespace solver
                     good &= (ctx().weakSuperbubbles || directTS == 0);
                     good &= goodS == goodT;
                     good &= goodS.size() > 0;
-                    good &= (goodS.size() != 1 || blk.spqr->typeOf(singleGoodS) != SPQRTree::NodeType::SNode);
+                    good &= (goodS.size() != 1 || blk.spqr->typeOf(singleGoodS) != SPQRTree::NodeType::SNode || directST > 0);
 
                     good &= (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
 
