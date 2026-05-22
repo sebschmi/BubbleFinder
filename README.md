@@ -24,7 +24,7 @@ All algorithms run in **linear time** in the size of the input graph (`O(|V|+|E|
 
 **Additional resources (Wiki):**
 - [Flowchart](../../wiki/Flowchart), which details execution paths for all commands
-- [Internals](../../wiki/Internals), covering GFA/bidirected graph representation, orientation projection, and theoretical background
+- [Internals](../../wiki/Internals), covering graph representation, optimization notes, and theoretical background
 - [Validation](../../wiki/Validation), describing bruteforce testing and the random test harness
 
 ---
