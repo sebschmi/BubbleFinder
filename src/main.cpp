@@ -34,6 +34,10 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <iterator>
+#include <functional>
+#include <initializer_list>
+#include <limits>
 
 #include <sys/resource.h>
 #include <sys/time.h>
@@ -202,6 +206,7 @@ inline void METRICS_PHASE_END(metrics::Phase p) { metrics::endPhase(p); }
 inline void PHASE_RSS_UPDATE_IO() { metrics::updateRSS(metrics::Phase::IO); }
 inline void PHASE_RSS_UPDATE_BUILD() { metrics::updateRSS(metrics::Phase::BUILD); }
 inline void PHASE_RSS_UPDATE_LOGIC() { metrics::updateRSS(metrics::Phase::LOGIC); }
+
 
 
 using namespace spqr_compat;
@@ -832,7 +837,6 @@ static inline void addSnarlsFound(size_t count)
     snarlsFound.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
 }
 
-static std::atomic<long long> g_spqr_rust_total_us{0};
 static std::atomic<size_t> g_phase_io_max_rss{0};
 static std::atomic<size_t> g_phase_build_max_rss{0};
 static std::atomic<size_t> g_phase_logic_max_rss{0};
@@ -850,43 +854,6 @@ static inline void __phase_rss_update(std::atomic<size_t> &dst)
 #define PHASE_RSS_UPDATE_IO_LEGACY() __phase_rss_update(g_phase_io_max_rss)
 #define PHASE_RSS_UPDATE_BUILD_LEGACY() __phase_rss_update(g_phase_build_max_rss)
 #define PHASE_RSS_UPDATE_LOGIC_LEGACY() __phase_rss_update(g_phase_logic_max_rss)
-
-struct SpqrRustAcc
-{
-    std::chrono::high_resolution_clock::time_point t0;
-    SpqrRustAcc() : t0(std::chrono::high_resolution_clock::now()) {}
-    ~SpqrRustAcc()
-    {
-        auto t1 = std::chrono::high_resolution_clock::now();
-        g_spqr_rust_total_us.fetch_add(
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-            std::memory_order_relaxed);
-    }
-};
-
-#define SPQR_RUST_ACC_SCOPE() SpqrRustAcc __spqr_rust_acc_guard;
-
-#define SPQR_RUST_EVAL(TAG, EXPR) \
-    ([&]() -> decltype(EXPR) { \
-        SPQR_RUST_ACC_SCOPE(); \
-        MEM_TIME_BLOCK(TAG); \
-        MARK_SCOPE_MEM(TAG); \
-        PROFILE_BLOCK(TAG); \
-        return (EXPR); })()
-
-#define SPQR_RUST_NEW_UNIQUE(TAG, T, ...) \
-    ([&]() { \
-        SPQR_RUST_ACC_SCOPE(); \
-        MEM_TIME_BLOCK(TAG); \
-        MARK_SCOPE_MEM(TAG); \
-        PROFILE_BLOCK(TAG); \
-        return std::make_unique<T>(__VA_ARGS__); })()
-
-#define SPQR_RUST_SCOPE(TAG)  \
-    SPQR_RUST_ACC_SCOPE();    \
-    MEM_TIME_BLOCK(TAG); \
-    MARK_SCOPE_MEM(TAG); \
-    PROFILE_BLOCK(TAG)
 
 namespace solver
 {
@@ -1125,6 +1092,8 @@ namespace solver
         namespace
         {
             thread_local std::vector<std::pair<spqr_compat::node, spqr_compat::node>> *tls_superbubble_collector = nullptr;
+            std::mutex risky_weak_superbubble_mutex;
+            std::vector<std::pair<spqr_compat::node, spqr_compat::node>> risky_weak_superbubbles;
             std::atomic<uint64_t> tip_diag_spqr_blocks{0};
             std::atomic<uint64_t> tip_diag_spqr_verts{0};
             std::atomic<uint64_t> tip_diag_internal_ss{0};
@@ -1132,10 +1101,80 @@ namespace solver
             std::atomic<uint64_t> tip_diag_max_ss_one_block{0};
         }
 
+        void clearRiskyWeakSuperbubbles()
+        {
+            std::lock_guard<std::mutex> lock(risky_weak_superbubble_mutex);
+            risky_weak_superbubbles.clear();
+        }
+
+        void markRiskyWeakSuperbubble(spqr_compat::node source, spqr_compat::node sink)
+        {
+            std::lock_guard<std::mutex> lock(risky_weak_superbubble_mutex);
+            risky_weak_superbubbles.emplace_back(source, sink);
+        }
+
+        std::vector<std::pair<spqr_compat::node, spqr_compat::node>> getRiskyWeakSuperbubbles()
+        {
+            std::lock_guard<std::mutex> lock(risky_weak_superbubble_mutex);
+            return risky_weak_superbubbles;
+        }
+
+        namespace spqra_profile
+        {
+            inline const char *executionMode()
+            {
+                const char *mode = std::getenv("BF_SPQRA_EXECUTION_MODE");
+                return mode ? mode : "";
+            }
+
+            inline bool aqContextRequested()
+            {
+                return std::strcmp(executionMode(), "aq_context") == 0;
+            }
+
+            inline bool portKernelRequested()
+            {
+                return std::strcmp(executionMode(), "port_kernel") == 0 ||
+                       std::getenv("BF_SPQRA_PORT_KERNEL") != nullptr;
+            }
+
+            inline bool aqDirectCoreScadRequested()
+            {
+                const char *mode = executionMode();
+                return std::strcmp(mode, "aq_context_direct") == 0 ||
+                       portKernelRequested() ||
+                       std::getenv("BF_SPQRA_DIRECT_CORE_SCAD") != nullptr;
+            }
+
+            inline bool aqAtomsRequested()
+            {
+                const char *mode = executionMode();
+                return std::strcmp(mode, "aq_atoms") == 0 ||
+                       std::getenv("BF_SPQRA_AQ_ATOMS") != nullptr;
+            }
+
+            inline bool aqAtomsUseSpqrTreeFallback()
+            {
+                return std::getenv("BF_SPQRA_ATOMS_USE_SPQRTREE") != nullptr;
+            }
+
+
+        }
+
+        static bool isTrashSuperbubbleNode(spqr_compat::node v)
+        {
+            auto &C = ctx();
+            const size_t idx = static_cast<size_t>(v.index());
+            if (idx < C.isTrashNodeByIndex.size())
+                return C.isTrashNodeByIndex[idx] != 0;
+            auto it = C.node2name.find(v);
+            return it != C.node2name.end() && it->second == "_trash";
+        }
+
         static bool tryCommitSuperbubble(spqr_compat::node source, spqr_compat::node sink)
         {
             auto &C = ctx();
-            if (ctx().node2name[source] == "_trash" || ctx().node2name[sink] == "_trash")
+            if (isTrashSuperbubbleNode(source) || isTrashSuperbubbleNode(sink))
             {
                 return false;
             }
@@ -1172,8 +1211,12 @@ namespace solver
             std::unique_ptr<SpCompressHandle, SpCompressHandleDeleter> spCompressHandle;
             SpCompressTreeView macroTreeView{};
             const SpqrTree *coreSpqrTree{nullptr};
+            CoreScadView coreScadView{};
+            SpqraMinimizerView spqraMinimizerView{};
+            SpqraBehaviorAtomView spqraBehaviorAtomView{};
             const uint32_t *coreNodeInv{nullptr};
             uint32_t coreNodeInvLen{0};
+            std::vector<uint32_t> spqraMinimizerLocalBlockIds;
             std::unordered_map<spqr_compat::edge, spqr_compat::edge> skel2tree; // mapping from skeleton virtual edge to tree edge
             spqr_compat::NodeArray<spqr_compat::node> parent;                   // mapping from node to parent in SPQR tree, it is possible since it is rooted,
                                                                   // parent of root is nullptr
@@ -1190,6 +1233,10 @@ namespace solver
             // Cached global degrees (per block node) to avoid random access into global NodeArrays
             spqr_compat::NodeArray<int> globIn;
             spqr_compat::NodeArray<int> globOut;
+            std::vector<uint32_t> edgeSrc;
+            std::vector<uint32_t> edgeDst;
+            uint32_t flatNodeCount{0};
+            uint32_t flatEdgeCount{0};
 
             BlockData() {}
 
@@ -1209,6 +1256,32 @@ namespace solver
             // BlockData(BlockData&&) = delete;
             // BlockData& operator=(BlockData&&) = delete;
         };
+
+        inline spqr_compat::node blockEdgeSource(const BlockData &blk, spqr_compat::edge e)
+        {
+            if (e.idx < blk.edgeSrc.size())
+                return spqr_compat::node{blk.edgeSrc[e.idx]};
+            return blk.Gblk->source(e);
+        }
+
+        inline spqr_compat::node blockEdgeTarget(const BlockData &blk, spqr_compat::edge e)
+        {
+            if (e.idx < blk.edgeDst.size())
+                return spqr_compat::node{blk.edgeDst[e.idx]};
+            return blk.Gblk->target(e);
+        }
+
+        inline uint32_t weakBlockNodeCount(const BlockData &blk)
+        {
+            return blk.flatNodeCount ? blk.flatNodeCount :
+                static_cast<uint32_t>(blk.Gblk ? blk.Gblk->numberOfNodes() : 0);
+        }
+
+        inline uint32_t weakBlockEdgeCount(const BlockData &blk)
+        {
+            return blk.flatEdgeCount ? blk.flatEdgeCount :
+                static_cast<uint32_t>(blk.Gblk ? blk.Gblk->numberOfEdges() : 0);
+        }
 
         struct CcData
         {
@@ -1389,71 +1462,102 @@ namespace solver
                 tls_superbubble_collector->emplace_back(source, sink);
                 return;
             }
-            // Otherwise, commit directly to global state (sequential behavior)
             tryCommitSuperbubble(source, sink);
-
-            // if(C.isEntry[source] || C.isExit[sink]) {
-            //     std::cerr << ("Superbubble already exists for source %s and sink %s", C.node2name[source].c_str(), C.node2name[sink].c_str());
-            //     return;
-            // }
-            // C.isEntry[source] = true;
-            // C.isExit[sink] = true;
-            // C.superbubbles.emplace_back(source, sink);
         }
 
-        static bool isAcyclicSkipping(const Graph &G, node from, node to)
+
+        struct FlatDigraphScratch
         {
-            std::vector<int> indeg(G.numberOfNodes(), 0);
-            for (edge e : G.edges)
-                if (!(G.source(e) == from && G.target(e) == to))
-                    indeg[G.target(e).idx]++;
+            static constexpr uint32_t invalid = UINT32_MAX;
 
-            std::queue<node> q;
-            for (node v : G.nodes)
-                if (indeg[v.idx] == 0)
-                    q.push(v);
+            uint32_t n{0};
+            std::vector<uint32_t> src;
+            std::vector<uint32_t> dst;
+            std::vector<uint32_t> next;
+            std::vector<uint32_t> head;
+            std::vector<int> indeg;
+            std::vector<uint32_t> queue;
 
-            uint32_t seen = 0;
-            while (!q.empty())
+            void reset(uint32_t nodeCount, uint32_t edgeReserve)
             {
-                node u = q.front();
-                q.pop();
-                seen++;
-                G.forEachAdj(u, [&](node v, edge e) {
-                    if (G.source(e) != u || (u == from && v == to))
-                        return;
-                    if (--indeg[v.idx] == 0)
-                        q.push(v);
-                });
+                n = nodeCount;
+                src.clear();
+                dst.clear();
+                if (src.capacity() < edgeReserve) src.reserve(edgeReserve);
+                if (dst.capacity() < edgeReserve) dst.reserve(edgeReserve);
+                if (head.size() < n) head.resize(n);
+                if (indeg.size() < n) indeg.resize(n);
+                if (queue.size() < n) queue.resize(n);
             }
-            return seen == G.numberOfNodes();
-        }
 
-        static bool isAcyclicSkippingEdge(const Graph &G, uint32_t skipped)
-        {
-            std::vector<int> indeg(G.numberOfNodes(), 0);
-            for (edge e : G.edges)
-                if (e.idx != skipped)
-                    indeg[G.target(e).idx]++;
-            std::queue<node> q;
-            for (node v : G.nodes)
-                if (indeg[v.idx] == 0)
-                    q.push(v);
-            uint32_t seen = 0;
-            while (!q.empty())
+            spqr_compat::edge addEdge(spqr_compat::node u, spqr_compat::node v)
             {
-                node u = q.front();
-                q.pop();
-                seen++;
-                G.forEachAdj(u, [&](node v, edge e) {
-                    if (G.source(e) != u || e.idx == skipped)
-                        return;
-                    if (--indeg[v.idx] == 0)
-                        q.push(v);
-                });
+                const uint32_t id = static_cast<uint32_t>(src.size());
+                src.push_back(u.idx);
+                dst.push_back(v.idx);
+                return spqr_compat::edge{id};
             }
-            return seen == G.numberOfNodes();
-        }
+
+            spqr_compat::edge newEdge(spqr_compat::node u, spqr_compat::node v)
+            {
+                return addEdge(u, v);
+            }
+
+            uint32_t numberOfEdges() const
+            {
+                return static_cast<uint32_t>(src.size());
+            }
+
+            bool isAcyclic(uint32_t skippedEdge = invalid,
+                           uint32_t skippedFrom = invalid,
+                           uint32_t skippedTo = invalid)
+            {
+                const uint32_t m = numberOfEdges();
+                if (next.size() < m) next.resize(m);
+                std::fill_n(head.begin(), n, invalid);
+                std::fill_n(indeg.begin(), n, 0);
+
+                for (uint32_t i = 0; i < m; ++i)
+                {
+                    if (i == skippedEdge)
+                        continue;
+                    if (skippedFrom != invalid && src[i] == skippedFrom && dst[i] == skippedTo)
+                        continue;
+                    next[i] = head[src[i]];
+                    head[src[i]] = i;
+                    ++indeg[dst[i]];
+                }
+
+                uint32_t qHead = 0;
+                uint32_t qTail = 0;
+                for (uint32_t v = 0; v < n; ++v)
+                    if (indeg[v] == 0)
+                        queue[qTail++] = v;
+
+                uint32_t seen = 0;
+                while (qHead < qTail)
+                {
+                    const uint32_t u = queue[qHead++];
+                    ++seen;
+                    for (uint32_t e = head[u]; e != invalid; e = next[e])
+                    {
+                        const uint32_t v = dst[e];
+                        if (--indeg[v] == 0)
+                            queue[qTail++] = v;
+                    }
+                }
+                return seen == n;
+            }
+
+            void materialize(Graph &g) const
+            {
+                for (uint32_t i = 0; i < n; ++i)
+                    g.newNode();
+                const uint32_t m = numberOfEdges();
+                for (uint32_t i = 0; i < m; ++i)
+                    g.newEdge(spqr_compat::node{src[i]}, spqr_compat::node{dst[i]});
+            }
+        };
 
         namespace SPQRsolve
         {
@@ -1501,6 +1605,17 @@ namespace solver
             {
                 EdgeDPState down; // value valid in  parent -> child  direction
                 EdgeDPState up;   // value valid in  child -> parent direction
+            };
+
+            struct BranchRef
+            {
+                enum class Kind : uint8_t { None = 0, TreeNode = 1, MacroChild = 2 };
+                Kind kind{Kind::None};
+                uint32_t id{SPQR_INVALID};
+
+                static BranchRef tree(uint32_t id) { return BranchRef{Kind::TreeNode, id}; }
+                static BranchRef macro(uint32_t id) { return BranchRef{Kind::MacroChild, id}; }
+                bool valid() const { return kind != Kind::None && id != SPQR_INVALID; }
             };
 
             inline spqr_compat::node parentOnTreeEdge(const TreeGraph &T, const BlockData &blk, spqr_compat::edge te)
@@ -1829,7 +1944,6 @@ namespace solver
                 node curr)
             {
                 // PROFILE_FUNCTION();
-                // std::cout << "Node " << curr->index() << " is " << nodeTypeToString(spqr.typeOf(curr)) << std::endl;
                 node_order.push_back(curr);
                 const TreeGraph &T = spqr.tree();
                 T.forEachAdj(curr, [&](node child, edge te) {
@@ -1886,8 +2000,8 @@ namespace solver
 
             inline void addBlockEdgeToState(EdgeDPState &st, const BlockData &blk, edge e)
             {
-                node u = blk.Gblk->source(e);
-                node v = blk.Gblk->target(e);
+                node u = blockEdgeSource(blk, e);
+                node v = blockEdgeTarget(blk, e);
                 if (u == st.s) st.localOutS++;
                 if (v == st.s) st.localInS++;
                 if (u == st.t) st.localOutT++;
@@ -1896,83 +2010,439 @@ namespace solver
                 if (u == st.t && v == st.s) st.directTS = true;
             }
 
-            inline std::vector<EdgeDPState> computeMacroStates(const SpCompressTreeView &view, BlockData &blk)
+            struct MacroEndpointDeg
             {
-                std::vector<EdgeDPState> states(view.macros_len);
-                for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+                uint32_t a{SPQR_INVALID};
+                uint32_t b{SPQR_INVALID};
+                int outA{0};
+                int inA{0};
+                int outB{0};
+                int inB{0};
+            };
+
+            inline MacroEndpointDeg childEndpointDeg(uint32_t cref,
+                                                     const std::vector<EdgeDPState> &states,
+                                                     const BlockData &blk)
+            {
+                MacroEndpointDeg d;
+                if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                 {
+                    edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+                    d.a = blockEdgeSource(blk, e).idx;
+                    d.b = blockEdgeTarget(blk, e).idx;
+                    d.outA = 1;
+                    d.inB = 1;
+                }
+                else
+                {
+                    const EdgeDPState &sub = states[SP_COMPRESS_CHILD_AS_MACRO(cref)];
+                    d.a = sub.s.idx;
+                    d.b = sub.t.idx;
+                    d.outA = sub.localOutS;
+                    d.inA = sub.localInS;
+                    d.outB = sub.localOutT;
+                    d.inB = sub.localInT;
+                }
+                return d;
+            }
+
+            inline bool computeSeriesLeakagePath(const SpCompressTreeView &view,
+                                                 const SpCompressNode &m,
+                                                 const std::vector<EdgeDPState> &states,
+                                                 const BlockData &blk,
+                                                 EdgeDPState &st)
+            {
+                if (m.children_count == 0)
+                    return true;
+
+                uint32_t cur = m.left;
+                int pendingOut = 0;
+                int pendingIn = 0;
+
+                auto checkInternal = [&](uint32_t v, int out, int in) {
+                    if (v == m.left || v == m.right)
+                        return;
+                    node bv{v};
+                    if (blk.globIn[bv] != in || blk.globOut[bv] != out)
+                        st.hasLeakage = true;
+                    if (blk.globIn[bv] == 0 || blk.globOut[bv] == 0)
+                        st.globalSourceSink = true;
+                };
+
+                for (uint32_t i = 0; i < m.children_count; ++i)
+                {
+                    uint32_t cref = view.children_ptr[m.children_offset + i];
+                    MacroEndpointDeg d = childEndpointDeg(cref, states, blk);
+                    uint32_t next = SPQR_INVALID;
+                    int entryOut = 0, entryIn = 0, exitOut = 0, exitIn = 0;
+
+                    if (d.a == cur)
+                    {
+                        next = d.b;
+                        entryOut = d.outA;
+                        entryIn = d.inA;
+                        exitOut = d.outB;
+                        exitIn = d.inB;
+                    }
+                    else if (d.b == cur)
+                    {
+                        next = d.a;
+                        entryOut = d.outB;
+                        entryIn = d.inB;
+                        exitOut = d.outA;
+                        exitIn = d.inA;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+
+                    pendingOut += entryOut;
+                    pendingIn += entryIn;
+                    checkInternal(cur, pendingOut, pendingIn);
+                    cur = next;
+                    pendingOut = exitOut;
+                    pendingIn = exitIn;
+                }
+
+                if (cur != m.right)
+                    return false;
+                return true;
+            }
+
+            inline void computeSeriesLeakageFallback(const SpCompressTreeView &view,
+                                                     const SpCompressNode &m,
+                                                     const std::vector<EdgeDPState> &states,
+                                                     const BlockData &blk,
+                                                     EdgeDPState &st)
+            {
+                thread_local std::vector<std::tuple<uint32_t, int, int>> degs;
+                degs.clear();
+                degs.reserve(static_cast<size_t>(m.children_count) * 2);
+                auto addDeg = [&](uint32_t v, int out, int in) {
+                    degs.emplace_back(v, out, in);
+                };
+                for (uint32_t i = 0; i < m.children_count; ++i)
+                {
+                    uint32_t cref = view.children_ptr[m.children_offset + i];
+                    if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+                    {
+                        edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+                        addDeg(blockEdgeSource(blk, e).idx, 1, 0);
+                        addDeg(blockEdgeTarget(blk, e).idx, 0, 1);
+                    }
+                    else
+                    {
+                        const EdgeDPState &sub = states[SP_COMPRESS_CHILD_AS_MACRO(cref)];
+                        addDeg(sub.s.idx, sub.localOutS, sub.localInS);
+                        addDeg(sub.t.idx, sub.localOutT, sub.localInT);
+                    }
+                }
+                std::sort(degs.begin(), degs.end(),
+                          [](const auto &a, const auto &b) { return std::get<0>(a) < std::get<0>(b); });
+                for (size_t i = 0; i < degs.size(); )
+                {
+                    uint32_t v = std::get<0>(degs[i]);
+                    int out = 0, in = 0;
+                    while (i < degs.size() && std::get<0>(degs[i]) == v)
+                    {
+                        out += std::get<1>(degs[i]);
+                        in += std::get<2>(degs[i]);
+                        ++i;
+                    }
+                    if (v == m.left || v == m.right)
+                        continue;
+                    node bv{v};
+                    if (blk.globIn[bv] != in || blk.globOut[bv] != out)
+                        st.hasLeakage = true;
+                    if (blk.globIn[bv] == 0 || blk.globOut[bv] == 0)
+                        st.globalSourceSink = true;
+                }
+            }
+
+            enum class PFixedAggMode : uint8_t
+            {
+                Macro,
+                Core
+            };
+
+            struct PFixedAggAtom
+            {
+                uint32_t goodSCount{0};
+                uint32_t goodTCount{0};
+                bool singleGoodValid{false};
+                bool singleGoodSeriesLike{false};
+                int64_t localOutSSum{0};
+                int64_t localInTSum{0};
+                bool good{true};
+                bool sameSetOk{true};
+                uint32_t branchCount{0};
+                int badSourcePoleNoWeakBack{0};
+                int badSinkPoleNoWeakBack{0};
+                int badAcyclicNoWeakBack{0};
+                int badGlobalSourceSink{0};
+                int badLeakage{0};
+
+                void addBranch(const EdgeDPState &state,
+                               node bS,
+                               node bT,
+                               bool branchIsSeriesLike,
+                               PFixedAggMode mode)
+                {
+                    ++branchCount;
+                    const int localOutS = (state.s == bS ? state.localOutS : state.localOutT);
+                    const int localInT = (state.t == bT ? state.localInT : state.localInS);
+                    localOutSSum += localOutS;
+                    localInTSum += localInT;
+
+                    const int localInS = (state.s == bS ? state.localInS : state.localInT);
+                    const int localOutT = (state.t == bT ? state.localOutT : state.localOutS);
+                    const bool weakBackBranch =
+                        ctx().weakSuperbubbles && localOutS == 0 && localInT == 0 &&
+                        localInS > 0 && localOutT > 0 &&
+                        state.acyclic && !state.globalSourceSink && !state.hasLeakage;
+                    if (weakBackBranch)
+                        return;
+
+                    const bool hasGoodS = localOutS > 0;
+                    const bool hasGoodT = localInT > 0;
+                    const bool observed = hasGoodS || hasGoodT;
+                    sameSetOk &= (hasGoodS == hasGoodT);
+                    if (hasGoodS)
+                    {
+                        ++goodSCount;
+                        if (goodSCount == 1)
+                        {
+                            singleGoodValid = true;
+                            singleGoodSeriesLike = branchIsSeriesLike;
+                        }
+                        else
+                        {
+                            singleGoodValid = false;
+                        }
+                    }
+                    if (hasGoodT)
+                        ++goodTCount;
+
+                    if (mode == PFixedAggMode::Core && !observed)
+                        return;
+
+                    const bool directFlag = state.directTS || state.directST;
+	                    if ((mode == PFixedAggMode::Macro || hasGoodS) &&
+	                        ((state.s == bS && state.localInS > 0) ||
+	                         (state.s == bT && state.localInT > 0)))
+                    {
+                        good = false;
+                        if (!directFlag)
+                            ++badSourcePoleNoWeakBack;
+                    }
+                    if ((mode == PFixedAggMode::Macro || hasGoodT) &&
+                        ((state.t == bT && state.localOutT > 0) ||
+                         (state.t == bS && state.localOutS > 0)))
+                    {
+                        good = false;
+                        if (!directFlag)
+                            ++badSinkPoleNoWeakBack;
+                    }
+                    if (!state.acyclic)
+                    {
+                        good = false;
+                        if (!directFlag)
+                            ++badAcyclicNoWeakBack;
+                    }
+                    if (state.globalSourceSink)
+                    {
+                        good = false;
+                        ++badGlobalSourceSink;
+                    }
+                    if (state.hasLeakage)
+                    {
+                        good = false;
+                        ++badLeakage;
+                    }
+                }
+            };
+
+            struct PFixedAggEntry
+            {
+                PFixedAggAtom fwd;
+                PFixedAggAtom rev;
+                int64_t directST{0};
+                int64_t directTS{0};
+                uint8_t valid{0};
+            };
+
+            inline bool pFixedAggTracingDisabled()
+            {
+                return true;
+            }
+
+            inline bool corePFixedAggRequested()
+            {
+                return pFixedAggTracingDisabled() &&
+                       (std::getenv("BF_SPQRA_CORE_P_FIXED_AGG") != nullptr ||
+                        std::getenv("BF_SPQRA_P_FIXED_AGG") != nullptr);
+            }
+
+            inline bool macroPAtomTracingDisabled()
+            {
+                return pFixedAggTracingDisabled();
+            }
+
+            inline bool emitPFixedAggCandidate(const PFixedAggAtom &branchAgg,
+                                               node bS,
+                                               node bT,
+                                               int64_t directST,
+                                               int64_t directTS,
+                                               bool qPossible,
+                                               const CcData &cc,
+                                               BlockData &blk)
+            {
+                if (!qPossible)
+                    return false;
+
+                PFixedAggAtom agg = branchAgg;
+                agg.localOutSSum += directST;
+                agg.localInTSum += directST;
+
+                bool good = agg.good;
+                const bool directOk = (ctx().weakSuperbubbles || directTS == 0);
+                const bool nonEmptyOk = (agg.goodSCount > 0 || directST > 1);
+                good &= directOk;
+                const bool sameSetOk = agg.sameSetOk && (agg.goodSCount == agg.goodTCount);
+                good &= sameSetOk;
+                good &= nonEmptyOk;
+
+                bool singletonOk = true;
+                if (agg.goodSCount == 1 && agg.singleGoodValid)
+                    singletonOk = !agg.singleGoodSeriesLike || (ctx().weakSuperbubbles && directST > 0);
+                good &= singletonOk;
+
+                const bool countsGood =
+                    (agg.localOutSSum == blk.globOut[bS] && agg.localInTSum == blk.globIn[bT]);
+                good &= countsGood;
+
+                const bool onlyWeakBackFailures =
+                    agg.badGlobalSourceSink == 0 && agg.badLeakage == 0 &&
+                    agg.badAcyclicNoWeakBack == 0 &&
+                    agg.badSourcePoleNoWeakBack == 0 &&
+                    agg.badSinkPoleNoWeakBack == 0;
+                if (ctx().weakSuperbubbles && !good && countsGood &&
+                    directOk && sameSetOk && nonEmptyOk && singletonOk &&
+                    agg.goodSCount > 1 && onlyWeakBackFailures)
+                {
+                    good = true;
+                }
+
+                if (good)
+                {
+                    node rawS = cc.toOrig[blk.toCc[bS]];
+                    node rawT = cc.toOrig[blk.toCc[bT]];
+                    addSuperbubble(rawS, rawT);
+                }
+                return true;
+            }
+
+	            inline std::vector<EdgeDPState> computeMacroStates(const SpCompressTreeView &view,
+	                                                               BlockData &blk,
+	                                                               const CcData *cc = nullptr,
+	                                                               bool emitMacroPAtoms = false,
+	                                                               std::vector<PFixedAggEntry> *macroPAgg = nullptr)
+	            {
+	                std::vector<EdgeDPState> states(view.macros_len);
+	                if (macroPAgg)
+	                    macroPAgg->assign(view.macros_len, PFixedAggEntry{});
+	                for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+	                {
                     const SpCompressNode &m = view.macros_ptr[mid];
                     EdgeDPState &st = states[mid];
-                    resetMacroState(st, node{m.left}, node{m.right});
-                    bool pFwd = false, pBack = false;
-                    for (uint32_t i = 0; i < m.children_count; ++i)
-                    {
+	                    resetMacroState(st, node{m.left}, node{m.right});
+	                    bool pFwd = false, pBack = false;
+	                    int directST = 0, directTS = 0;
+	                    PFixedAggAtom atomFwd;
+	                    PFixedAggAtom atomRev;
+	                    const bool needPFixedAgg =
+	                        m.kind == SP_COMPRESS_KIND_PARALLEL &&
+	                        (emitMacroPAtoms || macroPAgg);
+	                    for (uint32_t i = 0; i < m.children_count; ++i)
+	                    {
                         uint32_t cref = view.children_ptr[m.children_offset + i];
                         if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                         {
                             edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
                             addBlockEdgeToState(st, blk, e);
-                            node u = blk.Gblk->source(e);
-                            node v = blk.Gblk->target(e);
+                            node u = blockEdgeSource(blk, e);
+                            node v = blockEdgeTarget(blk, e);
                             if (u == st.s && v == st.t) pFwd = true;
                             if (u == st.t && v == st.s) pBack = true;
+                            if (m.kind == SP_COMPRESS_KIND_PARALLEL)
+                            {
+                                if (u == st.s && v == st.t) directST++;
+                                else directTS++;
+                            }
                         }
                         else
                         {
-                            const EdgeDPState &sub = states[SP_COMPRESS_CHILD_AS_MACRO(cref)];
+                            const uint32_t child = SP_COMPRESS_CHILD_AS_MACRO(cref);
+                            const EdgeDPState &sub = states[child];
                             mergeSubState(st, sub);
                             int dir = sub.getDirection();
                             if (sub.s == st.t && sub.t == st.s)
                                 dir = -dir;
                             if (dir > 0) pFwd = true;
                             if (dir < 0) pBack = true;
-                        }
-                    }
-                    if (m.kind == SP_COMPRESS_KIND_PARALLEL && pFwd && pBack)
-                        st.acyclic = false;
+	                            if (m.kind == SP_COMPRESS_KIND_PARALLEL)
+	                            {
+	                                const bool childIsSeries =
+	                                    view.macros_ptr[child].kind == SP_COMPRESS_KIND_SERIES;
+	                                if (needPFixedAgg)
+	                                {
+	                                    atomFwd.addBranch(sub, node{m.left}, node{m.right},
+	                                                      childIsSeries, PFixedAggMode::Macro);
+	                                    atomRev.addBranch(sub, node{m.right}, node{m.left},
+	                                                      childIsSeries, PFixedAggMode::Macro);
+	                                }
+	                            }
+	                        }
+	                    }
+	                    if (m.kind == SP_COMPRESS_KIND_PARALLEL && pFwd && pBack)
+	                        st.acyclic = false;
+	                    if (macroPAgg && m.kind == SP_COMPRESS_KIND_PARALLEL)
+	                    {
+	                        PFixedAggEntry &entry = (*macroPAgg)[mid];
+	                        entry.fwd = atomFwd;
+	                        entry.rev = atomRev;
+	                        entry.directST = directST;
+	                        entry.directTS = directTS;
+	                        entry.valid = 1;
+	                    }
+	                    if (emitMacroPAtoms && cc && m.kind == SP_COMPRESS_KIND_PARALLEL)
+	                    {
+	                        const bool qPossible0 = st.localOutS == blk.globOut[node{m.left}] &&
+	                                                st.localInT == blk.globIn[node{m.right}];
+	                        const bool qPossible1 = st.localOutT == blk.globOut[node{m.right}] &&
+	                                                st.localInS == blk.globIn[node{m.left}];
+	                        emitPFixedAggCandidate(atomFwd,
+	                                               node{m.left},
+	                                               node{m.right},
+	                                               directST,
+	                                               directTS,
+	                                               qPossible0,
+	                                               *cc,
+	                                               blk);
+	                        emitPFixedAggCandidate(atomRev,
+	                                               node{m.right},
+	                                               node{m.left},
+	                                               directTS,
+	                                               directST,
+	                                               qPossible1,
+	                                               *cc,
+	                                               blk);
+	                    }
                     if (m.kind == SP_COMPRESS_KIND_SERIES)
                     {
-                        std::vector<std::tuple<uint32_t, int, int>> degs;
-                        degs.reserve(static_cast<size_t>(m.children_count) * 2);
-                        auto addDeg = [&](uint32_t v, int out, int in) {
-                            degs.emplace_back(v, out, in);
-                        };
-                        for (uint32_t i = 0; i < m.children_count; ++i)
-                        {
-                            uint32_t cref = view.children_ptr[m.children_offset + i];
-                            if (SP_COMPRESS_CHILD_IS_EDGE(cref))
-                            {
-                                edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                                addDeg(blk.Gblk->source(e).idx, 1, 0);
-                                addDeg(blk.Gblk->target(e).idx, 0, 1);
-                            }
-                            else
-                            {
-                                const EdgeDPState &sub = states[SP_COMPRESS_CHILD_AS_MACRO(cref)];
-                                addDeg(sub.s.idx, sub.localOutS, sub.localInS);
-                                addDeg(sub.t.idx, sub.localOutT, sub.localInT);
-                            }
-                        }
-                        std::sort(degs.begin(), degs.end(),
-                                  [](const auto &a, const auto &b) { return std::get<0>(a) < std::get<0>(b); });
-                        for (size_t i = 0; i < degs.size(); )
-                        {
-                            uint32_t v = std::get<0>(degs[i]);
-                            int out = 0, in = 0;
-                            while (i < degs.size() && std::get<0>(degs[i]) == v)
-                            {
-                                out += std::get<1>(degs[i]);
-                                in += std::get<2>(degs[i]);
-                                ++i;
-                            }
-                            if (v == m.left || v == m.right)
-                                continue;
-                            node bv{v};
-                            if (blk.globIn[bv] != in || blk.globOut[bv] != out)
-                                st.hasLeakage = true;
-                            if (blk.globIn[bv] == 0 || blk.globOut[bv] == 0)
-                                st.globalSourceSink = true;
-                        }
+                        if (!computeSeriesLeakagePath(view, m, states, blk, st))
+                            computeSeriesLeakageFallback(view, m, states, blk, st);
                     }
                 }
                 return states;
@@ -1992,6 +2462,14 @@ namespace solver
                 const uint32_t *mapOffsets{nullptr};
                 const uint32_t *mapping{nullptr};
                 const uint32_t *coreNodeInv{nullptr};
+                std::vector<uint8_t> ownedTypes;
+                std::vector<uint32_t> ownedParents;
+                std::vector<uint32_t> ownedChildrenOffsets;
+                std::vector<uint32_t> ownedChildren;
+                std::vector<uint32_t> ownedSkelOffsets;
+                std::vector<SkeletonEdge> ownedSkelEdges;
+                std::vector<uint32_t> ownedMapOffsets;
+                std::vector<uint32_t> ownedMapping;
                 std::vector<uint32_t> post;
             };
 
@@ -2041,11 +2519,365 @@ namespace solver
                 return true;
             }
 
+            inline bool buildCoreContextFromScadView(BlockData &blk, CoreContext &out)
+            {
+                const CoreScadView &scad = blk.coreScadView;
+                if (!blk.coreNodeInv || blk.coreNodeInvLen == 0 ||
+                    !scad.components_ptr || scad.components_len == 0 ||
+                    !scad.edges_ptr || !scad.node_mapping_ptr)
+                {
+                    return false;
+                }
+
+                out = CoreContext{};
+                out.T = nullptr;
+                out.coreNodeInv = blk.coreNodeInv;
+                out.len = scad.components_len;
+                out.root = 0;
+
+                out.ownedTypes.assign(out.len, 0);
+                out.ownedParents.assign(out.len, SPQR_INVALID);
+                out.ownedChildrenOffsets.assign(out.len + 1, 0);
+                out.ownedSkelOffsets.assign(out.len + 1, 0);
+                out.ownedMapOffsets.assign(out.len + 1, 0);
+                out.ownedSkelEdges.assign(scad.edges_len, SkeletonEdge{
+                                                          SPQR_INVALID,
+                                                          SPQR_INVALID,
+                                                          SPQR_INVALID,
+                                                          SPQR_INVALID,
+                                                          SPQR_INVALID,
+                                                          SPQR_INVALID});
+                out.ownedMapping.assign(scad.node_mapping_ptr,
+                                        scad.node_mapping_ptr + scad.node_mapping_len);
+
+                for (uint32_t ci = 0; ci < scad.components_len; ++ci)
+                {
+                    const FfiScadComponent &fc = scad.components_ptr[ci];
+                    if (fc.edge_begin > fc.edge_end || fc.edge_end > scad.edges_len ||
+                        fc.inc_begin > fc.inc_end || fc.inc_end > scad.incidences_len ||
+                        fc.node_begin > fc.node_end || fc.node_end > scad.node_mapping_len)
+                    {
+                        return false;
+                    }
+                    out.ownedTypes[ci] =
+                        fc.kind == 1 ? SPQR_NODE_TYPE_S :
+                        fc.kind == 2 ? SPQR_NODE_TYPE_P :
+                        fc.kind == 3 ? SPQR_NODE_TYPE_R : SPQR_NODE_TYPE_R;
+                    out.ownedSkelOffsets[ci] = fc.edge_begin;
+                    out.ownedMapOffsets[ci] = fc.node_begin;
+                    if (ci + 1 == scad.components_len)
+                    {
+                        out.ownedSkelOffsets[ci + 1] = fc.edge_end;
+                        out.ownedMapOffsets[ci + 1] = fc.node_end;
+                    }
+                }
+
+                for (uint32_t ei = 0; ei < scad.edges_len; ++ei)
+                {
+                    const FfiScadEdge &fe = scad.edges_ptr[ei];
+                    SkeletonEdge se{};
+                    se.src = fe.src_local;
+                    se.dst = fe.dst_local;
+                    se.real_edge = (fe.kind == 3) ? SPQR_INVALID : fe.original_edge_id;
+                    se.virtual_id = (fe.kind == 3) ? fe.virtual_id : SPQR_INVALID;
+                    se.twin_tree_node = SPQR_INVALID;
+                    se.twin_edge_idx = SPQR_INVALID;
+                    out.ownedSkelEdges[ei] = se;
+                }
+
+                std::vector<std::pair<uint32_t, uint32_t>> treePairs;
+                treePairs.reserve(scad.incidences_len / 2);
+                if (scad.incidences_ptr)
+                {
+                    for (uint32_t ii = 0; ii < scad.incidences_len; ++ii)
+                    {
+                        const FfiScadIncidence &inc = scad.incidences_ptr[ii];
+                        if (inc.component_id >= out.len ||
+                            inc.twin_incidence >= scad.incidences_len)
+                        {
+                            return false;
+                        }
+                        const FfiScadIncidence &tw = scad.incidences_ptr[inc.twin_incidence];
+                        if (tw.twin_incidence != ii || tw.component_id >= out.len)
+                        {
+                            return false;
+                        }
+
+                        const FfiScadComponent &c0 = scad.components_ptr[inc.component_id];
+                        const FfiScadComponent &c1 = scad.components_ptr[tw.component_id];
+                        const uint32_t ge0 = c0.edge_begin + inc.local_edge_id;
+                        const uint32_t ge1 = c1.edge_begin + tw.local_edge_id;
+                        if (ge0 >= scad.edges_len || ge1 >= scad.edges_len)
+                            return false;
+                        out.ownedSkelEdges[ge0].twin_tree_node = tw.component_id;
+                        out.ownedSkelEdges[ge0].twin_edge_idx = tw.local_edge_id;
+
+                        if (ii > inc.twin_incidence)
+                            treePairs.emplace_back(inc.component_id, tw.component_id);
+                    }
+                }
+
+                std::vector<uint32_t> adjCount(out.len, 0);
+                for (auto [a, b] : treePairs)
+                {
+                    if (a == b || a >= out.len || b >= out.len)
+                        return false;
+                    ++adjCount[a];
+                    ++adjCount[b];
+                }
+                std::vector<uint32_t> adjOffsets(out.len + 1, 0);
+                for (uint32_t i = 0; i < out.len; ++i)
+                    adjOffsets[i + 1] = adjOffsets[i] + adjCount[i];
+                std::vector<uint32_t> adj(adjOffsets[out.len], SPQR_INVALID);
+                std::vector<uint32_t> write = adjOffsets;
+                for (auto [a, b] : treePairs)
+                {
+                    adj[write[a]++] = b;
+                    adj[write[b]++] = a;
+                }
+
+                std::vector<uint8_t> seen(out.len, 0);
+                std::vector<uint32_t> stack;
+                stack.reserve(out.len);
+                stack.push_back(out.root);
+                seen[out.root] = 1;
+                while (!stack.empty())
+                {
+                    uint32_t v = stack.back();
+                    stack.pop_back();
+                    for (uint32_t ai = adjOffsets[v]; ai < adjOffsets[v + 1]; ++ai)
+                    {
+                        uint32_t u = adj[ai];
+                        if (seen[u])
+                            continue;
+                        seen[u] = 1;
+                        out.ownedParents[u] = v;
+                        stack.push_back(u);
+                    }
+                }
+                for (uint32_t i = 0; i < out.len; ++i)
+                    if (!seen[i] && i != out.root)
+                        out.ownedParents[i] = out.root;
+
+                std::vector<uint32_t> childCount(out.len, 0);
+                for (uint32_t i = 0; i < out.len; ++i)
+                {
+                    uint32_t p = out.ownedParents[i];
+                    if (p != SPQR_INVALID && p < out.len)
+                        ++childCount[p];
+                }
+                for (uint32_t i = 0; i < out.len; ++i)
+                    out.ownedChildrenOffsets[i + 1] = out.ownedChildrenOffsets[i] + childCount[i];
+                out.ownedChildren.assign(out.ownedChildrenOffsets[out.len], SPQR_INVALID);
+                write = out.ownedChildrenOffsets;
+                for (uint32_t i = 0; i < out.len; ++i)
+                {
+                    uint32_t p = out.ownedParents[i];
+                    if (p != SPQR_INVALID && p < out.len)
+                        out.ownedChildren[write[p]++] = i;
+                }
+
+                out.types = out.ownedTypes.data();
+                out.parents = out.ownedParents.data();
+                out.childrenOffsets = out.ownedChildrenOffsets.data();
+                out.children = out.ownedChildren.empty() ? nullptr : out.ownedChildren.data();
+                out.skelOffsets = out.ownedSkelOffsets.data();
+                out.skelEdges = out.ownedSkelEdges.empty() ? nullptr : out.ownedSkelEdges.data();
+                out.mapOffsets = out.ownedMapOffsets.data();
+                out.mapping = out.ownedMapping.empty() ? nullptr : out.ownedMapping.data();
+                out.post.clear();
+                out.post.reserve(out.len);
+                std::vector<uint8_t> entered(out.len, 0);
+                stack.clear();
+                stack.push_back(out.root);
+                while (!stack.empty())
+                {
+                    uint32_t tn = stack.back();
+                    if (!entered[tn])
+                    {
+                        entered[tn] = 1;
+                        for (uint32_t i = out.childrenOffsets[tn]; i < out.childrenOffsets[tn + 1]; ++i)
+                            stack.push_back(out.children[i]);
+                    }
+                    else
+                    {
+                        stack.pop_back();
+                        out.post.push_back(tn);
+                    }
+                }
+
+                return true;
+            }
+
+            inline uint8_t scadKindToSpqrType(uint8_t kind)
+            {
+                return kind == 1 ? SPQR_NODE_TYPE_S :
+                       kind == 2 ? SPQR_NODE_TYPE_P :
+                       kind == 3 ? SPQR_NODE_TYPE_R : SPQR_NODE_TYPE_R;
+            }
+
+            inline bool scadTreeEdgeSideCanEmit(uint8_t currType, uint8_t backType)
+            {
+                return (currType == SPQR_NODE_TYPE_R && backType != SPQR_NODE_TYPE_P) ||
+                       (currType == SPQR_NODE_TYPE_P && backType == SPQR_NODE_TYPE_S) ||
+                       (currType == SPQR_NODE_TYPE_S && backType == SPQR_NODE_TYPE_P);
+            }
+
+            inline uint64_t scadTreeEdgeSideObservableMessages(uint8_t currType,
+                                                               uint8_t backType)
+            {
+                return scadTreeEdgeSideCanEmit(currType, backType) ? 2ull : 0ull;
+            }
+
+            inline bool coreSkeletonTwin(const CoreContext &c,
+                                         const SkeletonEdge &se,
+                                         uint32_t &other);
+
+            inline bool scadValidTwinPair(const CoreScadView &scad,
+                                          uint32_t incidenceId,
+                                          uint32_t &twinId)
+            {
+                if (!scad.incidences_ptr || incidenceId >= scad.incidences_len)
+                    return false;
+                const FfiScadIncidence &inc = scad.incidences_ptr[incidenceId];
+                if (inc.component_id >= scad.components_len ||
+                    inc.twin_incidence >= scad.incidences_len)
+                    return false;
+                const FfiScadIncidence &tw = scad.incidences_ptr[inc.twin_incidence];
+                if (tw.component_id >= scad.components_len ||
+                    tw.twin_incidence != incidenceId)
+                    return false;
+                twinId = inc.twin_incidence;
+                return true;
+            }
+
             inline uint32_t coreLocalBlockId(const CoreContext &c, uint32_t tn, uint32_t local)
             {
                 uint32_t p = c.mapOffsets[tn] + local;
                 return c.coreNodeInv[c.mapping[p]];
             }
+
+            inline bool coreSkeletonChildRef(const SpCompressTreeView &view,
+                                             const SkeletonEdge &se,
+                                             uint32_t &cref)
+            {
+                if (se.real_edge == SPQR_INVALID ||
+                    se.real_edge >= view.core_edges_len ||
+                    !view.core_edges_ptr)
+                {
+                    return false;
+                }
+                cref = view.core_edges_ptr[se.real_edge].child;
+                return true;
+            }
+
+	            inline bool coreSkeletonTwin(const CoreContext &c,
+	                                         const SkeletonEdge &se,
+	                                         uint32_t &other)
+	            {
+	                if (se.real_edge != SPQR_INVALID || se.twin_tree_node >= c.len)
+                    return false;
+	                other = se.twin_tree_node;
+	                return true;
+	            }
+
+	            inline void buildCorePFixedAggEntry(uint32_t A,
+	                                                const CoreContext &c,
+	                                                const SpCompressTreeView &view,
+	                                                const std::vector<EdgeDPState> &macroStates,
+	                                                const std::vector<EdgeDPState> &down,
+	                                                const std::vector<EdgeDPState> &up,
+	                                                const BlockData &blk,
+	                                                PFixedAggEntry &entry)
+	            {
+	                entry = PFixedAggEntry{};
+	                if (A >= c.len || c.types[A] != SPQR_NODE_TYPE_P)
+	                    return;
+
+	                const node pole0{coreLocalBlockId(c, A, 0)};
+	                const node pole1{coreLocalBlockId(c, A, 1)};
+	                const uint32_t start = c.skelOffsets[A];
+	                const uint32_t end = c.skelOffsets[A + 1];
+	                for (uint32_t i = start; i < end; ++i)
+	                {
+	                    const SkeletonEdge &se = c.skelEdges[i];
+	                    uint32_t cref = SPQR_INVALID;
+	                    if (coreSkeletonChildRef(view, se, cref))
+	                    {
+	                        if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+	                        {
+	                            edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+	                            node u = blockEdgeSource(blk, e);
+	                            node v = blockEdgeTarget(blk, e);
+	                            if (u == pole0 && v == pole1)
+	                                ++entry.directST;
+	                            else
+	                                ++entry.directTS;
+	                        }
+	                        else
+	                        {
+	                            const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+	                            const EdgeDPState &state = macroStates[mid];
+	                            const bool seriesLike =
+	                                mid < view.macros_len &&
+	                                view.macros_ptr[mid].kind == SP_COMPRESS_KIND_SERIES;
+	                            entry.fwd.addBranch(state, pole0, pole1, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(state, pole1, pole0, seriesLike,
+	                                                PFixedAggMode::Core);
+	                        }
+	                        continue;
+	                    }
+
+	                    uint32_t other = SPQR_INVALID;
+	                    if (!coreSkeletonTwin(c, se, other))
+	                        continue;
+	                    const EdgeDPState &state = (c.parents[other] == A ? down[other] : up[A]);
+	                    const bool seriesLike = other < c.len && c.types[other] == SPQR_NODE_TYPE_S;
+	                    entry.fwd.addBranch(state, pole0, pole1, seriesLike,
+	                                        PFixedAggMode::Core);
+	                    entry.rev.addBranch(state, pole1, pole0, seriesLike,
+	                                        PFixedAggMode::Core);
+		                }
+		                entry.valid = 1;
+		            }
+
+	            inline bool tryBubbleCorePNodeGroupingFixed(uint32_t A,
+	                                                         const CoreContext &c,
+	                                                         const std::vector<PFixedAggEntry> *corePAgg,
+	                                                         const CcData &cc,
+	                                                         BlockData &blk)
+	            {
+	                if (!corePAgg || !pFixedAggTracingDisabled() ||
+	                    A >= corePAgg->size() || A >= c.len ||
+	                    c.types[A] != SPQR_NODE_TYPE_P)
+	                {
+	                    return false;
+	                }
+	                const PFixedAggEntry &entry = (*corePAgg)[A];
+	                if (!entry.valid)
+	                    return false;
+
+	                const node pole0{coreLocalBlockId(c, A, 0)};
+	                const node pole1{coreLocalBlockId(c, A, 1)};
+	                emitPFixedAggCandidate(entry.fwd,
+	                                       pole0,
+	                                       pole1,
+	                                       entry.directST,
+	                                       entry.directTS,
+	                                       true,
+	                                       cc,
+	                                       blk);
+	                emitPFixedAggCandidate(entry.rev,
+	                                       pole1,
+	                                       pole0,
+	                                       entry.directTS,
+	                                       entry.directST,
+	                                       true,
+	                                       cc,
+	                                       blk);
+	                return true;
+	            }
 
             inline uint32_t localEndpointOnSkeletonEdge(const CoreContext &c,
                                                         uint32_t tn,
@@ -2082,11 +2914,12 @@ namespace solver
                     mergeSubState(st, macroStates[SP_COMPRESS_CHILD_AS_MACRO(cref)]);
             }
 
+            template <typename GraphLike>
             inline uint32_t addStateToGraphOnSkeletonEdge(const EdgeDPState &sub,
                                                           const CoreContext &c,
                                                           uint32_t tn,
                                                           const SkeletonEdge &se,
-                                                          Graph &g,
+                                                          GraphLike &g,
                                                           std::vector<int> &inDeg,
                                                           std::vector<int> &outDeg,
                                                           bool zeroAsForward)
@@ -2110,13 +2943,14 @@ namespace solver
                 return forwardEdge;
             }
 
+            template <typename GraphLike>
             inline uint32_t addChildRefToGraphFast(uint32_t cref,
                                                    const std::vector<EdgeDPState> &macroStates,
                                                    const CoreContext &c,
                                                    uint32_t tn,
                                                    const SkeletonEdge &se,
                                                    BlockData &blk,
-                                                   Graph &g,
+                                                   GraphLike &g,
                                                    std::vector<int> &inDeg,
                                                    std::vector<int> &outDeg,
                                                    bool zeroAsForward)
@@ -2124,8 +2958,8 @@ namespace solver
                 if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                 {
                     edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                    uint32_t uLoc = localEndpointOnSkeletonEdge(c, tn, se, blk.Gblk->source(e));
-                    uint32_t vLoc = localEndpointOnSkeletonEdge(c, tn, se, blk.Gblk->target(e));
+                    uint32_t uLoc = localEndpointOnSkeletonEdge(c, tn, se, blockEdgeSource(blk, e));
+                    uint32_t vLoc = localEndpointOnSkeletonEdge(c, tn, se, blockEdgeTarget(blk, e));
                     if (uLoc == SPQR_INVALID || vLoc == SPQR_INVALID)
                         return SPQR_INVALID;
                     edge ge = g.newEdge(node{uLoc}, node{vLoc});
@@ -2155,7 +2989,8 @@ namespace solver
                     for (uint32_t i = start; i < end; ++i)
                     {
                         const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge == SPQR_INVALID && se.twin_tree_node == parent)
+                        uint32_t other = SPQR_INVALID;
+                        if (coreSkeletonTwin(c, se, other) && other == parent)
                         {
                             parentEdge = i;
                             break;
@@ -2171,58 +3006,73 @@ namespace solver
                     resetMacroState(st, s, t);
 
                     uint32_t nLocal = c.mapOffsets[tn + 1] - c.mapOffsets[tn];
-                    Graph g;
-                    for (uint32_t i = 0; i < nLocal; ++i)
-                        g.newNode();
-                    std::vector<int> inDeg(nLocal, 0), outDeg(nLocal, 0);
+                    thread_local FlatDigraphScratch tls_core_down_graph;
+                    thread_local std::vector<int> tls_core_down_inDeg;
+                    thread_local std::vector<int> tls_core_down_outDeg;
+                    if (tls_core_down_inDeg.size() < nLocal) tls_core_down_inDeg.resize(nLocal);
+                    if (tls_core_down_outDeg.size() < nLocal) tls_core_down_outDeg.resize(nLocal);
+                    std::fill_n(tls_core_down_inDeg.begin(), nLocal, 0);
+                    std::fill_n(tls_core_down_outDeg.begin(), nLocal, 0);
+                    tls_core_down_graph.reset(nLocal, end - start);
                     for (uint32_t i = start; i < end; ++i)
                     {
                         if (i == parentEdge)
                             continue;
                         const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge != SPQR_INVALID)
-                        {
-                            uint32_t cref = view.core_edges_ptr[se.real_edge].child;
-                            addChildRefToState(st, cref, macroStates, blk);
-                            addChildRefToGraphFast(cref, macroStates, c, tn, se, blk, g, inDeg, outDeg, true);
+                        uint32_t cref = SPQR_INVALID;
+	                        if (coreSkeletonChildRef(view, se, cref))
+	                        {
+	                            addChildRefToState(st, cref, macroStates, blk);
+	                            addChildRefToGraphFast(cref, macroStates, c, tn, se, blk,
+	                                                   tls_core_down_graph,
+	                                                   tls_core_down_inDeg,
+	                                                   tls_core_down_outDeg,
+	                                                   true);
                             if (c.types[tn] == SPQR_NODE_TYPE_P && SP_COMPRESS_CHILD_IS_EDGE(cref))
                             {
                                 edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                                node u = blk.Gblk->source(e);
-                                node v = blk.Gblk->target(e);
+                                node u = blockEdgeSource(blk, e);
+                                node v = blockEdgeTarget(blk, e);
                                 if (u == st.s && v == st.t) st.directST = true;
                                 if (u == st.t && v == st.s) st.directTS = true;
                             }
                         }
                         else
                         {
-                            uint32_t child = se.twin_tree_node;
-                            mergeSubState(st, down[child]);
-                            addStateToGraphOnSkeletonEdge(down[child], c, tn, se, g, inDeg, outDeg, false);
-                        }
-                    }
+                            uint32_t child = SPQR_INVALID;
+	                            if (!coreSkeletonTwin(c, se, child))
+	                                continue;
+	                            mergeSubState(st, down[child]);
+	                            addStateToGraphOnSkeletonEdge(down[child], c, tn, se,
+	                                                          tls_core_down_graph,
+	                                                          tls_core_down_inDeg,
+	                                                          tls_core_down_outDeg,
+	                                                          false);
+	                        }
+	                    }
 
                     uint32_t sLoc = pe.dst;
                     uint32_t tLoc = pe.src;
-                    st.localOutS = outDeg[sLoc];
-                    st.localInS = inDeg[sLoc];
-                    st.localOutT = outDeg[tLoc];
-                    st.localInT = inDeg[tLoc];
+	                    st.localOutS = tls_core_down_outDeg[sLoc];
+	                    st.localInS = tls_core_down_inDeg[sLoc];
+	                    st.localOutT = tls_core_down_outDeg[tLoc];
+	                    st.localInT = tls_core_down_inDeg[tLoc];
 
                     for (uint32_t li = 0; li < nLocal; ++li)
                     {
-                        node b{coreLocalBlockId(c, tn, li)};
-                        if (b == st.s || b == st.t)
-                            continue;
-                        if (blk.globIn[b] != inDeg[li] || blk.globOut[b] != outDeg[li])
-                            st.hasLeakage = true;
+	                        node b{coreLocalBlockId(c, tn, li)};
+	                        if (b == st.s || b == st.t)
+	                            continue;
+	                        if (blk.globIn[b] != tls_core_down_inDeg[li] ||
+	                            blk.globOut[b] != tls_core_down_outDeg[li])
+	                            st.hasLeakage = true;
                         if (blk.globIn[b] == 0 || blk.globOut[b] == 0)
                             st.globalSourceSink = true;
                     }
 
                     if (st.acyclic)
                     {
-                        st.acyclic &= isAcyclic(g);
+                        st.acyclic &= tls_core_down_graph.isAcyclic();
                     }
                     if (!st.acyclic)
                     {
@@ -2243,23 +3093,1024 @@ namespace solver
                 return down;
             }
 
+	            inline bool coreTreeBubbleCurrentCanEmit(const EdgeDPState &curr,
+	                                                     const EdgeDPState &back)
+	            {
+	                return curr.s && curr.t && back.s && back.t &&
+	                       curr.acyclic && !curr.globalSourceSink && !curr.hasLeakage;
+	            }
+
+	            inline void tryCoreTreeBubblePair(const EdgeDPState &curr,
+	                                              const EdgeDPState &back,
+	                                              const CcData &cc,
+	                                              BlockData &blk,
+	                                              bool additionalCheck)
+	            {
+	                if (!coreTreeBubbleCurrentCanEmit(curr, back))
+	                    return;
+	                tryBubble(curr, back, blk, cc, false, additionalCheck);
+	                tryBubble(curr, back, blk, cc, true, additionalCheck);
+	            }
+
+	            inline void tryCoreTreeEdgeBubbles(uint32_t child,
+	                                           uint32_t parent,
+	                                           const CoreContext &c,
+	                                               const EdgeDPState &downSt,
+	                                               const EdgeDPState &upSt,
+	                                               const CcData &cc,
+                                               BlockData &blk)
+            {
+                if (child >= c.len || parent >= c.len)
+                    return;
+                uint8_t parentType = c.types[parent];
+                uint8_t childType = c.types[child];
+	                if ((childType == SPQR_NODE_TYPE_R && parentType != SPQR_NODE_TYPE_P) ||
+	                    (childType == SPQR_NODE_TYPE_P && parentType == SPQR_NODE_TYPE_S))
+	                {
+	                    bool check = childType == SPQR_NODE_TYPE_P;
+	                    tryCoreTreeBubblePair(downSt, upSt, cc, blk,
+	                                          check);
+	                }
+	                if (childType == SPQR_NODE_TYPE_S && parentType == SPQR_NODE_TYPE_P)
+	                {
+	                    tryCoreTreeBubblePair(downSt, upSt, cc, blk,
+	                                          true);
+	                }
+	                if ((parentType == SPQR_NODE_TYPE_R && childType != SPQR_NODE_TYPE_P) ||
+	                    (parentType == SPQR_NODE_TYPE_P && childType == SPQR_NODE_TYPE_S))
+	                {
+	                    bool check = parentType == SPQR_NODE_TYPE_P;
+	                    tryCoreTreeBubblePair(upSt, downSt, cc, blk,
+	                                          check);
+	                }
+	                if (parentType == SPQR_NODE_TYPE_S && childType == SPQR_NODE_TYPE_P)
+	                {
+	                    tryCoreTreeBubblePair(upSt, downSt, cc, blk,
+	                                          true);
+		                }
+		            }
+
+	            inline bool minimizerDirectCollectRequested()
+	            {
+	                return std::getenv("BF_SPQRA_MINIMIZER_DIRECT_COLLECT") != nullptr;
+	            }
+
+	            inline void tryCoreTreeEdgeBubblesByTypes(uint8_t childType,
+	                                                      uint8_t parentType,
+	                                                      const EdgeDPState &downSt,
+	                                                      const EdgeDPState &upSt,
+	                                                      const CcData &cc,
+	                                                      BlockData &blk)
+	            {
+	                if ((childType == SPQR_NODE_TYPE_R && parentType != SPQR_NODE_TYPE_P) ||
+	                    (childType == SPQR_NODE_TYPE_P && parentType == SPQR_NODE_TYPE_S))
+	                {
+	                    const bool check = childType == SPQR_NODE_TYPE_P;
+	                    tryCoreTreeBubblePair(downSt, upSt, cc, blk,
+	                                          check);
+	                }
+	                if (childType == SPQR_NODE_TYPE_S && parentType == SPQR_NODE_TYPE_P)
+	                {
+	                    tryCoreTreeBubblePair(downSt, upSt, cc, blk,
+	                                          true);
+	                }
+	                if ((parentType == SPQR_NODE_TYPE_R && childType != SPQR_NODE_TYPE_P) ||
+	                    (parentType == SPQR_NODE_TYPE_P && childType == SPQR_NODE_TYPE_S))
+	                {
+	                    const bool check = parentType == SPQR_NODE_TYPE_P;
+	                    tryCoreTreeBubblePair(upSt, downSt, cc, blk,
+	                                          check);
+	                }
+	                if (parentType == SPQR_NODE_TYPE_S && childType == SPQR_NODE_TYPE_P)
+	                {
+	                    tryCoreTreeBubblePair(upSt, downSt, cc, blk,
+	                                          true);
+	                }
+	            }
+
+	            inline const EdgeDPState *minimizerPortMessage(uint32_t port,
+	                                                           const CoreScadView &scad,
+	                                                           const SpqraMinimizerView &minView,
+	                                                           const std::vector<EdgeDPState> &down,
+	                                                           const std::vector<EdgeDPState> &up)
+	            {
+	                if (!scad.incidences_ptr || !minView.components_ptr ||
+	                    port >= scad.incidences_len)
+	                    return nullptr;
+	                const FfiScadIncidence &inc = scad.incidences_ptr[port];
+	                if (inc.twin_incidence >= scad.incidences_len ||
+	                    inc.component_id >= minView.components_len)
+	                    return nullptr;
+	                const FfiScadIncidence &tw = scad.incidences_ptr[inc.twin_incidence];
+	                if (tw.component_id >= minView.components_len)
+	                    return nullptr;
+	                const uint32_t a = inc.component_id;
+	                const uint32_t b = tw.component_id;
+	                if (a < down.size() && minView.components_ptr[a].parent == b)
+	                    return &down[a];
+	                if (b < up.size() && minView.components_ptr[b].parent == a)
+	                    return &up[b];
+	                return nullptr;
+	            }
+
+	            inline const EdgeDPState *minimizerViewEdgeMessage(uint32_t component,
+	                                                               const FfiSpqraMinimizerEdge &me,
+	                                                               const SpqraMinimizerView &minView,
+	                                                               const std::vector<EdgeDPState> &down,
+	                                                               const std::vector<EdgeDPState> &up)
+	            {
+	                if (!minView.components_ptr || component >= minView.components_len ||
+	                    (me.flags & SPQRA_MIN_EDGE_VIRTUAL) == 0 ||
+	                    me.twin_component >= minView.components_len)
+	                {
+	                    return nullptr;
+	                }
+	                const uint32_t other = me.twin_component;
+	                if (component < down.size() &&
+	                    minView.components_ptr[component].parent == other)
+	                {
+	                    return &down[component];
+	                }
+	                if (other < up.size() &&
+	                    minView.components_ptr[other].parent == component)
+	                {
+	                    return &up[other];
+	                }
+	                return nullptr;
+	            }
+
+	            inline uint32_t minimizerLocalBlockId(const SpqraMinimizerView &minView,
+	                                                  const BlockData &blk,
+	                                                  const FfiSpqraMinimizerComponent &comp,
+	                                                  uint32_t local)
+	            {
+	                if (!minView.node_mapping_ptr || !blk.coreNodeInv ||
+	                    comp.node_begin > comp.node_end ||
+	                    local >= comp.node_end - comp.node_begin)
+	                {
+	                    return SPQR_INVALID;
+	                }
+	                const uint32_t mi = comp.node_begin + local;
+	                if (mi < blk.spqraMinimizerLocalBlockIds.size())
+	                    return blk.spqraMinimizerLocalBlockIds[mi];
+	                if (mi >= minView.node_mapping_len)
+	                    return SPQR_INVALID;
+	                const uint32_t coreId = minView.node_mapping_ptr[mi];
+	                if (coreId >= blk.coreNodeInvLen)
+	                    return SPQR_INVALID;
+	                return blk.coreNodeInv[coreId];
+	            }
+
+	            inline void populateMinimizerLocalBlockIds(BlockData &blk)
+	            {
+	                blk.spqraMinimizerLocalBlockIds.clear();
+	                const SpqraMinimizerView &minView = blk.spqraMinimizerView;
+	                if (!minView.node_mapping_ptr || minView.node_mapping_len == 0 ||
+	                    !blk.coreNodeInv || blk.coreNodeInvLen == 0)
+	                {
+	                    return;
+	                }
+	                blk.spqraMinimizerLocalBlockIds.resize(minView.node_mapping_len,
+	                                                       SPQR_INVALID);
+	                for (uint32_t i = 0; i < minView.node_mapping_len; ++i)
+	                {
+	                    const uint32_t coreId = minView.node_mapping_ptr[i];
+	                    if (coreId < blk.coreNodeInvLen)
+	                        blk.spqraMinimizerLocalBlockIds[i] = blk.coreNodeInv[coreId];
+	                }
+	            }
+
+	            inline bool minimizerMessageKernelRequested()
+	            {
+	                return std::getenv("BF_SPQRA_MINIMIZER_MESSAGE_KERNEL") != nullptr;
+	            }
+
+	            inline bool minimizerViewCollectRequested()
+	            {
+	                return std::getenv("BF_SPQRA_MINIMIZER_VIEW_COLLECT") != nullptr;
+	            }
+
+	            inline bool emitNestedAtomCoreEdgesRequested()
+	            {
+	                return std::getenv("BF_SPQRA_EMIT_NESTED_ATOM_CORE_EDGES") != nullptr;
+	            }
+
+	            inline uint32_t minimizerLocalEndpointOnEdge(const SpqraMinimizerView &minView,
+	                                                         const BlockData &blk,
+	                                                         const FfiSpqraMinimizerComponent &comp,
+	                                                         const FfiSpqraMinimizerEdge &me,
+	                                                         node b)
+	            {
+	                if (minimizerLocalBlockId(minView, blk, comp, me.src_local) == b.idx)
+	                    return me.src_local;
+	                if (minimizerLocalBlockId(minView, blk, comp, me.dst_local) == b.idx)
+	                    return me.dst_local;
+	                return SPQR_INVALID;
+	            }
+
+	            template <typename GraphLike>
+	            inline uint32_t addStateToGraphOnMinimizerEdge(const EdgeDPState &sub,
+	                                                           const SpqraMinimizerView &minView,
+	                                                           const BlockData &blk,
+	                                                           const FfiSpqraMinimizerComponent &comp,
+	                                                           const FfiSpqraMinimizerEdge &me,
+	                                                           GraphLike &g,
+	                                                           std::vector<int> &inDeg,
+	                                                           std::vector<int> &outDeg,
+	                                                           bool zeroAsForward)
+	            {
+	                const uint32_t sLoc =
+	                    minimizerLocalEndpointOnEdge(minView, blk, comp, me, sub.s);
+	                const uint32_t tLoc =
+	                    minimizerLocalEndpointOnEdge(minView, blk, comp, me, sub.t);
+	                if (sLoc == SPQR_INVALID || tLoc == SPQR_INVALID)
+	                    return SPQR_INVALID;
+	                int dir = sub.getDirection();
+	                uint32_t forwardEdge = SPQR_INVALID;
+	                if (dir == 1 || (dir == 0 && zeroAsForward))
+	                {
+	                    edge ge = g.newEdge(node{sLoc}, node{tLoc});
+	                    forwardEdge = ge.idx;
+	                }
+	                if (dir == -1)
+	                {
+	                    g.newEdge(node{tLoc}, node{sLoc});
+	                }
+	                addStateCountsAtLoc(sub, sLoc, tLoc, inDeg, outDeg);
+	                return forwardEdge;
+	            }
+
+	            template <typename GraphLike>
+	            inline uint32_t addChildRefToGraphFastMinimizer(uint32_t cref,
+	                                                            const std::vector<EdgeDPState> &macroStates,
+	                                                            const SpqraMinimizerView &minView,
+	                                                            const BlockData &blk,
+	                                                            const FfiSpqraMinimizerComponent &comp,
+	                                                            const FfiSpqraMinimizerEdge &me,
+	                                                            GraphLike &g,
+	                                                            std::vector<int> &inDeg,
+	                                                            std::vector<int> &outDeg,
+	                                                            bool zeroAsForward)
+	            {
+	                if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+	                {
+	                    edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+	                    const uint32_t uLoc =
+	                        minimizerLocalEndpointOnEdge(minView, blk, comp, me,
+	                                                     blockEdgeSource(blk, e));
+	                    const uint32_t vLoc =
+	                        minimizerLocalEndpointOnEdge(minView, blk, comp, me,
+	                                                     blockEdgeTarget(blk, e));
+	                    if (uLoc == SPQR_INVALID || vLoc == SPQR_INVALID)
+	                        return SPQR_INVALID;
+	                    edge ge = g.newEdge(node{uLoc}, node{vLoc});
+	                    outDeg[uLoc]++;
+	                    inDeg[vLoc]++;
+	                    return ge.idx;
+	                }
+	                const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+	                if (mid >= macroStates.size())
+	                    return SPQR_INVALID;
+	                return addStateToGraphOnMinimizerEdge(macroStates[mid], minView, blk, comp, me,
+	                                                      g, inDeg, outDeg, zeroAsForward);
+	            }
+
+	            struct SpqraBehaviorAtomStates
+	            {
+	                std::vector<EdgeDPState> fwd;
+	                std::vector<EdgeDPState> rev;
+	                std::vector<EdgeDPState> outside;
+	                std::vector<uint8_t> outsideParentType;
+	            };
+
+			            inline uint32_t atomLocalOfBlock(node b,
+			                                             std::vector<uint32_t> &blockIds)
+	            {
+	                for (uint32_t i = 0; i < blockIds.size(); ++i)
+		                {
+		                    if (blockIds[i] == b.idx)
+		                        return i;
+		                }
+		                blockIds.push_back(b.idx);
+			                return static_cast<uint32_t>(blockIds.size() - 1);
+			            }
+
+		            inline node atomCoreToBlock(uint32_t core, const BlockData &blk)
+		            {
+		                if (!blk.coreNodeInv || core >= blk.coreNodeInvLen)
+		                    return node{SPQR_INVALID};
+		                return node{blk.coreNodeInv[core]};
+		            }
+
+		            template <typename GraphLike>
+		            inline uint32_t addAtomStateToGraph(const EdgeDPState &sub,
+		                                                GraphLike &g,
+		                                                std::vector<int> &inDeg,
+		                                                std::vector<int> &outDeg,
+		                                                std::vector<uint32_t> &blockIds,
+		                                                bool zeroAsForward)
+		            {
+		                const uint32_t sLoc = atomLocalOfBlock(sub.s, blockIds);
+		                const uint32_t tLoc = atomLocalOfBlock(sub.t, blockIds);
+		                if (sLoc >= inDeg.size() || tLoc >= inDeg.size())
+		                    return SPQR_INVALID;
+		                int dir = sub.getDirection();
+		                uint32_t forwardEdge = SPQR_INVALID;
+		                if (dir == 1 || (dir == 0 && zeroAsForward))
+		                {
+		                    edge ge = g.newEdge(node{sLoc}, node{tLoc});
+		                    forwardEdge = ge.idx;
+		                }
+		                if (dir == -1)
+		                    g.newEdge(node{tLoc}, node{sLoc});
+		                addStateCountsAtLoc(sub, sLoc, tLoc, inDeg, outDeg);
+		                return forwardEdge;
+		            }
+
+		            template <typename GraphLike>
+		            inline uint32_t addAtomChildRefToGraph(uint32_t cref,
+		                                                    const std::vector<EdgeDPState> &macroStates,
+	                                                    BlockData &blk,
+	                                                    GraphLike &g,
+	                                                    std::vector<int> &inDeg,
+	                                                    std::vector<int> &outDeg,
+	                                                    std::vector<uint32_t> &blockIds,
+	                                                    bool zeroAsForward)
+	            {
+	                if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+	                {
+	                    edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+	                    node u = blockEdgeSource(blk, e);
+	                    node v = blockEdgeTarget(blk, e);
+	                    const uint32_t uLoc = atomLocalOfBlock(u, blockIds);
+	                    const uint32_t vLoc = atomLocalOfBlock(v, blockIds);
+	                    if (uLoc >= inDeg.size() || vLoc >= inDeg.size())
+	                        return SPQR_INVALID;
+	                    edge ge = g.newEdge(node{uLoc}, node{vLoc});
+	                    ++outDeg[uLoc];
+	                    ++inDeg[vLoc];
+	                    return ge.idx;
+	                }
+		                const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+		                if (mid >= macroStates.size())
+		                    return SPQR_INVALID;
+		                return addAtomStateToGraph(macroStates[mid],
+		                                           g,
+		                                           inDeg,
+		                                           outDeg,
+		                                           blockIds,
+		                                           zeroAsForward);
+		            }
+
+		            inline const EdgeDPState *nestedBehaviorAtomStateForItem(
+		                const FfiSpqraBehaviorAtomItem &item,
+		                const SpqraBehaviorAtomView &atoms,
+		                const std::vector<EdgeDPState> &atomFwd,
+		                const std::vector<EdgeDPState> &atomRev,
+		                const BlockData &blk,
+		                uint32_t currentAtom)
+		            {
+		                const uint32_t atomId = item.child_ref;
+		                if (atomId >= currentAtom ||
+		                    atomId >= atoms.atoms_len ||
+		                    atomId >= atomFwd.size() ||
+		                    atomId >= atomRev.size() ||
+		                    !atoms.atoms_ptr)
+		                {
+		                    return nullptr;
+		                }
+		                const EdgeDPState &fwd = atomFwd[atomId];
+		                const EdgeDPState &rev = atomRev[atomId];
+		                if (blk.coreNodeInv &&
+		                    item.src_core < blk.coreNodeInvLen &&
+		                    item.dst_core < blk.coreNodeInvLen)
+		                {
+		                    node src{blk.coreNodeInv[item.src_core]};
+		                    node dst{blk.coreNodeInv[item.dst_core]};
+		                    if (src.idx != SPQR_INVALID && dst.idx != SPQR_INVALID)
+		                    {
+		                        if (fwd.s == src && fwd.t == dst)
+		                            return &fwd;
+		                        if (rev.s == src && rev.t == dst)
+		                            return &rev;
+		                    }
+		                }
+		                const FfiSpqraBehaviorAtom &nested = atoms.atoms_ptr[atomId];
+		                if (item.src_core == nested.port0_core &&
+		                    item.dst_core == nested.port1_core)
+		                    return &fwd;
+		                if (item.src_core == nested.port1_core &&
+		                    item.dst_core == nested.port0_core)
+		                    return &rev;
+		                return nullptr;
+		            }
+
+			            inline EdgeDPState computeBehaviorAtomState(const FfiSpqraBehaviorAtom &atom,
+			                                                        const SpqraBehaviorAtomView &atoms,
+			                                                        const std::vector<EdgeDPState> &macroStates,
+			                                                        const std::vector<EdgeDPState> &atomFwd,
+			                                                        const std::vector<EdgeDPState> &atomRev,
+			                                                        BlockData &blk,
+			                                                        uint32_t atomIndex,
+			                                                        bool reverse)
+	            {
+	                EdgeDPState st;
+	                if (!atoms.items_ptr || !blk.coreNodeInv ||
+	                    atom.port0_core >= blk.coreNodeInvLen ||
+	                    atom.port1_core >= blk.coreNodeInvLen)
+	                {
+	                    return st;
+	                }
+	                node a{blk.coreNodeInv[atom.port0_core]};
+	                node b{blk.coreNodeInv[atom.port1_core]};
+	                if (a.idx == SPQR_INVALID || b.idx == SPQR_INVALID)
+	                    return st;
+	                resetMacroState(st, reverse ? b : a, reverse ? a : b);
+
+		                const uint32_t itemBegin = std::min(atom.item_begin, atoms.items_len);
+		                const uint32_t itemEnd = std::min(atom.item_end, atoms.items_len);
+		                const uint32_t atomItemCount =
+		                    itemEnd >= itemBegin ? itemEnd - itemBegin : 0;
+		                std::vector<uint32_t> blockIds;
+		                blockIds.reserve(atomItemCount + 2);
+		                atomLocalOfBlock(a, blockIds);
+		                atomLocalOfBlock(b, blockIds);
+		                for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+	                {
+	                    const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+		                    if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                    {
+		                        if (SP_COMPRESS_CHILD_IS_EDGE(item.child_ref))
+		                        {
+		                            edge e{SP_COMPRESS_CHILD_AS_EDGE(item.child_ref)};
+		                            atomLocalOfBlock(blockEdgeSource(blk, e), blockIds);
+		                            atomLocalOfBlock(blockEdgeTarget(blk, e), blockIds);
+		                        }
+		                        else
+		                        {
+		                            const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(item.child_ref);
+		                            if (mid < macroStates.size())
+		                            {
+		                                atomLocalOfBlock(macroStates[mid].s, blockIds);
+		                                atomLocalOfBlock(macroStates[mid].t, blockIds);
+		                            }
+		                        }
+		                    }
+		                    else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                    {
+		                        const EdgeDPState *nested =
+		                            nestedBehaviorAtomStateForItem(item,
+		                                                           atoms,
+		                                                           atomFwd,
+		                                                           atomRev,
+		                                                           blk,
+		                                                           atomIndex);
+		                        if (nested)
+		                        {
+		                            atomLocalOfBlock(nested->s, blockIds);
+		                            atomLocalOfBlock(nested->t, blockIds);
+		                        }
+		                    }
+	                }
+
+	                thread_local std::vector<int> tls_atom_inDeg;
+	                thread_local std::vector<int> tls_atom_outDeg;
+	                const uint32_t nLocal = static_cast<uint32_t>(blockIds.size());
+	                if (tls_atom_inDeg.size() < nLocal) tls_atom_inDeg.resize(nLocal);
+	                if (tls_atom_outDeg.size() < nLocal) tls_atom_outDeg.resize(nLocal);
+	                std::fill_n(tls_atom_inDeg.begin(), nLocal, 0);
+	                std::fill_n(tls_atom_outDeg.begin(), nLocal, 0);
+		                thread_local FlatDigraphScratch tls_atom_graph;
+		                tls_atom_graph.reset(nLocal, atomItemCount);
+
+		                for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+	                {
+	                    const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+		                    if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                    {
+		                        addChildRefToState(st, item.child_ref, macroStates, blk);
+		                        addAtomChildRefToGraph(item.child_ref,
+		                                               macroStates,
+		                                               blk,
+		                                               tls_atom_graph,
+		                                               tls_atom_inDeg,
+		                                               tls_atom_outDeg,
+		                                               blockIds,
+		                                               true);
+		                    }
+		                    else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                    {
+		                        const EdgeDPState *nested =
+		                            nestedBehaviorAtomStateForItem(item,
+		                                                           atoms,
+		                                                           atomFwd,
+		                                                           atomRev,
+		                                                           blk,
+		                                                           atomIndex);
+		                        if (nested)
+		                        {
+		                            mergeSubState(st, *nested);
+		                            addAtomStateToGraph(*nested,
+		                                                tls_atom_graph,
+		                                                tls_atom_inDeg,
+		                                                tls_atom_outDeg,
+		                                                blockIds,
+		                                                true);
+		                        }
+		                    }
+		                }
+	                if (st.acyclic)
+	                    st.acyclic &= tls_atom_graph.isAcyclic();
+
+	                uint32_t sLoc = SPQR_INVALID;
+	                uint32_t tLoc = SPQR_INVALID;
+	                for (uint32_t li = 0; li < nLocal; ++li)
+	                {
+	                    if (blockIds[li] == st.s.idx) sLoc = li;
+	                    if (blockIds[li] == st.t.idx) tLoc = li;
+	                }
+	                if (sLoc != SPQR_INVALID && tLoc != SPQR_INVALID)
+	                {
+	                    st.localOutS = tls_atom_outDeg[sLoc];
+	                    st.localInS = tls_atom_inDeg[sLoc];
+	                    st.localOutT = tls_atom_outDeg[tLoc];
+	                    st.localInT = tls_atom_inDeg[tLoc];
+	                }
+	                for (uint32_t li = 0; li < nLocal; ++li)
+	                {
+	                    node bnode{blockIds[li]};
+	                    if (bnode == st.s || bnode == st.t)
+	                        continue;
+	                    if (blk.globIn[bnode] != tls_atom_inDeg[li] ||
+	                        blk.globOut[bnode] != tls_atom_outDeg[li])
+	                        st.hasLeakage = true;
+	                    if (blk.globIn[bnode] == 0 || blk.globOut[bnode] == 0)
+	                        st.globalSourceSink = true;
+		                }
+		                return st;
+		            }
+
+	            inline EdgeDPState reverseBehaviorAtomState(const EdgeDPState &fwd)
+	            {
+		                EdgeDPState rev;
+		                rev.s = fwd.t;
+		                rev.t = fwd.s;
+		                rev.localOutS = fwd.localOutT;
+		                rev.localInS = fwd.localInT;
+		                rev.localOutT = fwd.localOutS;
+		                rev.localInT = fwd.localInS;
+		                rev.globalSourceSink = fwd.globalSourceSink;
+		                rev.directST = fwd.directTS;
+		                rev.directTS = fwd.directST;
+		                rev.hasLeakage = fwd.hasLeakage;
+		                rev.acyclic = fwd.acyclic;
+	                return rev;
+	            }
+
+	            inline const EdgeDPState *behaviorAtomStateForCoreEndpoints(
+	                const SpqraBehaviorAtomStates &atomStates,
+	                const SpqraBehaviorAtomView &atoms,
+	                uint32_t atomId,
+	                uint32_t srcCore,
+	                uint32_t dstCore)
+	            {
+	                if (!atoms.atoms_ptr || atomId >= atoms.atoms_len ||
+	                    atomId >= atomStates.fwd.size() ||
+	                    atomId >= atomStates.rev.size())
+	                    return nullptr;
+	                const FfiSpqraBehaviorAtom &atom = atoms.atoms_ptr[atomId];
+	                if (srcCore == atom.port0_core && dstCore == atom.port1_core)
+	                    return &atomStates.fwd[atomId];
+	                if (srcCore == atom.port1_core && dstCore == atom.port0_core)
+	                    return &atomStates.rev[atomId];
+	                return nullptr;
+	            }
+
+		            inline SpqraBehaviorAtomStates computeBehaviorAtomStates(
+		                const SpqraBehaviorAtomView &atoms,
+		                const std::vector<EdgeDPState> &macroStates,
+		                BlockData &blk)
+	            {
+	                SpqraBehaviorAtomStates out;
+		                out.fwd.resize(atoms.atoms_len);
+		                out.rev.resize(atoms.atoms_len);
+		                out.outside.resize(atoms.atoms_len);
+		                out.outsideParentType.assign(atoms.atoms_len, 0);
+		                if (!atoms.atoms_ptr)
+		                    return out;
+			                for (uint32_t ai = 0; ai < atoms.atoms_len; ++ai)
+		                {
+			                    out.fwd[ai] = computeBehaviorAtomState(atoms.atoms_ptr[ai],
+			                                                           atoms,
+			                                                           macroStates,
+			                                                           out.fwd,
+			                                                           out.rev,
+			                                                           blk,
+			                                                           ai,
+			                                                           false);
+		                    out.rev[ai] = reverseBehaviorAtomState(out.fwd[ai]);
+		                }
+			                return out;
+			            }
+
+		            inline void computeNestedBehaviorAtomOutsideStates(
+		                const SpqraBehaviorAtomView &atoms,
+		                const std::vector<EdgeDPState> &macroStates,
+		                BlockData &blk,
+		                SpqraBehaviorAtomStates &atomStates)
+		            {
+		                if (!std::getenv("BF_SPQRA_NESTED_ATOM_OUTSIDE") ||
+		                    !atoms.atoms_ptr || !atoms.items_ptr)
+		                    return;
+		                const uint32_t nAtoms = atoms.atoms_len;
+		                for (uint32_t parentPlusOne = nAtoms; parentPlusOne > 0; --parentPlusOne)
+		                {
+		                    const uint32_t parentId = parentPlusOne - 1;
+		                    if (parentId >= atomStates.outside.size())
+		                        continue;
+		                    const EdgeDPState &parentOutside = atomStates.outside[parentId];
+		                    if (!parentOutside.s || !parentOutside.t)
+		                        continue;
+		                    const FfiSpqraBehaviorAtom &parent = atoms.atoms_ptr[parentId];
+		                    const uint32_t itemBegin = std::min(parent.item_begin, atoms.items_len);
+		                    const uint32_t itemEnd = std::min(parent.item_end, atoms.items_len);
+		                    if (itemBegin >= itemEnd)
+		                        continue;
+		                    const uint8_t parentType = scadKindToSpqrType(parent.kind);
+
+		                    for (uint32_t exclude = itemBegin; exclude < itemEnd; ++exclude)
+		                    {
+		                        const FfiSpqraBehaviorAtomItem &excludedItem = atoms.items_ptr[exclude];
+		                        if ((excludedItem.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM) == 0)
+		                            continue;
+		                        const uint32_t childId = excludedItem.child_ref;
+		                        if (childId >= parentId ||
+		                            childId >= nAtoms ||
+		                            childId >= atomStates.fwd.size() ||
+		                            childId >= atomStates.rev.size() ||
+		                            childId >= atomStates.outside.size())
+		                            continue;
+		                        const EdgeDPState *child =
+		                            nestedBehaviorAtomStateForItem(excludedItem,
+		                                                           atoms,
+		                                                           atomStates.fwd,
+		                                                           atomStates.rev,
+		                                                           blk,
+		                                                           parentId);
+		                        if (!child || !child->s || !child->t)
+		                            continue;
+
+		                        EdgeDPState st;
+		                        resetMacroState(st, child->s, child->t);
+		                        std::vector<uint32_t> blockIds;
+		                        blockIds.reserve((itemEnd - itemBegin) + 4);
+		                        const FfiSpqraBehaviorAtom &childAtom = atoms.atoms_ptr[childId];
+		                        node childA = atomCoreToBlock(childAtom.port0_core, blk);
+		                        node childB = atomCoreToBlock(childAtom.port1_core, blk);
+		                        if (childA.idx != SPQR_INVALID)
+		                            atomLocalOfBlock(childA, blockIds);
+		                        if (childB.idx != SPQR_INVALID)
+		                            atomLocalOfBlock(childB, blockIds);
+		                        atomLocalOfBlock(parentOutside.s, blockIds);
+		                        atomLocalOfBlock(parentOutside.t, blockIds);
+		                        for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+		                        {
+		                            if (ii == exclude)
+		                                continue;
+		                            const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+		                            if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                            {
+		                                if (SP_COMPRESS_CHILD_IS_EDGE(item.child_ref))
+		                                {
+		                                    edge e{SP_COMPRESS_CHILD_AS_EDGE(item.child_ref)};
+		                                    atomLocalOfBlock(blockEdgeSource(blk, e), blockIds);
+		                                    atomLocalOfBlock(blockEdgeTarget(blk, e), blockIds);
+		                                }
+		                                else
+		                                {
+		                                    const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(item.child_ref);
+		                                    if (mid < macroStates.size())
+		                                    {
+		                                        atomLocalOfBlock(macroStates[mid].s, blockIds);
+		                                        atomLocalOfBlock(macroStates[mid].t, blockIds);
+		                                    }
+		                                }
+		                            }
+		                            else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                            {
+		                                const EdgeDPState *nested =
+		                                    nestedBehaviorAtomStateForItem(item,
+		                                                                   atoms,
+		                                                                   atomStates.fwd,
+		                                                                   atomStates.rev,
+		                                                                   blk,
+		                                                                   parentId);
+		                                if (nested)
+		                                {
+		                                    atomLocalOfBlock(nested->s, blockIds);
+		                                    atomLocalOfBlock(nested->t, blockIds);
+		                                }
+		                            }
+		                        }
+
+		                        thread_local std::vector<int> tls_atom_out_inDeg;
+		                        thread_local std::vector<int> tls_atom_out_outDeg;
+		                        thread_local FlatDigraphScratch tls_atom_out_graph;
+		                        const uint32_t nLocal = static_cast<uint32_t>(blockIds.size());
+		                        if (tls_atom_out_inDeg.size() < nLocal)
+		                            tls_atom_out_inDeg.resize(nLocal);
+		                        if (tls_atom_out_outDeg.size() < nLocal)
+		                            tls_atom_out_outDeg.resize(nLocal);
+		                        std::fill_n(tls_atom_out_inDeg.begin(), nLocal, 0);
+		                        std::fill_n(tls_atom_out_outDeg.begin(), nLocal, 0);
+		                        tls_atom_out_graph.reset(nLocal, (itemEnd - itemBegin) + 1);
+
+		                        mergeSubState(st, parentOutside);
+		                        addAtomStateToGraph(parentOutside,
+		                                            tls_atom_out_graph,
+		                                            tls_atom_out_inDeg,
+		                                            tls_atom_out_outDeg,
+		                                            blockIds,
+		                                            true);
+		                        for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+		                        {
+		                            if (ii == exclude)
+		                                continue;
+		                            const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+		                            if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                            {
+		                                addChildRefToState(st, item.child_ref, macroStates, blk);
+		                                addAtomChildRefToGraph(item.child_ref,
+		                                                       macroStates,
+		                                                       blk,
+		                                                       tls_atom_out_graph,
+		                                                       tls_atom_out_inDeg,
+		                                                       tls_atom_out_outDeg,
+		                                                       blockIds,
+		                                                       true);
+		                            }
+		                            else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                            {
+		                                const EdgeDPState *nested =
+		                                    nestedBehaviorAtomStateForItem(item,
+		                                                                   atoms,
+		                                                                   atomStates.fwd,
+		                                                                   atomStates.rev,
+		                                                                   blk,
+		                                                                   parentId);
+		                                if (nested)
+		                                {
+		                                    mergeSubState(st, *nested);
+		                                    addAtomStateToGraph(*nested,
+		                                                        tls_atom_out_graph,
+		                                                        tls_atom_out_inDeg,
+		                                                        tls_atom_out_outDeg,
+		                                                        blockIds,
+		                                                        true);
+		                                }
+		                            }
+		                        }
+		                        if (st.acyclic)
+		                            st.acyclic &= tls_atom_out_graph.isAcyclic();
+
+		                        uint32_t sLoc = SPQR_INVALID;
+		                        uint32_t tLoc = SPQR_INVALID;
+		                        for (uint32_t li = 0; li < nLocal; ++li)
+		                        {
+		                            if (blockIds[li] == st.s.idx) sLoc = li;
+		                            if (blockIds[li] == st.t.idx) tLoc = li;
+		                        }
+		                        if (sLoc != SPQR_INVALID && tLoc != SPQR_INVALID)
+		                        {
+		                            st.localOutS = tls_atom_out_outDeg[sLoc];
+		                            st.localInS = tls_atom_out_inDeg[sLoc];
+		                            st.localOutT = tls_atom_out_outDeg[tLoc];
+		                            st.localInT = tls_atom_out_inDeg[tLoc];
+		                        }
+		                        for (uint32_t li = 0; li < nLocal; ++li)
+		                        {
+		                            node bnode{blockIds[li]};
+		                            if (bnode == st.s || bnode == st.t)
+		                                continue;
+		                            if (blk.globIn[bnode] != tls_atom_out_inDeg[li] ||
+		                                blk.globOut[bnode] != tls_atom_out_outDeg[li])
+		                                st.hasLeakage = true;
+		                            if (blk.globIn[bnode] == 0 || blk.globOut[bnode] == 0)
+		                                st.globalSourceSink = true;
+		                        }
+		                        atomStates.outside[childId] = st;
+		                        if (childId < atomStates.outsideParentType.size())
+		                            atomStates.outsideParentType[childId] = parentType;
+		                    }
+		                }
+		            }
+
+	            inline bool emitBehaviorAtomPFixedAgg(uint32_t atomId,
+	                                                   const SpqraBehaviorAtomView &atoms,
+	                                                   const SpqraBehaviorAtomStates &atomStates,
+	                                                   const std::vector<EdgeDPState> &macroStates,
+	                                                   const SpCompressTreeView &view,
+		                                                   const CcData &cc,
+		                                                   BlockData &blk)
+		            {
+		                if (!atoms.atoms_ptr || !atoms.items_ptr ||
+		                    atomId >= atoms.atoms_len ||
+		                    atomId >= atomStates.fwd.size() ||
+		                    atomId >= atomStates.outside.size())
+		                    return false;
+		                const FfiSpqraBehaviorAtom &atom = atoms.atoms_ptr[atomId];
+		                if (scadKindToSpqrType(atom.kind) != SPQR_NODE_TYPE_P)
+		                    return false;
+		                const EdgeDPState &inside = atomStates.fwd[atomId];
+		                const EdgeDPState &outside = atomStates.outside[atomId];
+		                if (!inside.s || !inside.t || !outside.s || !outside.t)
+		                    return false;
+
+		                PFixedAggEntry entry;
+		                node bS{inside.s.idx};
+		                node bT{inside.t.idx};
+		                const uint32_t itemBegin = std::min(atom.item_begin, atoms.items_len);
+		                const uint32_t itemEnd = std::min(atom.item_end, atoms.items_len);
+		                for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+		                {
+		                    const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+		                    if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                    {
+		                        const uint32_t cref = item.child_ref;
+		                        if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+		                        {
+		                            edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+		                            node u = blockEdgeSource(blk, e);
+		                            node v = blockEdgeTarget(blk, e);
+		                            if (u == bS && v == bT)
+		                                ++entry.directST;
+		                            else
+		                                ++entry.directTS;
+		                        }
+		                        else
+		                        {
+		                            const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+		                            if (mid >= macroStates.size() || mid >= view.macros_len)
+		                                continue;
+		                            const bool seriesLike =
+		                                view.macros_ptr[mid].kind == SP_COMPRESS_KIND_SERIES;
+		                            entry.fwd.addBranch(macroStates[mid],
+		                                                bS,
+		                                                bT,
+		                                                seriesLike,
+		                                                PFixedAggMode::Core);
+		                            entry.rev.addBranch(macroStates[mid],
+		                                                bT,
+		                                                bS,
+		                                                seriesLike,
+		                                                PFixedAggMode::Core);
+		                        }
+		                    }
+		                    else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                    {
+		                        const EdgeDPState *nested =
+		                            nestedBehaviorAtomStateForItem(item,
+		                                                           atoms,
+		                                                           atomStates.fwd,
+		                                                           atomStates.rev,
+		                                                           blk,
+		                                                           atomId);
+		                        if (!nested)
+		                            continue;
+		                        const bool seriesLike =
+		                            item.child_ref < atoms.atoms_len &&
+		                            scadKindToSpqrType(atoms.atoms_ptr[item.child_ref].kind) ==
+		                                SPQR_NODE_TYPE_S;
+		                        entry.fwd.addBranch(*nested,
+		                                            bS,
+		                                            bT,
+		                                            seriesLike,
+		                                            PFixedAggMode::Core);
+		                        entry.rev.addBranch(*nested,
+		                                            bT,
+		                                            bS,
+		                                            seriesLike,
+		                                            PFixedAggMode::Core);
+		                    }
+		                }
+		                const uint8_t outsideParentType =
+		                    atomId < atomStates.outsideParentType.size()
+		                        ? atomStates.outsideParentType[atomId]
+		                        : 0;
+		                const bool outsideSeriesLike = outsideParentType == SPQR_NODE_TYPE_S;
+		                entry.fwd.addBranch(outside,
+		                                    bS,
+		                                    bT,
+		                                    outsideSeriesLike,
+		                                    PFixedAggMode::Core);
+		                entry.rev.addBranch(outside,
+		                                    bT,
+		                                    bS,
+		                                    outsideSeriesLike,
+		                                    PFixedAggMode::Core);
+		                emitPFixedAggCandidate(entry.fwd,
+		                                       bS,
+		                                       bT,
+		                                       entry.directST,
+		                                       entry.directTS,
+		                                       true,
+		                                       cc,
+		                                       blk);
+		                emitPFixedAggCandidate(entry.rev,
+		                                       bT,
+		                                       bS,
+		                                       entry.directTS,
+		                                       entry.directST,
+		                                       true,
+		                                       cc,
+		                                       blk);
+		                return true;
+		            }
+
+	            inline const EdgeDPState *behaviorAtomStateForEdge(
+	                const SpqraBehaviorAtomStates &atomStates,
+	                const FfiSpqraMinimizerEdge &me,
+	                const SpqraMinimizerView &minView,
+	                const BlockData &blk,
+	                const FfiSpqraMinimizerComponent &comp)
+		            {
+		                const uint32_t atomId = me.child_ref;
+		                if (atomId >= atomStates.fwd.size() || atomId >= atomStates.rev.size())
+		                    return nullptr;
+		                const EdgeDPState &fwd = atomStates.fwd[atomId];
+		                const EdgeDPState &rev = atomStates.rev[atomId];
+		                if (blk.spqraBehaviorAtomView.atoms_ptr &&
+		                    atomId < blk.spqraBehaviorAtomView.atoms_len &&
+		                    minView.node_mapping_ptr)
+		                {
+		                    if (me.src_local != SPQR_INVALID &&
+		                        me.dst_local != SPQR_INVALID)
+		                    {
+		                        const uint32_t srcMi = comp.node_begin + me.src_local;
+		                        const uint32_t dstMi = comp.node_begin + me.dst_local;
+		                        if (srcMi < minView.node_mapping_len &&
+		                            dstMi < minView.node_mapping_len)
+		                        {
+		                            const FfiSpqraBehaviorAtom &atom =
+		                                blk.spqraBehaviorAtomView.atoms_ptr[atomId];
+		                            const uint32_t srcCore = minView.node_mapping_ptr[srcMi];
+		                            const uint32_t dstCore = minView.node_mapping_ptr[dstMi];
+		                            if (srcCore == atom.port0_core && dstCore == atom.port1_core)
+		                                return &fwd;
+		                            if (srcCore == atom.port1_core && dstCore == atom.port0_core)
+		                                return &rev;
+		                        }
+		                    }
+		                }
+		                const uint32_t srcBlock =
+		                    minimizerLocalBlockId(minView, blk, comp, me.src_local);
+		                const uint32_t dstBlock =
+		                    minimizerLocalBlockId(minView, blk, comp, me.dst_local);
+		                if (fwd.s.idx == srcBlock && fwd.t.idx == dstBlock)
+		                    return &fwd;
+		                if (rev.s.idx == srcBlock && rev.t.idx == dstBlock)
+		                    return &rev;
+	                if (fwd.s.idx == dstBlock && fwd.t.idx == srcBlock)
+	                    return &fwd;
+	                if (rev.s.idx == dstBlock && rev.t.idx == srcBlock)
+	                    return &rev;
+	                return &fwd;
+	            }
+
             inline void computeCoreUpStates(const CoreContext &c,
                                             const SpCompressTreeView &view,
                                             const std::vector<EdgeDPState> &macroStates,
                                             BlockData &blk,
-                                            std::vector<EdgeDPState> &down,
-                                            std::vector<EdgeDPState> &up,
-                                            std::vector<NodeDPState> &nodeDp)
+	                                            std::vector<EdgeDPState> &down,
+	                                            std::vector<EdgeDPState> &up,
+	                                            std::vector<NodeDPState> &nodeDp,
+	                                            const CcData *directCoreCc = nullptr,
+	                                            std::vector<PFixedAggEntry> *corePAgg = nullptr)
             {
-                std::vector<uint32_t> order = c.post;
-                std::reverse(order.begin(), order.end());
-                for (uint32_t A : order)
+                const bool emitCoreEdgesDuringUp =
+                    directCoreCc != nullptr &&
+                    std::getenv("BF_SPQRA_CORE_EXACT_EMIT_DURING_UP") != nullptr;
+                for (auto itPost = c.post.rbegin(); itPost != c.post.rend(); ++itPost)
                 {
+                    uint32_t A = *itPost;
                     uint32_t nLocal = c.mapOffsets[A + 1] - c.mapOffsets[A];
-                    Graph g;
-                    for (uint32_t i = 0; i < nLocal; ++i)
-                        g.newNode();
-                    std::vector<int> inDeg(nLocal, 0), outDeg(nLocal, 0);
+                    uint32_t start = c.skelOffsets[A];
+                    uint32_t end = c.skelOffsets[A + 1];
+                    thread_local FlatDigraphScratch tls_core_up_graph;
+                    thread_local std::vector<int> tls_core_up_inDeg;
+                    thread_local std::vector<int> tls_core_up_outDeg;
+                    thread_local std::vector<uint8_t> tls_core_up_isSourceSink;
+                    thread_local std::vector<uint8_t> tls_core_up_isLeaking;
+                    if (tls_core_up_inDeg.size() < nLocal) tls_core_up_inDeg.resize(nLocal);
+                    if (tls_core_up_outDeg.size() < nLocal) tls_core_up_outDeg.resize(nLocal);
+                    if (tls_core_up_isSourceSink.size() < nLocal) tls_core_up_isSourceSink.resize(nLocal);
+                    if (tls_core_up_isLeaking.size() < nLocal) tls_core_up_isLeaking.resize(nLocal);
+                    std::fill_n(tls_core_up_inDeg.begin(), nLocal, 0);
+                    std::fill_n(tls_core_up_outDeg.begin(), nLocal, 0);
+                    std::fill_n(tls_core_up_isSourceSink.begin(), nLocal, (uint8_t)0);
+                    std::fill_n(tls_core_up_isLeaking.begin(), nLocal, (uint8_t)0);
+                    tls_core_up_graph.reset(nLocal, end - start);
+
                     struct VRef
                     {
                         uint32_t other;
@@ -2269,19 +4120,24 @@ namespace solver
                         uint32_t tLoc;
                         uint32_t forwardEdge;
                     };
-                    std::vector<VRef> refs;
-                    uint32_t start = c.skelOffsets[A];
-                    uint32_t end = c.skelOffsets[A + 1];
-                    for (uint32_t i = start; i < end; ++i)
-                    {
-                        const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge != SPQR_INVALID)
-                        {
-                            uint32_t cref = view.core_edges_ptr[se.real_edge].child;
-                            addChildRefToGraphFast(cref, macroStates, c, A, se, blk, g, inDeg, outDeg, true);
+	                    thread_local std::vector<VRef> refs;
+	                    refs.clear();
+	                    for (uint32_t i = start; i < end; ++i)
+	                    {
+	                        const SkeletonEdge &se = c.skelEdges[i];
+	                        uint32_t cref = SPQR_INVALID;
+	                        if (coreSkeletonChildRef(view, se, cref))
+	                        {
+	                            addChildRefToGraphFast(cref, macroStates, c, A, se, blk,
+	                                                   tls_core_up_graph,
+	                                                   tls_core_up_inDeg,
+	                                                   tls_core_up_outDeg,
+	                                                   true);
+	                            continue;
+	                        }
+                        uint32_t B = SPQR_INVALID;
+                        if (!coreSkeletonTwin(c, se, B))
                             continue;
-                        }
-                        uint32_t B = se.twin_tree_node;
                         const EdgeDPState *child = (B == c.parents[A] ? &up[A] : &down[B]);
                         EdgeDPState *update = (B == c.parents[A] ? &down[A] : &up[B]);
                         if (B != c.parents[A])
@@ -2291,7 +4147,11 @@ namespace solver
                         }
                         uint32_t sLoc = localEndpointOnSkeletonEdge(c, A, se, child->s);
                         uint32_t tLoc = localEndpointOnSkeletonEdge(c, A, se, child->t);
-                        uint32_t forwardEdge = addStateToGraphOnSkeletonEdge(*child, c, A, se, g, inDeg, outDeg, true);
+                        uint32_t forwardEdge = addStateToGraphOnSkeletonEdge(*child, c, A, se,
+                                                                              tls_core_up_graph,
+                                                                              tls_core_up_inDeg,
+                                                                              tls_core_up_outDeg,
+                                                                              true);
                         if (sLoc != SPQR_INVALID && tLoc != SPQR_INVALID)
                             refs.push_back({B, update, child, sLoc, tLoc, forwardEdge});
                     }
@@ -2300,18 +4160,18 @@ namespace solver
 
                     int localSourceSinkCount = 0;
                     int localLeakageCount = 0;
-                    std::vector<uint8_t> isSourceSink(nLocal, 0), isLeaking(nLocal, 0);
                     for (uint32_t li = 0; li < nLocal; ++li)
                     {
                         node b{coreLocalBlockId(c, A, li)};
                         if (blk.globIn[b] == 0 || blk.globOut[b] == 0)
                         {
-                            isSourceSink[li] = 1;
+                            tls_core_up_isSourceSink[li] = 1;
                             localSourceSinkCount++;
                         }
-                        if (blk.globIn[b] != inDeg[li] || blk.globOut[b] != outDeg[li])
+                        if (blk.globIn[b] != tls_core_up_inDeg[li] ||
+                            blk.globOut[b] != tls_core_up_outDeg[li])
                         {
-                            isLeaking[li] = 1;
+                            tls_core_up_isLeaking[li] = 1;
                             localLeakageCount++;
                         }
                     }
@@ -2325,14 +4185,14 @@ namespace solver
                         for (uint32_t i = start; i < end; ++i)
                         {
                             const SkeletonEdge &se = c.skelEdges[i];
-                            if (se.real_edge == SPQR_INVALID)
+                            uint32_t cref = SPQR_INVALID;
+                            if (!coreSkeletonChildRef(view, se, cref))
                                 continue;
-                            uint32_t cref = view.core_edges_ptr[se.real_edge].child;
                             if (!SP_COMPRESS_CHILD_IS_EDGE(cref))
                                 continue;
                             edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                            node u = blk.Gblk->source(e);
-                            node v = blk.Gblk->target(e);
+                            node u = blockEdgeSource(blk, e);
+                            node v = blockEdgeTarget(blk, e);
                             if (u == pole0 && v == pole1) cnt01++;
                             if (u == pole1 && v == pole0) cnt10++;
                         }
@@ -2380,7 +4240,7 @@ namespace solver
                             }
                             else
                             {
-                                bool ac = isAcyclicSkippingEdge(g, r.forwardEdge);
+                                bool ac = tls_core_up_graph.isAcyclic(r.forwardEdge);
                                 if (r.toUpdate->acyclic && !ac)
                                 {
                                     nodeDp[r.other].outgoingCyclesCount++;
@@ -2392,12 +4252,22 @@ namespace solver
                     }
                     else
                     {
-                        FeedbackArcSet fas(g);
-                        std::vector<edge> fasEdges;
-                        bool ac = fas.run_or_acyclic(fasEdges);
+                        thread_local std::vector<edge> fasEdges;
+                        fasEdges.clear();
+                        bool ac = tls_core_up_graph.isAcyclic();
                         if (!ac)
                         {
-                            std::vector<uint8_t> inFas(g.numberOfEdges(), 0);
+                            Graph g;
+                            tls_core_up_graph.materialize(g);
+                            FeedbackArcSet fas(g);
+                            ac = fas.run_or_acyclic(fasEdges);
+                        }
+                        if (!ac)
+                        {
+                            thread_local std::vector<uint8_t> inFas;
+                            const uint32_t nEdges = tls_core_up_graph.numberOfEdges();
+                            if (inFas.size() < nEdges) inFas.resize(nEdges);
+                            std::fill_n(inFas.begin(), nEdges, (uint8_t)0);
                             for (edge e : fasEdges) inFas[e.idx] = 1;
                             for (auto &r : refs)
                             {
@@ -2416,7 +4286,8 @@ namespace solver
                     {
                         if (curr.outgoingSourceSinkCount >= 2 ||
                             (curr.outgoingSourceSinkCount == 1 && node{r.other} != curr.lastSourceSinkNode) ||
-                            ((int)isSourceSink[r.sLoc] + (int)isSourceSink[r.tLoc] < localSourceSinkCount))
+                            ((int)tls_core_up_isSourceSink[r.sLoc] +
+                             (int)tls_core_up_isSourceSink[r.tLoc] < localSourceSinkCount))
                         {
                             if (!r.toUpdate->globalSourceSink)
                             {
@@ -2427,7 +4298,8 @@ namespace solver
                         }
                         if (curr.outgoingLeakageCount >= 2 ||
                             (curr.outgoingLeakageCount == 1 && node{r.other} != curr.lastLeakageNode) ||
-                            ((int)isLeaking[r.sLoc] + (int)isLeaking[r.tLoc] < localLeakageCount))
+                            ((int)tls_core_up_isLeaking[r.sLoc] +
+                             (int)tls_core_up_isLeaking[r.tLoc] < localLeakageCount))
                         {
                             if (!r.toUpdate->hasLeakage)
                             {
@@ -2436,12 +4308,463 @@ namespace solver
                             }
                             r.toUpdate->hasLeakage = true;
                         }
-                        r.toUpdate->localInS = inDeg[r.sLoc] - r.opposite->localInS;
-                        r.toUpdate->localOutS = outDeg[r.sLoc] - r.opposite->localOutS;
-                        r.toUpdate->localInT = inDeg[r.tLoc] - r.opposite->localInT;
-                        r.toUpdate->localOutT = outDeg[r.tLoc] - r.opposite->localOutT;
+                        r.toUpdate->localInS = tls_core_up_inDeg[r.sLoc] - r.opposite->localInS;
+                        r.toUpdate->localOutS = tls_core_up_outDeg[r.sLoc] - r.opposite->localOutS;
+                        r.toUpdate->localInT = tls_core_up_inDeg[r.tLoc] - r.opposite->localInT;
+                        r.toUpdate->localOutT = tls_core_up_outDeg[r.tLoc] - r.opposite->localOutT;
                     }
-                }
+
+                    if (emitCoreEdgesDuringUp)
+                    {
+                        const uint32_t parentOfA = c.parents[A];
+                        for (const auto &r : refs)
+                        {
+                            uint32_t B = r.other;
+                            if (B == parentOfA || B >= c.len || c.parents[B] != A)
+                                continue;
+                            tryCoreTreeEdgeBubbles(B, A, c, down[B], up[B], *directCoreCc,
+                                                   blk);
+                            blk.isAcycic &= (down[B].acyclic && up[B].acyclic);
+	                        }
+	                    }
+	                }
+	                if (corePAgg)
+	                {
+	                    corePAgg->assign(c.len, PFixedAggEntry{});
+	                    for (uint32_t tn = 0; tn < c.len; ++tn)
+	                    {
+	                        if (c.types[tn] == SPQR_NODE_TYPE_P)
+	                            buildCorePFixedAggEntry(tn, c, view, macroStates, down, up, blk,
+	                                                     (*corePAgg)[tn]);
+	                    }
+	                }
+	            }
+
+            inline std::vector<EdgeDPState> computeMinimizerDownStates(const SpqraMinimizerView &minView,
+                                                                       const std::vector<EdgeDPState> &macroStates,
+                                                                       BlockData &blk,
+	                                                                       std::vector<NodeDPState> &nodeDp,
+	                                                                       const SpqraBehaviorAtomStates *atomStates = nullptr)
+	            {
+	                std::vector<EdgeDPState> down(minView.components_len);
+	                if (!minView.components_ptr || !minView.edges_ptr || !minView.postorder_ptr)
+	                    return down;
+	                const uint32_t root = minView.summary.root;
+	                for (uint32_t pi = 0; pi < minView.postorder_len; ++pi)
+	                {
+	                    const uint32_t tn = minView.postorder_ptr[pi];
+	                    if (tn >= minView.components_len || tn == root)
+	                        continue;
+	                    const FfiSpqraMinimizerComponent &comp = minView.components_ptr[tn];
+	                    const uint32_t parent = comp.parent;
+	                    if (parent >= minView.components_len)
+	                        continue;
+
+	                    uint32_t parentEdge = SPQR_INVALID;
+	                    const uint32_t edgeEnd = std::min(comp.edge_end, minView.edges_len);
+	                    for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                    {
+	                        const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                        if ((me.flags & SPQRA_MIN_EDGE_VIRTUAL) &&
+	                            me.twin_component == parent)
+	                        {
+	                            parentEdge = ge;
+	                            break;
+	                        }
+	                    }
+	                    if (parentEdge == SPQR_INVALID)
+	                        continue;
+
+	                    const FfiSpqraMinimizerEdge &pe = minView.edges_ptr[parentEdge];
+	                    node s{minimizerLocalBlockId(minView, blk, comp, pe.dst_local)};
+	                    node t{minimizerLocalBlockId(minView, blk, comp, pe.src_local)};
+	                    if (s.idx == SPQR_INVALID || t.idx == SPQR_INVALID)
+	                        continue;
+	                    EdgeDPState &st = down[tn];
+	                    resetMacroState(st, s, t);
+
+	                    const uint32_t nLocal =
+	                        comp.node_end >= comp.node_begin ? comp.node_end - comp.node_begin : 0;
+	                    thread_local FlatDigraphScratch tls_min_down_graph;
+	                    thread_local std::vector<int> tls_min_down_inDeg;
+	                    thread_local std::vector<int> tls_min_down_outDeg;
+	                    if (tls_min_down_inDeg.size() < nLocal) tls_min_down_inDeg.resize(nLocal);
+	                    if (tls_min_down_outDeg.size() < nLocal) tls_min_down_outDeg.resize(nLocal);
+	                    std::fill_n(tls_min_down_inDeg.begin(), nLocal, 0);
+	                    std::fill_n(tls_min_down_outDeg.begin(), nLocal, 0);
+	                    tls_min_down_graph.reset(nLocal, edgeEnd - comp.edge_begin);
+
+	                    for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                    {
+	                        if (ge == parentEdge)
+	                            continue;
+	                        const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                        if ((me.flags & SPQRA_MIN_EDGE_HAS_BEHAVIOR_ATOM) && atomStates)
+	                        {
+	                            const EdgeDPState *atom =
+	                                behaviorAtomStateForEdge(*atomStates, me, minView, blk, comp);
+	                            if (atom)
+	                            {
+	                                mergeSubState(st, *atom);
+	                                addStateToGraphOnMinimizerEdge(*atom, minView, blk, comp, me,
+	                                                               tls_min_down_graph,
+	                                                               tls_min_down_inDeg,
+	                                                               tls_min_down_outDeg,
+	                                                               false);
+	                            }
+	                            continue;
+	                        }
+	                        if (me.flags & SPQRA_MIN_EDGE_HAS_CHILD_REF)
+	                        {
+	                            addChildRefToState(st, me.child_ref, macroStates, blk);
+	                            addChildRefToGraphFastMinimizer(me.child_ref, macroStates,
+	                                                            minView, blk, comp, me,
+	                                                            tls_min_down_graph,
+	                                                            tls_min_down_inDeg,
+	                                                            tls_min_down_outDeg,
+	                                                            true);
+	                            if (scadKindToSpqrType(comp.kind) == SPQR_NODE_TYPE_P &&
+	                                SP_COMPRESS_CHILD_IS_EDGE(me.child_ref))
+	                            {
+	                                edge e{SP_COMPRESS_CHILD_AS_EDGE(me.child_ref)};
+	                                node u = blockEdgeSource(blk, e);
+	                                node v = blockEdgeTarget(blk, e);
+	                                if (u == st.s && v == st.t) st.directST = true;
+	                                if (u == st.t && v == st.s) st.directTS = true;
+	                            }
+	                            continue;
+	                        }
+	                        if (me.flags & SPQRA_MIN_EDGE_VIRTUAL)
+	                        {
+	                            const uint32_t child = me.twin_component;
+	                            if (child >= minView.components_len ||
+	                                minView.components_ptr[child].parent != tn)
+	                                continue;
+	                            mergeSubState(st, down[child]);
+	                            addStateToGraphOnMinimizerEdge(down[child], minView, blk, comp, me,
+	                                                           tls_min_down_graph,
+	                                                           tls_min_down_inDeg,
+	                                                           tls_min_down_outDeg,
+	                                                           false);
+	                        }
+	                    }
+
+	                    const uint32_t sLoc = pe.dst_local;
+	                    const uint32_t tLoc = pe.src_local;
+	                    if (sLoc < nLocal && tLoc < nLocal)
+	                    {
+	                        st.localOutS = tls_min_down_outDeg[sLoc];
+	                        st.localInS = tls_min_down_inDeg[sLoc];
+	                        st.localOutT = tls_min_down_outDeg[tLoc];
+	                        st.localInT = tls_min_down_inDeg[tLoc];
+	                    }
+
+	                    for (uint32_t li = 0; li < nLocal; ++li)
+	                    {
+	                        node b{minimizerLocalBlockId(minView, blk, comp, li)};
+	                        if (b.idx == SPQR_INVALID || b == st.s || b == st.t)
+	                            continue;
+	                        if (blk.globIn[b] != tls_min_down_inDeg[li] ||
+	                            blk.globOut[b] != tls_min_down_outDeg[li])
+	                            st.hasLeakage = true;
+	                        if (blk.globIn[b] == 0 || blk.globOut[b] == 0)
+	                            st.globalSourceSink = true;
+	                    }
+
+	                    if (st.acyclic)
+	                        st.acyclic &= tls_min_down_graph.isAcyclic();
+	                    if (!st.acyclic && parent < nodeDp.size())
+	                    {
+	                        nodeDp[parent].outgoingCyclesCount++;
+	                        nodeDp[parent].lastCycleNode = node{tn};
+	                    }
+	                    if (st.globalSourceSink && parent < nodeDp.size())
+	                    {
+	                        nodeDp[parent].outgoingSourceSinkCount++;
+	                        nodeDp[parent].lastSourceSinkNode = node{tn};
+	                    }
+	                    if (st.hasLeakage && parent < nodeDp.size())
+	                    {
+	                        nodeDp[parent].outgoingLeakageCount++;
+	                        nodeDp[parent].lastLeakageNode = node{tn};
+	                    }
+	                }
+                return down;
+            }
+
+            inline void computeMinimizerUpStates(const SpqraMinimizerView &minView,
+                                                 const std::vector<EdgeDPState> &macroStates,
+                                                 BlockData &blk,
+	                                                 std::vector<EdgeDPState> &down,
+	                                                 std::vector<EdgeDPState> &up,
+	                                                 std::vector<NodeDPState> &nodeDp,
+	                                                 SpqraBehaviorAtomStates *atomStates = nullptr)
+	            {
+	                if (!minView.components_ptr || !minView.edges_ptr || !minView.postorder_ptr)
+	                    return;
+	                for (auto itPost = std::make_reverse_iterator(minView.postorder_ptr + minView.postorder_len);
+	                     itPost != std::make_reverse_iterator(minView.postorder_ptr); ++itPost)
+	                {
+	                    const uint32_t A = *itPost;
+	                    if (A >= minView.components_len)
+	                        continue;
+	                    const FfiSpqraMinimizerComponent &comp = minView.components_ptr[A];
+	                    const uint32_t nLocal =
+	                        comp.node_end >= comp.node_begin ? comp.node_end - comp.node_begin : 0;
+	                    const uint32_t edgeEnd = std::min(comp.edge_end, minView.edges_len);
+	                    thread_local FlatDigraphScratch tls_min_up_graph;
+	                    thread_local std::vector<int> tls_min_up_inDeg;
+	                    thread_local std::vector<int> tls_min_up_outDeg;
+	                    thread_local std::vector<uint8_t> tls_min_up_isSourceSink;
+	                    thread_local std::vector<uint8_t> tls_min_up_isLeaking;
+	                    if (tls_min_up_inDeg.size() < nLocal) tls_min_up_inDeg.resize(nLocal);
+	                    if (tls_min_up_outDeg.size() < nLocal) tls_min_up_outDeg.resize(nLocal);
+	                    if (tls_min_up_isSourceSink.size() < nLocal) tls_min_up_isSourceSink.resize(nLocal);
+	                    if (tls_min_up_isLeaking.size() < nLocal) tls_min_up_isLeaking.resize(nLocal);
+	                    std::fill_n(tls_min_up_inDeg.begin(), nLocal, 0);
+	                    std::fill_n(tls_min_up_outDeg.begin(), nLocal, 0);
+	                    std::fill_n(tls_min_up_isSourceSink.begin(), nLocal, (uint8_t)0);
+	                    std::fill_n(tls_min_up_isLeaking.begin(), nLocal, (uint8_t)0);
+	                    tls_min_up_graph.reset(nLocal, edgeEnd - comp.edge_begin);
+
+	                    struct VRef
+	                    {
+	                        uint32_t other;
+	                        EdgeDPState *toUpdate;
+	                        const EdgeDPState *opposite;
+	                        uint32_t sLoc;
+	                        uint32_t tLoc;
+	                        uint32_t forwardEdge;
+	                    };
+	                    thread_local std::vector<VRef> refs;
+	                    refs.clear();
+	                    const uint32_t parentA = comp.parent;
+	                    for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                    {
+	                        const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                        if ((me.flags & SPQRA_MIN_EDGE_HAS_BEHAVIOR_ATOM) && atomStates)
+	                        {
+	                            const uint32_t atomId = me.child_ref;
+	                            if (atomId >= atomStates->outside.size())
+	                                continue;
+	                            const EdgeDPState *child =
+	                                behaviorAtomStateForEdge(*atomStates, me, minView, blk, comp);
+	                            if (!child)
+	                                continue;
+		                            EdgeDPState *update = &atomStates->outside[atomId];
+		                            update->s = child->s;
+		                            update->t = child->t;
+		                            if (atomId < atomStates->outsideParentType.size())
+		                                atomStates->outsideParentType[atomId] =
+		                                    scadKindToSpqrType(comp.kind);
+		                            const uint32_t sLoc =
+		                                minimizerLocalEndpointOnEdge(minView, blk, comp, me, child->s);
+	                            const uint32_t tLoc =
+	                                minimizerLocalEndpointOnEdge(minView, blk, comp, me, child->t);
+	                            const uint32_t forwardEdge =
+	                                addStateToGraphOnMinimizerEdge(*child, minView, blk, comp, me,
+	                                                               tls_min_up_graph,
+	                                                               tls_min_up_inDeg,
+	                                                               tls_min_up_outDeg,
+	                                                               true);
+	                            if (sLoc != SPQR_INVALID && tLoc != SPQR_INVALID)
+	                                refs.push_back({SPQR_INVALID, update, child, sLoc, tLoc, forwardEdge});
+	                            continue;
+	                        }
+	                        if (me.flags & SPQRA_MIN_EDGE_HAS_CHILD_REF)
+	                        {
+	                            addChildRefToGraphFastMinimizer(me.child_ref, macroStates,
+	                                                            minView, blk, comp, me,
+	                                                            tls_min_up_graph,
+	                                                            tls_min_up_inDeg,
+	                                                            tls_min_up_outDeg,
+	                                                            true);
+	                            continue;
+	                        }
+	                        if ((me.flags & SPQRA_MIN_EDGE_VIRTUAL) == 0)
+	                            continue;
+	                        const uint32_t B = me.twin_component;
+	                        if (B >= minView.components_len)
+	                            continue;
+	                        const EdgeDPState *child = (B == parentA ? &up[A] : &down[B]);
+	                        EdgeDPState *update = (B == parentA ? &down[A] : &up[B]);
+	                        if (B != parentA)
+	                        {
+	                            update->s = down[B].s;
+	                            update->t = down[B].t;
+	                        }
+	                        const uint32_t sLoc =
+	                            minimizerLocalEndpointOnEdge(minView, blk, comp, me, child->s);
+	                        const uint32_t tLoc =
+	                            minimizerLocalEndpointOnEdge(minView, blk, comp, me, child->t);
+	                        const uint32_t forwardEdge =
+	                            addStateToGraphOnMinimizerEdge(*child, minView, blk, comp, me,
+	                                                           tls_min_up_graph,
+	                                                           tls_min_up_inDeg,
+	                                                           tls_min_up_outDeg,
+	                                                           true);
+	                        if (sLoc != SPQR_INVALID && tLoc != SPQR_INVALID)
+	                            refs.push_back({B, update, child, sLoc, tLoc, forwardEdge});
+	                    }
+	                    if (refs.empty())
+	                        continue;
+
+	                    int localSourceSinkCount = 0;
+	                    int localLeakageCount = 0;
+	                    for (uint32_t li = 0; li < nLocal; ++li)
+	                    {
+	                        node b{minimizerLocalBlockId(minView, blk, comp, li)};
+	                        if (b.idx == SPQR_INVALID)
+	                            continue;
+	                        if (blk.globIn[b] == 0 || blk.globOut[b] == 0)
+	                        {
+	                            tls_min_up_isSourceSink[li] = 1;
+	                            ++localSourceSinkCount;
+	                        }
+	                        if (blk.globIn[b] != tls_min_up_inDeg[li] ||
+	                            blk.globOut[b] != tls_min_up_outDeg[li])
+	                        {
+	                            tls_min_up_isLeaking[li] = 1;
+	                            ++localLeakageCount;
+	                        }
+	                    }
+
+	                    if (scadKindToSpqrType(comp.kind) == SPQR_NODE_TYPE_P)
+	                    {
+	                        node pole0{minimizerLocalBlockId(minView, blk, comp, 0)};
+	                        node pole1{minimizerLocalBlockId(minView, blk, comp, 1)};
+	                        int cnt01 = 0;
+	                        int cnt10 = 0;
+	                        for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                        {
+	                            const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                            if ((me.flags & SPQRA_MIN_EDGE_HAS_CHILD_REF) == 0 ||
+	                                !SP_COMPRESS_CHILD_IS_EDGE(me.child_ref))
+	                                continue;
+	                            edge e{SP_COMPRESS_CHILD_AS_EDGE(me.child_ref)};
+	                            node u = blockEdgeSource(blk, e);
+	                            node v = blockEdgeTarget(blk, e);
+	                            if (u == pole0 && v == pole1) ++cnt01;
+	                            if (u == pole1 && v == pole0) ++cnt10;
+	                        }
+	                        for (auto &r : refs)
+	                        {
+	                            EdgeDPState &st = *r.toUpdate;
+	                            if (st.s == pole0 && st.t == pole1)
+	                            {
+	                                st.directST |= cnt01 > 0;
+	                                st.directTS |= cnt10 > 0;
+	                            }
+	                            else if (st.s == pole1 && st.t == pole0)
+	                            {
+	                                st.directST |= cnt10 > 0;
+	                                st.directTS |= cnt01 > 0;
+	                            }
+	                        }
+	                    }
+
+	                    NodeDPState curr = A < nodeDp.size() ? nodeDp[A] : NodeDPState{};
+	                    if (curr.outgoingCyclesCount >= 2)
+	                    {
+	                        for (auto &r : refs)
+	                        {
+	                            if (r.toUpdate->acyclic && r.other < nodeDp.size())
+	                            {
+	                                nodeDp[r.other].outgoingCyclesCount++;
+	                                nodeDp[r.other].lastCycleNode = node{A};
+	                            }
+	                            r.toUpdate->acyclic = false;
+	                        }
+	                    }
+	                    else if (curr.outgoingCyclesCount == 1)
+	                    {
+	                        for (auto &r : refs)
+	                        {
+	                            if (node{r.other} != curr.lastCycleNode)
+	                            {
+	                                if (r.toUpdate->acyclic && r.other < nodeDp.size())
+	                                {
+	                                    nodeDp[r.other].outgoingCyclesCount++;
+	                                    nodeDp[r.other].lastCycleNode = node{A};
+	                                }
+	                                r.toUpdate->acyclic = false;
+	                            }
+	                            else
+	                            {
+	                                bool ac = tls_min_up_graph.isAcyclic(r.forwardEdge);
+	                                if (r.toUpdate->acyclic && !ac && r.other < nodeDp.size())
+	                                {
+	                                    nodeDp[r.other].outgoingCyclesCount++;
+	                                    nodeDp[r.other].lastCycleNode = node{A};
+	                                }
+	                                r.toUpdate->acyclic &= ac;
+	                            }
+	                        }
+	                    }
+	                    else
+	                    {
+	                        thread_local std::vector<edge> fasEdges;
+	                        fasEdges.clear();
+	                        bool ac = tls_min_up_graph.isAcyclic();
+	                        if (!ac)
+	                        {
+	                            Graph g;
+	                            tls_min_up_graph.materialize(g);
+	                            FeedbackArcSet fas(g);
+	                            ac = fas.run_or_acyclic(fasEdges);
+	                        }
+	                        if (!ac)
+	                        {
+	                            thread_local std::vector<uint8_t> inFas;
+	                            const uint32_t nEdges = tls_min_up_graph.numberOfEdges();
+	                            if (inFas.size() < nEdges) inFas.resize(nEdges);
+	                            std::fill_n(inFas.begin(), nEdges, (uint8_t)0);
+	                            for (edge e : fasEdges) inFas[e.idx] = 1;
+	                            for (auto &r : refs)
+	                            {
+	                                bool keep = r.forwardEdge != SPQR_INVALID && inFas[r.forwardEdge];
+	                                if (r.toUpdate->acyclic && !keep && r.other < nodeDp.size())
+	                                {
+	                                    nodeDp[r.other].outgoingCyclesCount++;
+	                                    nodeDp[r.other].lastCycleNode = node{A};
+	                                }
+	                                r.toUpdate->acyclic &= keep;
+	                            }
+	                        }
+	                    }
+
+	                    for (auto &r : refs)
+	                    {
+	                        if (curr.outgoingSourceSinkCount >= 2 ||
+	                            (curr.outgoingSourceSinkCount == 1 && node{r.other} != curr.lastSourceSinkNode) ||
+	                            ((int)tls_min_up_isSourceSink[r.sLoc] +
+	                             (int)tls_min_up_isSourceSink[r.tLoc] < localSourceSinkCount))
+	                        {
+	                            if (!r.toUpdate->globalSourceSink && r.other < nodeDp.size())
+	                            {
+	                                nodeDp[r.other].outgoingSourceSinkCount++;
+	                                nodeDp[r.other].lastSourceSinkNode = node{A};
+	                            }
+	                            r.toUpdate->globalSourceSink = true;
+	                        }
+	                        if (curr.outgoingLeakageCount >= 2 ||
+	                            (curr.outgoingLeakageCount == 1 && node{r.other} != curr.lastLeakageNode) ||
+	                            ((int)tls_min_up_isLeaking[r.sLoc] +
+	                             (int)tls_min_up_isLeaking[r.tLoc] < localLeakageCount))
+	                        {
+	                            if (!r.toUpdate->hasLeakage && r.other < nodeDp.size())
+	                            {
+	                                nodeDp[r.other].outgoingLeakageCount++;
+	                                nodeDp[r.other].lastLeakageNode = node{A};
+	                            }
+	                            r.toUpdate->hasLeakage = true;
+	                        }
+	                        r.toUpdate->localInS = tls_min_up_inDeg[r.sLoc] - r.opposite->localInS;
+	                        r.toUpdate->localOutS = tls_min_up_outDeg[r.sLoc] - r.opposite->localOutS;
+	                        r.toUpdate->localInT = tls_min_up_inDeg[r.tLoc] - r.opposite->localInT;
+	                        r.toUpdate->localOutT = tls_min_up_outDeg[r.tLoc] - r.opposite->localOutT;
+	                    }
+	                }
             }
 
 
@@ -2464,21 +4787,21 @@ namespace solver
                 for (uint32_t i = start; i < end; ++i)
                 {
                     const SkeletonEdge &se = c.skelEdges[i];
-                    if (se.real_edge == SPQR_INVALID)
+                    uint32_t cref = SPQR_INVALID;
+                    if (!coreSkeletonChildRef(view, se, cref))
                         continue;
-                    uint32_t cref = view.core_edges_ptr[se.real_edge].child;
                     if (!SP_COMPRESS_CHILD_IS_EDGE(cref))
                         continue;
                     edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                    node u = blk.Gblk->source(e);
-                    node v = blk.Gblk->target(e);
+                    node u = blockEdgeSource(blk, e);
+                    node v = blockEdgeTarget(blk, e);
                     if (u == bS && v == bT) directST++;
                     else directTS++;
                 }
                 for (int q = 0; q < 2; ++q)
                 {
                     std::vector<const EdgeDPState *> goodS, goodT;
-                    uint32_t singleGood = SPQR_INVALID;
+                    BranchRef singleGood;
                     int localOutSSum = directST;
                     int localInTSum = directST;
                     auto weakBackBranch = [&](const EdgeDPState &state, int outS, int inT) {
@@ -2491,9 +4814,9 @@ namespace solver
                     for (uint32_t i = start; i < end; ++i)
                     {
                         const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge != SPQR_INVALID)
+                        uint32_t cref = SPQR_INVALID;
+                        if (coreSkeletonChildRef(view, se, cref))
                         {
-                            uint32_t cref = view.core_edges_ptr[se.real_edge].child;
                             if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                                 continue;
                             const EdgeDPState &state = macroStates[SP_COMPRESS_CHILD_AS_MACRO(cref)];
@@ -2503,11 +4826,16 @@ namespace solver
                             localInTSum += localInT;
                             if (weakBackBranch(state, localOutS, localInT))
                                 continue;
-                            if (localOutS > 0) { goodS.push_back(&state); singleGood = cref; }
+                            if (localOutS > 0) {
+                                goodS.push_back(&state);
+                                singleGood = BranchRef::macro(SP_COMPRESS_CHILD_AS_MACRO(cref));
+                            }
                             if (localInT > 0) goodT.push_back(&state);
                             continue;
                         }
-                        uint32_t other = se.twin_tree_node;
+                        uint32_t other = SPQR_INVALID;
+                        if (!coreSkeletonTwin(c, se, other))
+                            continue;
                         const EdgeDPState &state = (c.parents[other] == A ? down[other] : up[A]);
                         int localOutS = (state.s == bS ? state.localOutS : state.localOutT);
                         int localInT = (state.t == bT ? state.localInT : state.localInS);
@@ -2515,14 +4843,34 @@ namespace solver
                         localInTSum += localInT;
                         if (weakBackBranch(state, localOutS, localInT))
                             continue;
-                        if (localOutS > 0) { goodS.push_back(&state); singleGood = other | 0x80000000u; }
+                        if (localOutS > 0) {
+                            goodS.push_back(&state);
+                            singleGood = BranchRef::tree(other);
+                        }
                         if (localInT > 0) goodT.push_back(&state);
                     }
                     bool good = true;
+                    int badSourcePole = 0;
+                    int badSinkPole = 0;
+                    int badSAcyclic = 0, badSGlobalSourceSink = 0, badSLeakage = 0;
+                    int badTAcyclic = 0, badTGlobalSourceSink = 0, badTLeakage = 0;
+                    int badSAcyclicNoWeakBack = 0, badTAcyclicNoWeakBack = 0;
+                    int badSourcePoleNoWeakBack = 0, badSinkPoleNoWeakBack = 0;
                     for (auto state : goodS)
                     {
                         if ((state->s == bS && state->localInS > 0) || (state->s == bT && state->localInT > 0))
+                        {
                             good = false;
+                            badSourcePole++;
+                            if (!(state->directTS || state->directST)) badSourcePoleNoWeakBack++;
+                        }
+                        if (!state->acyclic)
+                        {
+                            badSAcyclic++;
+                            if (!(state->directTS || state->directST)) badSAcyclicNoWeakBack++;
+                        }
+                        if (state->globalSourceSink) badSGlobalSourceSink++;
+                        if (state->hasLeakage) badSLeakage++;
                         good &= state->acyclic;
                         good &= !state->globalSourceSink;
                         good &= !state->hasLeakage;
@@ -2530,28 +4878,62 @@ namespace solver
                     for (auto state : goodT)
                     {
                         if ((state->t == bT && state->localOutT > 0) || (state->t == bS && state->localOutS > 0))
+                        {
                             good = false;
+                            badSinkPole++;
+                            if (!(state->directTS || state->directST)) badSinkPoleNoWeakBack++;
+                        }
+                        if (!state->acyclic)
+                        {
+                            badTAcyclic++;
+                            if (!(state->directTS || state->directST)) badTAcyclicNoWeakBack++;
+                        }
+                        if (state->globalSourceSink) badTGlobalSourceSink++;
+                        if (state->hasLeakage) badTLeakage++;
                         good &= state->acyclic;
                         good &= !state->globalSourceSink;
                         good &= !state->hasLeakage;
                     }
-                    good &= (ctx().weakSuperbubbles || directTS == 0);
-                    good &= goodS == goodT;
-                    good &= (!goodS.empty() || directST > 1);
-                    if (goodS.size() == 1 && singleGood != SPQR_INVALID)
+                    bool directOk = (ctx().weakSuperbubbles || directTS == 0);
+                    bool sameSetOk = (goodS == goodT);
+                    bool nonEmptyOk = (!goodS.empty() || directST > 1);
+                    good &= directOk;
+                    good &= sameSetOk;
+                    good &= nonEmptyOk;
+                    bool singletonOk = true;
+                    if (goodS.size() == 1 && singleGood.valid())
                     {
-                        if ((singleGood & 0x80000000u) != 0)
+                        if (singleGood.kind == BranchRef::Kind::TreeNode)
                         {
-                            uint32_t tn = singleGood & 0x7fffffffu;
-                            good &= c.types[tn] != SPQR_NODE_TYPE_S || (ctx().weakSuperbubbles && directST > 0);
+                            singletonOk = singleGood.id < c.len &&
+                                          (c.types[singleGood.id] != SPQR_NODE_TYPE_S ||
+                                           (ctx().weakSuperbubbles && directST > 0));
                         }
-                        else if (SP_COMPRESS_CHILD_IS_MACRO(singleGood))
+                        else if (singleGood.kind == BranchRef::Kind::MacroChild)
                         {
-                            const SpCompressNode &m = view.macros_ptr[SP_COMPRESS_CHILD_AS_MACRO(singleGood)];
-                            good &= m.kind != SP_COMPRESS_KIND_SERIES || (ctx().weakSuperbubbles && directST > 0);
+                            singletonOk = singleGood.id < view.macros_len;
+                            if (singletonOk)
+                            {
+                                const SpCompressNode &m = view.macros_ptr[singleGood.id];
+                                singletonOk = m.kind != SP_COMPRESS_KIND_SERIES || (ctx().weakSuperbubbles && directST > 0);
+                            }
                         }
                     }
-                    good &= (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
+                    good &= singletonOk;
+                    bool corePCountsGood =
+                        (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
+                    good &= corePCountsGood;
+                    bool onlyCorePWeakBackFailures =
+                        badSGlobalSourceSink == 0 && badTGlobalSourceSink == 0 &&
+                        badSLeakage == 0 && badTLeakage == 0 &&
+                        badSAcyclicNoWeakBack == 0 && badTAcyclicNoWeakBack == 0 &&
+                        badSourcePoleNoWeakBack == 0 && badSinkPoleNoWeakBack == 0;
+                    if (ctx().weakSuperbubbles && !good && corePCountsGood &&
+                        sameSetOk && nonEmptyOk && singletonOk &&
+                        goodS.size() > 1 && onlyCorePWeakBackFailures)
+                    {
+                        good = true;
+                    }
                     if (good)
                     {
                         node rawS = cc.toOrig[blk.toCc[bS]];
@@ -2574,6 +4956,13 @@ namespace solver
                     return;
                 node bS{m.left};
                 node bT{m.right};
+                const EdgeDPState &whole = macroStates[mid];
+                const bool qPossible0 = whole.localOutS == blk.globOut[bS] &&
+                                        whole.localInT == blk.globIn[bT];
+                const bool qPossible1 = whole.localOutT == blk.globOut[bT] &&
+                                        whole.localInS == blk.globIn[bS];
+                if (!qPossible0 && !qPossible1)
+                    return;
                 int directST = 0, directTS = 0;
                 for (uint32_t i = 0; i < m.children_count; ++i)
                 {
@@ -2581,18 +4970,33 @@ namespace solver
                     if (!SP_COMPRESS_CHILD_IS_EDGE(cref))
                         continue;
                     edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                    node u = blk.Gblk->source(e);
-                    node v = blk.Gblk->target(e);
+                    node u = blockEdgeSource(blk, e);
+                    node v = blockEdgeTarget(blk, e);
                     if (u == bS && v == bT) directST++;
                     else directTS++;
                 }
                 for (int q = 0; q < 2; ++q)
                 {
-                    std::vector<uint32_t> goodS, goodT;
+                    if ((q == 0 && !qPossible0) || (q == 1 && !qPossible1))
+                    {
+                        std::swap(directST, directTS);
+                        std::swap(bS, bT);
+                        continue;
+                    }
+                    uint32_t goodSCount = 0;
+                    uint32_t goodTCount = 0;
                     uint32_t singleGood = SPQR_INVALID;
                     int localOutSSum = directST;
                     int localInTSum = directST;
                     bool good = true;
+                    bool sameSetOk = true;
+                    int badSourcePole = 0;
+                    int badSinkPole = 0;
+                    int badSourcePoleNoWeakBack = 0;
+                    int badSinkPoleNoWeakBack = 0;
+                    int badAcyclicNoWeakBack = 0;
+                    int badGlobalSourceSink = 0;
+                    int badLeakage = 0;
                     auto weakBackBranch = [&](const EdgeDPState &state, int outS, int inT) {
                         int inS = (state.s == bS ? state.localInS : state.localInT);
                         int outT = (state.t == bT ? state.localOutT : state.localOutS);
@@ -2618,29 +5022,76 @@ namespace solver
                         localInTSum += localInT;
                         if (weakBackBranch(*state, localOutS, localInT))
                             continue;
-                        if (localOutS > 0) { goodS.push_back(i); singleGood = i; }
-                        if (localInT > 0) goodT.push_back(i);
+                        bool hasGoodS = localOutS > 0;
+                        bool hasGoodT = localInT > 0;
+                        sameSetOk &= (hasGoodS == hasGoodT);
+                        if (hasGoodS)
+                        {
+                            ++goodSCount;
+                            singleGood = i;
+                        }
+                        if (hasGoodT)
+                            ++goodTCount;
                         if ((state->s == bS && state->localInS > 0) || (state->s == bT && state->localInT > 0))
+                        {
                             good = false;
+                            ++badSourcePole;
+                            if (!(state->directTS || state->directST))
+                                ++badSourcePoleNoWeakBack;
+                        }
                         if ((state->t == bT && state->localOutT > 0) || (state->t == bS && state->localOutS > 0))
+                        {
                             good = false;
-                        good &= state->acyclic;
-                        good &= !state->globalSourceSink;
-                        good &= !state->hasLeakage;
+                            ++badSinkPole;
+                            if (!(state->directTS || state->directST))
+                                ++badSinkPoleNoWeakBack;
+                        }
+                        if (!state->acyclic)
+                        {
+                            good = false;
+                            if (!(state->directTS || state->directST))
+                                ++badAcyclicNoWeakBack;
+                        }
+                        if (state->globalSourceSink)
+                        {
+                            good = false;
+                            ++badGlobalSourceSink;
+                        }
+                        if (state->hasLeakage)
+                        {
+                            good = false;
+                            ++badLeakage;
+                        }
                     }
-                    good &= (ctx().weakSuperbubbles || directTS == 0);
-                    good &= goodS == goodT;
-                    good &= (!goodS.empty() || directST > 1);
-                    if (goodS.size() == 1 && singleGood != SPQR_INVALID)
+                    bool directOk = (ctx().weakSuperbubbles || directTS == 0);
+                    bool nonEmptyOk = (goodSCount > 0 || directST > 1);
+                    good &= directOk;
+                    good &= sameSetOk;
+                    good &= nonEmptyOk;
+                    bool singletonOk = true;
+                    if (goodSCount == 1 && singleGood != SPQR_INVALID)
                     {
                         uint32_t cref = view.children_ptr[m.children_offset + singleGood];
                         if (SP_COMPRESS_CHILD_IS_MACRO(cref))
                         {
                             const SpCompressNode &sub = view.macros_ptr[SP_COMPRESS_CHILD_AS_MACRO(cref)];
-                            good &= sub.kind != SP_COMPRESS_KIND_SERIES || (ctx().weakSuperbubbles && directST > 0);
+                            singletonOk = sub.kind != SP_COMPRESS_KIND_SERIES || (ctx().weakSuperbubbles && directST > 0);
                         }
                     }
-                    good &= (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
+                    good &= singletonOk;
+                    bool countsGood = (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
+                    good &= countsGood;
+                    bool onlyWeakBackFailures =
+                        badGlobalSourceSink == 0 && badLeakage == 0 &&
+                        badAcyclicNoWeakBack == 0 &&
+                        badSourcePoleNoWeakBack == 0 &&
+                        badSinkPoleNoWeakBack == 0;
+                    if (ctx().weakSuperbubbles && !good && countsGood &&
+                        directOk && sameSetOk && nonEmptyOk && singletonOk &&
+                        goodSCount > 1 && onlyWeakBackFailures)
+                    {
+                        good = true;
+                    }
                     if (good)
                     {
                         node rawS = cc.toOrig[blk.toCc[bS]];
@@ -2684,8 +5135,8 @@ namespace solver
                 if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                 {
                     edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                    node u = blk.Gblk->source(e);
-                    node v = blk.Gblk->target(e);
+                    node u = blockEdgeSource(blk, e);
+                    node v = blockEdgeTarget(blk, e);
                     if (u == st.s) st.localOutS--;
                     if (v == st.s) st.localInS--;
                     if (u == st.t) st.localOutT--;
@@ -2719,31 +5170,14 @@ namespace solver
             inline bool buildMacroSeriesPath(const SpCompressTreeView &view,
                                              const SpCompressNode &m,
                                              BlockData &blk,
-                                             std::vector<uint32_t> &order,
-                                             std::vector<uint32_t> &vertices)
+                                             std::vector<uint32_t> &order)
             {
-                struct PathChild
-                {
-                    uint32_t cref{SPQR_INVALID};
-                    uint32_t a{SPQR_INVALID};
-                    uint32_t b{SPQR_INVALID};
-                };
-                const uint32_t k = m.children_count;
-                std::vector<PathChild> children;
-                std::vector<std::pair<uint32_t, uint32_t>> incidence;
-                children.reserve(k);
-                incidence.reserve(static_cast<size_t>(k) * 2);
-                order.clear();
-                vertices.clear();
-                for (uint32_t i = 0; i < k; ++i)
-                {
-                    uint32_t cref = view.children_ptr[m.children_offset + i];
-                    uint32_t a = SPQR_INVALID, b = SPQR_INVALID;
+                auto childEndpoints = [&](uint32_t cref, uint32_t &a, uint32_t &b) {
                     if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                     {
                         edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                        a = blk.Gblk->source(e).idx;
-                        b = blk.Gblk->target(e).idx;
+                        a = blockEdgeSource(blk, e).idx;
+                        b = blockEdgeTarget(blk, e).idx;
                     }
                     else
                     {
@@ -2751,6 +5185,57 @@ namespace solver
                         a = sub.left;
                         b = sub.right;
                     }
+                };
+
+                const uint32_t k = m.children_count;
+                order.clear();
+                order.reserve(k);
+
+                uint32_t cur = m.left;
+                bool orderedPath = true;
+                for (uint32_t i = 0; i < k; ++i)
+                {
+                    uint32_t cref = view.children_ptr[m.children_offset + i];
+                    uint32_t a = SPQR_INVALID, b = SPQR_INVALID;
+                    childEndpoints(cref, a, b);
+                    if (a == SPQR_INVALID || b == SPQR_INVALID)
+                    {
+                        orderedPath = false;
+                        break;
+                    }
+                    uint32_t next = SPQR_INVALID;
+                    if (a == cur) next = b;
+                    else if (b == cur) next = a;
+                    else
+                    {
+                        orderedPath = false;
+                        break;
+                    }
+                    order.push_back(i);
+                    cur = next;
+                }
+                if (orderedPath && cur == m.right)
+                    return true;
+
+                struct PathChild
+                {
+                    uint32_t cref{SPQR_INVALID};
+                    uint32_t a{SPQR_INVALID};
+                    uint32_t b{SPQR_INVALID};
+                };
+                thread_local std::vector<PathChild> children;
+                thread_local std::vector<std::pair<uint32_t, uint32_t>> incidence;
+                thread_local std::vector<uint8_t> visited;
+                children.clear();
+                incidence.clear();
+                children.reserve(k);
+                incidence.reserve(static_cast<size_t>(k) * 2);
+                order.clear();
+                for (uint32_t i = 0; i < k; ++i)
+                {
+                    uint32_t cref = view.children_ptr[m.children_offset + i];
+                    uint32_t a = SPQR_INVALID, b = SPQR_INVALID;
+                    childEndpoints(cref, a, b);
                     if (a == SPQR_INVALID || b == SPQR_INVALID)
                         return false;
                     children.push_back(PathChild{cref, a, b});
@@ -2758,12 +5243,10 @@ namespace solver
                     incidence.emplace_back(b, i);
                 }
                 std::sort(incidence.begin(), incidence.end());
-                std::vector<uint8_t> visited(k, 0);
+                visited.assign(k, 0);
                 uint32_t current = m.left;
                 uint32_t prev = SPQR_INVALID;
-                vertices.push_back(current);
                 order.reserve(k);
-                vertices.reserve(static_cast<size_t>(k) + 1);
                 for (uint32_t step = 0; step < k; ++step)
                 {
                     auto it = std::lower_bound(
@@ -2789,7 +5272,6 @@ namespace solver
                     else return false;
                     visited[chosen] = 1;
                     order.push_back(chosen);
-                    vertices.push_back(next);
                     prev = chosen;
                     current = next;
                 }
@@ -2848,31 +5330,33 @@ namespace solver
                     for (uint32_t i = start; i < end; ++i)
                     {
                         const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge != SPQR_INVALID)
+                        uint32_t cref = SPQR_INVALID;
+                        if (coreSkeletonChildRef(view, se, cref))
                         {
-                            uint32_t cref = view.core_edges_ptr[se.real_edge].child;
                             addChildRefToState(total, cref, macroStates, blk);
                             if (SP_COMPRESS_CHILD_IS_EDGE(cref))
                             {
                                 edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
-                                node u = blk.Gblk->source(e);
-                                node v = blk.Gblk->target(e);
+                                node u = blockEdgeSource(blk, e);
+                                node v = blockEdgeTarget(blk, e);
                                 if (u == total.s && v == total.t) total.directST = true;
                                 if (u == total.t && v == total.s) total.directTS = true;
                             }
                         }
                         else
                         {
-                            uint32_t other = se.twin_tree_node;
+                            uint32_t other = SPQR_INVALID;
+                            if (!coreSkeletonTwin(c, se, other))
+                                continue;
                             mergeSubState(total, other == c.parents[tn] ? up[tn] : down[other]);
                         }
                     }
                     for (uint32_t i = start; i < end; ++i)
                     {
                         const SkeletonEdge &se = c.skelEdges[i];
-                        if (se.real_edge == SPQR_INVALID)
+                        uint32_t cref = SPQR_INVALID;
+                        if (!coreSkeletonChildRef(view, se, cref))
                             continue;
-                        uint32_t cref = view.core_edges_ptr[se.real_edge].child;
                         if (!SP_COMPRESS_CHILD_IS_MACRO(cref))
                             continue;
                         uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
@@ -2893,7 +5377,7 @@ namespace solver
                 for (uint32_t mid = 0; mid < M; ++mid)
                     if (out.parent[mid] == SPQR_INVALID)
                         stack.push_back(mid);
-                std::vector<uint32_t> order, vertices;
+                std::vector<uint32_t> order;
                 while (!stack.empty())
                 {
                     uint32_t pid = stack.back();
@@ -2931,7 +5415,7 @@ namespace solver
                     }
                     else
                     {
-                        if (!buildMacroSeriesPath(view, p, blk, order, vertices))
+                        if (!buildMacroSeriesPath(view, p, blk, order))
                             continue;
                         for (uint32_t i = 0; i < order.size(); ++i)
                         {
@@ -3005,7 +5489,8 @@ namespace solver
                                                 const std::vector<EdgeDPState> &down,
                                                 const std::vector<EdgeDPState> &up,
                                                 const CcData &cc,
-                                                BlockData &blk)
+                                                BlockData &blk,
+                                                const std::vector<PFixedAggEntry> *corePAgg = nullptr)
             {
                 for (uint32_t child = 0; child < c.len; ++child)
                 {
@@ -3043,31 +5528,1063 @@ namespace solver
                     blk.isAcycic &= (downSt.acyclic && upSt.acyclic);
                 }
                 for (uint32_t tn = 0; tn < c.len; ++tn)
+                {
+                    if (tryBubbleCorePNodeGroupingFixed(tn, c, corePAgg, cc, blk))
+                        continue;
                     tryBubbleCorePNodeGrouping(tn, c, view, macroStates, down, up, cc, blk);
-                collectMacroTreeSuperbubbles(view, macroStates, macroCtx, cc, blk);
+                }
+                if (!macroCtx.hasOutside.empty())
+                    collectMacroTreeSuperbubbles(view, macroStates, macroCtx, cc, blk);
                 for (uint32_t mid = 0; mid < view.macros_len; ++mid)
                     tryBubbleMacroPNodeGrouping(mid, view, macroStates, cc, blk);
             }
 
+            struct AQCoreEdgeTask
+            {
+                uint32_t child{SPQR_INVALID};
+                uint32_t parent{SPQR_INVALID};
+                bool currDown{true};
+                bool swap{false};
+                bool additionalCheck{false};
+            };
+
+            struct AQMacroEdgeTask
+            {
+                uint32_t macroId{SPQR_INVALID};
+                bool currDown{true};
+                bool swap{false};
+                bool additionalCheck{true};
+            };
+
+            struct AQContext
+            {
+                std::vector<AQCoreEdgeTask> coreEdgeTasks;
+                std::vector<uint32_t> corePNodes;
+                std::vector<AQMacroEdgeTask> macroEdgeTasks;
+                std::vector<uint32_t> macroPNodes;
+            };
+
+            inline AQContext buildAQContextFromSpqrTree(const CoreContext &c,
+                                                        const SpCompressTreeView &view,
+                                                        const MacroContext &macroCtx,
+                                                        bool skipMacroPNodes = false,
+                                                        bool skipCoreEdgeTasks = false)
+            {
+                AQContext aq;
+                if (!skipCoreEdgeTasks)
+                    aq.coreEdgeTasks.reserve(static_cast<size_t>(c.len) * 2);
+                aq.corePNodes.reserve(c.len / 4 + 1);
+                aq.macroPNodes.reserve(view.macros_len / 4 + 1);
+
+                auto addCore = [&](uint32_t child,
+                                   uint32_t parent,
+                                   bool currDown,
+                                   bool swap,
+                                   bool additionalCheck) {
+                    aq.coreEdgeTasks.push_back(AQCoreEdgeTask{
+                        child,
+                        parent,
+                        currDown,
+                        swap,
+                        additionalCheck});
+                };
+
+                if (!skipCoreEdgeTasks)
+                for (uint32_t child = 0; child < c.len; ++child)
+                {
+                    if (child == c.root)
+                        continue;
+                    uint32_t parent = c.parents[child];
+                    uint8_t parentType = c.types[parent];
+                    uint8_t childType = c.types[child];
+                    if ((childType == SPQR_NODE_TYPE_R && parentType != SPQR_NODE_TYPE_P) ||
+                        (childType == SPQR_NODE_TYPE_P && parentType == SPQR_NODE_TYPE_S))
+                    {
+                        bool check = childType == SPQR_NODE_TYPE_P;
+                        addCore(child, parent, true, false, check);
+                        addCore(child, parent, true, true, check);
+                    }
+                    if (childType == SPQR_NODE_TYPE_S && parentType == SPQR_NODE_TYPE_P)
+                    {
+                        addCore(child, parent, true, false, true);
+                        addCore(child, parent, true, true, true);
+                    }
+                    if ((parentType == SPQR_NODE_TYPE_R && childType != SPQR_NODE_TYPE_P) ||
+                        (parentType == SPQR_NODE_TYPE_P && childType == SPQR_NODE_TYPE_S))
+                    {
+                        bool check = parentType == SPQR_NODE_TYPE_P;
+                        addCore(child, parent, false, false, check);
+                        addCore(child, parent, false, true, check);
+                    }
+                    if (parentType == SPQR_NODE_TYPE_S && childType == SPQR_NODE_TYPE_P)
+                    {
+                        addCore(child, parent, false, false, true);
+                        addCore(child, parent, false, true, true);
+                    }
+                }
+
+                for (uint32_t tn = 0; tn < c.len; ++tn)
+                    if (c.types[tn] == SPQR_NODE_TYPE_P)
+                        aq.corePNodes.push_back(tn);
+
+                if (!macroCtx.outside.empty())
+                {
+                    aq.macroEdgeTasks.reserve(view.macros_len / 8 + 1);
+                    for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+                    {
+                        if (!macroCtx.hasOutside[mid])
+                            continue;
+                        uint32_t parentType = macroCtx.parentType[mid];
+                        if (parentType == SPQR_INVALID)
+                            continue;
+                        uint8_t childType = macroSpqrType(view.macros_ptr[mid]);
+                        if ((childType == SPQR_NODE_TYPE_P && parentType == SPQR_NODE_TYPE_S) ||
+                            (childType == SPQR_NODE_TYPE_S && parentType == SPQR_NODE_TYPE_P))
+                        {
+                            aq.macroEdgeTasks.push_back(AQMacroEdgeTask{mid, true, false, true});
+                            aq.macroEdgeTasks.push_back(AQMacroEdgeTask{mid, true, true, true});
+                        }
+                        if ((parentType == SPQR_NODE_TYPE_R && childType != SPQR_NODE_TYPE_P) ||
+                            (parentType == SPQR_NODE_TYPE_P && childType == SPQR_NODE_TYPE_S) ||
+                            (parentType == SPQR_NODE_TYPE_S && childType == SPQR_NODE_TYPE_P))
+                        {
+                            aq.macroEdgeTasks.push_back(AQMacroEdgeTask{mid, false, false, true});
+                            aq.macroEdgeTasks.push_back(AQMacroEdgeTask{mid, false, true, true});
+                        }
+                    }
+                }
+
+                if (!skipMacroPNodes)
+                {
+                    for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+                        if (view.macros_ptr[mid].kind == SP_COMPRESS_KIND_PARALLEL)
+                            aq.macroPNodes.push_back(mid);
+                }
+                return aq;
+            }
+
+            inline void executeAQContextFromSpqrTree(const AQContext &aq,
+                                                     const CoreContext &c,
+                                                     const SpCompressTreeView &view,
+                                                     const std::vector<EdgeDPState> &macroStates,
+                                                     const MacroContext &macroCtx,
+	                                                     const std::vector<EdgeDPState> &down,
+	                                                     const std::vector<EdgeDPState> &up,
+	                                                     const CcData &cc,
+		                                                     BlockData &blk,
+		                                                     const std::vector<PFixedAggEntry> *corePAgg = nullptr)
+	            {
+	                for (uint32_t child = 0; child < c.len; ++child)
+	                {
+	                    if (child == c.root)
+                        continue;
+                    blk.isAcycic &= (down[child].acyclic && up[child].acyclic);
+                }
+                for (const AQCoreEdgeTask &task : aq.coreEdgeTasks)
+                {
+                    const EdgeDPState &curr = task.currDown ? down[task.child] : up[task.child];
+                    const EdgeDPState &back = task.currDown ? up[task.child] : down[task.child];
+	                    tryBubble(curr, back, blk, cc, task.swap, task.additionalCheck);
+	                }
+		                for (uint32_t tn : aq.corePNodes)
+		                {
+		                    if (tryBubbleCorePNodeGroupingFixed(tn, c, corePAgg, cc, blk))
+	                        continue;
+		                    tryBubbleCorePNodeGrouping(tn, c, view, macroStates, down, up, cc, blk);
+		                }
+	                for (const AQMacroEdgeTask &task : aq.macroEdgeTasks)
+	                {
+	                    const EdgeDPState &downSt = macroStates[task.macroId];
+                    const EdgeDPState &upSt = macroCtx.outside[task.macroId];
+                    const EdgeDPState &curr = task.currDown ? downSt : upSt;
+                    const EdgeDPState &back = task.currDown ? upSt : downSt;
+	                    tryBubble(curr, back, blk, cc, task.swap, task.additionalCheck);
+	                }
+	                for (uint32_t mid : aq.macroPNodes)
+	                    tryBubbleMacroPNodeGrouping(mid, view, macroStates, cc, blk);
+		            }
+
+	            inline bool collectAQAtomsFromMinimizerMessages(const CoreScadView &scad,
+	                                                            const SpqraMinimizerView &minView,
+	                                                            const SpCompressTreeView &view,
+	                                                            const std::vector<EdgeDPState> &macroStates,
+	                                                            const std::vector<EdgeDPState> &down,
+	                                                            const std::vector<EdgeDPState> &up,
+	                                                            const CcData &cc,
+	                                                            BlockData &blk)
+	            {
+	                if (!minimizerDirectCollectRequested())
+	                {
+	                    if (!minimizerMessageKernelRequested())
+	                        return false;
+	                }
+	                if (!scad.components_ptr || !scad.incidences_ptr ||
+	                    !minView.components_ptr || !minView.edges_ptr ||
+	                    !minView.node_mapping_ptr || minView.components_len == 0 ||
+	                    minView.components_len != scad.components_len ||
+	                    minView.edges_len != scad.edges_len ||
+	                    minView.node_mapping_len == 0 ||
+	                    minView.summary.bad_twin_count != 0)
+	                {
+	                    return false;
+	                }
+
+		                const bool coreEdgesAlreadyEmitted =
+		                    std::getenv("BF_SPQRA_CORE_EXACT_EMIT_DURING_UP") != nullptr &&
+		                    !minimizerMessageKernelRequested();
+		                for (uint32_t ii = 0; ii < scad.incidences_len; ++ii)
+	                {
+	                    uint32_t twin = SPQR_INVALID;
+	                    if (!scadValidTwinPair(scad, ii, twin) || ii > twin)
+	                        continue;
+	                    const uint32_t a = scad.incidences_ptr[ii].component_id;
+	                    const uint32_t b = scad.incidences_ptr[twin].component_id;
+		                    if (a >= minView.components_len || b >= minView.components_len)
+		                    {
+		                        continue;
+		                    }
+
+	                    uint32_t child = SPQR_INVALID;
+	                    uint32_t parent = SPQR_INVALID;
+	                    uint32_t childPort = SPQR_INVALID;
+	                    uint32_t parentPort = SPQR_INVALID;
+	                    if (minView.components_ptr[a].parent == b)
+	                    {
+	                        child = a;
+	                        parent = b;
+	                        childPort = ii;
+	                        parentPort = twin;
+	                    }
+	                    else if (minView.components_ptr[b].parent == a)
+	                    {
+	                        child = b;
+	                        parent = a;
+	                        childPort = twin;
+	                        parentPort = ii;
+	                    }
+		                    else
+		                    {
+		                        continue;
+		                    }
+
+	                    const EdgeDPState *downSt =
+	                        minimizerPortMessage(childPort, scad, minView, down, up);
+	                    const EdgeDPState *upSt =
+	                        minimizerPortMessage(parentPort, scad, minView, down, up);
+		                    if (!downSt || !upSt)
+		                    {
+		                        continue;
+		                    }
+
+	                    const uint8_t childType =
+	                        scadKindToSpqrType(minView.components_ptr[child].kind);
+	                    const uint8_t parentType =
+	                        scadKindToSpqrType(minView.components_ptr[parent].kind);
+		                    if (!coreEdgesAlreadyEmitted)
+		                    {
+		                        tryCoreTreeEdgeBubblesByTypes(childType, parentType,
+		                                                      *downSt, *upSt, cc, blk);
+		                    }
+		                    blk.isAcycic &= (downSt->acyclic && upSt->acyclic);
+		                }
+
+		                std::vector<uint32_t> edgeToInc;
+	                edgeToInc.assign(scad.edges_len, SPQR_INVALID);
+	                for (uint32_t ii = 0; ii < scad.incidences_len; ++ii)
+	                {
+	                    const FfiScadIncidence &inc = scad.incidences_ptr[ii];
+	                    if (inc.component_id >= scad.components_len)
+	                        continue;
+	                    const FfiScadComponent &comp = scad.components_ptr[inc.component_id];
+	                    const uint32_t ge = comp.edge_begin + inc.local_edge_id;
+	                    if (ge < scad.edges_len && ge < edgeToInc.size())
+	                        edgeToInc[ge] = ii;
+	                }
+
+	                for (uint32_t ci = 0; ci < minView.components_len; ++ci)
+	                {
+	                    const FfiSpqraMinimizerComponent &comp = minView.components_ptr[ci];
+		                    if (scadKindToSpqrType(comp.kind) != SPQR_NODE_TYPE_P)
+		                        continue;
+		                    const uint32_t pole0 = minimizerLocalBlockId(minView, blk, comp, 0);
+		                    const uint32_t pole1 = minimizerLocalBlockId(minView, blk, comp, 1);
+		                    if (pole0 == SPQR_INVALID || pole1 == SPQR_INVALID)
+		                    {
+		                        continue;
+		                    }
+
+	                    PFixedAggEntry entry;
+	                    node bS{pole0};
+	                    node bT{pole1};
+	                    const uint32_t edgeEnd = std::min(comp.edge_end, minView.edges_len);
+	                    for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                    {
+	                        const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                        if (me.flags & SPQRA_MIN_EDGE_VIRTUAL)
+	                        {
+		                            if (me.twin_component >= minView.components_len)
+		                            {
+		                                continue;
+		                            }
+	                            const FfiSpqraMinimizerComponent &twComp =
+	                                minView.components_ptr[me.twin_component];
+	                            const uint32_t twGe =
+	                                twComp.edge_begin + me.twin_local_edge;
+		                            if (twGe >= edgeToInc.size())
+		                            {
+		                                continue;
+		                            }
+	                            const uint32_t twPort = edgeToInc[twGe];
+	                            const EdgeDPState *state =
+	                                minimizerPortMessage(twPort, scad, minView, down, up);
+		                            if (!state)
+		                            {
+		                                continue;
+		                            }
+	                            const bool seriesLike =
+	                                me.twin_component < minView.components_len &&
+	                                scadKindToSpqrType(
+	                                    minView.components_ptr[me.twin_component].kind) ==
+	                                    SPQR_NODE_TYPE_S;
+	                            entry.fwd.addBranch(*state, bS, bT, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(*state, bT, bS, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            continue;
+	                        }
+
+	                        if ((me.flags & SPQRA_MIN_EDGE_HAS_CHILD_REF) == 0)
+	                            continue;
+	                        const uint32_t cref = me.child_ref;
+	                        if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+	                        {
+	                            edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+	                            node u = blockEdgeSource(blk, e);
+	                            node v = blockEdgeTarget(blk, e);
+	                            if (u == bS && v == bT)
+	                                ++entry.directST;
+	                            else
+	                                ++entry.directTS;
+	                        }
+	                        else
+	                        {
+	                            const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+		                            if (mid >= macroStates.size() || mid >= view.macros_len)
+		                            {
+		                                continue;
+		                            }
+	                            const bool seriesLike =
+	                                view.macros_ptr[mid].kind == SP_COMPRESS_KIND_SERIES;
+	                            entry.fwd.addBranch(macroStates[mid], bS, bT, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(macroStates[mid], bT, bS, seriesLike,
+	                                                PFixedAggMode::Core);
+	                        }
+	                    }
+	                    entry.valid = 1;
+	                    emitPFixedAggCandidate(entry.fwd,
+	                                           bS,
+	                                           bT,
+	                                           entry.directST,
+	                                           entry.directTS,
+	                                           true,
+	                                           cc,
+	                                           blk);
+	                    emitPFixedAggCandidate(entry.rev,
+	                                           bT,
+	                                           bS,
+	                                           entry.directTS,
+	                                           entry.directST,
+	                                           true,
+		                                           cc,
+		                                           blk);
+		                }
+		                return true;
+		            }
+
+	            inline uint64_t emitBehaviorAtomInternalCoreEdges(
+	                const SpqraBehaviorAtomView &atoms,
+	                const SpqraBehaviorAtomStates &atomStates,
+	                const CcData &cc,
+	                BlockData &blk,
+	                uint64_t *badPorts = nullptr)
+	            {
+	                if (!emitNestedAtomCoreEdgesRequested() ||
+	                    !atoms.atoms_ptr || !atoms.items_ptr)
+	                    return 0;
+	                uint64_t taskCount = 0;
+	                uint64_t bad = 0;
+	                for (uint32_t parentId = 0; parentId < atoms.atoms_len; ++parentId)
+	                {
+	                    const FfiSpqraBehaviorAtom &parent = atoms.atoms_ptr[parentId];
+	                    const uint8_t parentType = scadKindToSpqrType(parent.kind);
+	                    const uint32_t itemBegin = std::min(parent.item_begin, atoms.items_len);
+	                    const uint32_t itemEnd = std::min(parent.item_end, atoms.items_len);
+	                    for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+	                    {
+	                        const FfiSpqraBehaviorAtomItem &item = atoms.items_ptr[ii];
+	                        if ((item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM) == 0)
+	                            continue;
+	                        const uint32_t childId = item.child_ref;
+	                        if (childId >= atoms.atoms_len ||
+	                            childId >= atomStates.fwd.size() ||
+	                            childId >= atomStates.rev.size() ||
+	                            childId >= atomStates.outside.size())
+	                        {
+	                            ++bad;
+	                            continue;
+	                        }
+	                        const EdgeDPState *inside =
+	                            nestedBehaviorAtomStateForItem(item,
+	                                                           atoms,
+	                                                           atomStates.fwd,
+	                                                           atomStates.rev,
+	                                                           blk,
+	                                                           parentId);
+	                        const EdgeDPState &outside = atomStates.outside[childId];
+	                        if (!inside || !inside->s || !inside->t ||
+	                            !outside.s || !outside.t)
+	                        {
+	                            ++bad;
+	                            continue;
+	                        }
+	                        const uint8_t childType =
+	                            scadKindToSpqrType(atoms.atoms_ptr[childId].kind);
+	                        taskCount +=
+	                            scadTreeEdgeSideObservableMessages(childType, parentType) +
+	                            scadTreeEdgeSideObservableMessages(parentType, childType);
+	                        tryCoreTreeEdgeBubblesByTypes(childType,
+	                                                      parentType,
+	                                                      *inside,
+	                                                      outside,
+	                                                      cc,
+	                                                      blk);
+	                    }
+	                }
+	                if (badPorts)
+	                    *badPorts += bad;
+	                return taskCount;
+	            }
+
+	            inline bool collectAQAtomsFromMinimizerViewMessages(const SpqraMinimizerView &minView,
+	                                                                const SpCompressTreeView &view,
+	                                                                const std::vector<EdgeDPState> &macroStates,
+	                                                                const std::vector<EdgeDPState> &down,
+	                                                                const std::vector<EdgeDPState> &up,
+	                                                                const CcData &cc,
+	                                                                BlockData &blk,
+	                                                                const SpqraBehaviorAtomStates *atomStates = nullptr)
+	            {
+	                if (!minimizerMessageKernelRequested())
+	                    return false;
+	                if (!minView.components_ptr || !minView.edges_ptr ||
+	                    !minView.node_mapping_ptr || minView.components_len == 0 ||
+	                    minView.summary.bad_twin_count != 0)
+	                {
+	                    return false;
+	                }
+
+		                for (uint32_t child = 0; child < minView.components_len; ++child)
+	                {
+	                    const FfiSpqraMinimizerComponent &comp =
+	                        minView.components_ptr[child];
+	                    const uint32_t parent = comp.parent;
+	                    if (parent == SPQR_INVALID || parent >= minView.components_len)
+	                        continue;
+		                    if (child >= down.size() || child >= up.size())
+		                    {
+		                        continue;
+		                    }
+	                    const EdgeDPState &downSt = down[child];
+	                    const EdgeDPState &upSt = up[child];
+	                    const uint8_t childType = scadKindToSpqrType(comp.kind);
+	                    const uint8_t parentType =
+	                        scadKindToSpqrType(minView.components_ptr[parent].kind);
+			                    tryCoreTreeEdgeBubblesByTypes(childType, parentType,
+			                                                  downSt, upSt, cc, blk);
+		                    blk.isAcycic &= (downSt.acyclic && upSt.acyclic);
+		                }
+
+		                std::vector<uint8_t> emittedAtomP;
+	                if (atomStates && blk.spqraBehaviorAtomView.atoms_ptr)
+	                {
+	                    emittedAtomP.assign(blk.spqraBehaviorAtomView.atoms_len, 0);
+	                    for (uint32_t ci = 0; ci < minView.components_len; ++ci)
+	                    {
+	                        const FfiSpqraMinimizerComponent &comp = minView.components_ptr[ci];
+	                        const uint8_t parentType = scadKindToSpqrType(comp.kind);
+	                        const uint32_t edgeEnd = std::min(comp.edge_end, minView.edges_len);
+	                        for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                        {
+	                            const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                            if ((me.flags & SPQRA_MIN_EDGE_HAS_BEHAVIOR_ATOM) == 0)
+	                                continue;
+	                            const uint32_t atomId = me.child_ref;
+	                            if (atomId >= atomStates->fwd.size() ||
+	                                atomId >= atomStates->outside.size() ||
+	                                atomId >= blk.spqraBehaviorAtomView.atoms_len)
+	                                continue;
+	                            const EdgeDPState *inside =
+	                                behaviorAtomStateForEdge(*atomStates, me, minView, blk, comp);
+	                            if (!inside)
+	                                continue;
+	                            const EdgeDPState &outside = atomStates->outside[atomId];
+	                            const uint8_t atomType =
+	                                scadKindToSpqrType(blk.spqraBehaviorAtomView.atoms_ptr[atomId].kind);
+		                            tryCoreTreeEdgeBubblesByTypes(atomType,
+	                                                          parentType,
+	                                                          *inside,
+	                                                          outside,
+	                                                          cc,
+	                                                          blk);
+		                            if (atomType == SPQR_NODE_TYPE_P &&
+		                                atomId < emittedAtomP.size() &&
+		                                !emittedAtomP[atomId])
+		                            {
+		                                emittedAtomP[atomId] = 1;
+			                                const FfiSpqraBehaviorAtom &atom =
+			                                    blk.spqraBehaviorAtomView.atoms_ptr[atomId];
+				                                if (!blk.spqraBehaviorAtomView.items_ptr)
+				                                {
+			                                    continue;
+			                                }
+			                                if (!outside.s || !outside.t)
+			                                {
+			                                    continue;
+			                                }
+		                                PFixedAggEntry entry;
+		                                node bS{inside->s.idx};
+		                                node bT{inside->t.idx};
+		                                const uint32_t itemBegin =
+		                                    std::min(atom.item_begin,
+		                                             blk.spqraBehaviorAtomView.items_len);
+		                                const uint32_t itemEnd =
+		                                    std::min(atom.item_end,
+		                                             blk.spqraBehaviorAtomView.items_len);
+		                                for (uint32_t ii = itemBegin; ii < itemEnd; ++ii)
+	                                {
+	                                    const FfiSpqraBehaviorAtomItem &item =
+	                                        blk.spqraBehaviorAtomView.items_ptr[ii];
+		                                    if (item.flags & SPQRA_MIN_ATOM_ITEM_CHILD_REF)
+		                                    {
+		                                        const uint32_t cref = item.child_ref;
+		                                        if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+		                                        {
+		                                            edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+		                                            node u = blockEdgeSource(blk, e);
+		                                            node v = blockEdgeTarget(blk, e);
+		                                            if (u == bS && v == bT)
+		                                                ++entry.directST;
+		                                            else
+		                                                ++entry.directTS;
+		                                        }
+		                                        else
+		                                        {
+		                                            const uint32_t mid =
+		                                                SP_COMPRESS_CHILD_AS_MACRO(cref);
+			                                            if (mid >= macroStates.size() ||
+			                                                mid >= view.macros_len)
+			                                            {
+			                                                continue;
+			                                            }
+		                                            const bool seriesLike =
+		                                                view.macros_ptr[mid].kind ==
+		                                                SP_COMPRESS_KIND_SERIES;
+		                                            entry.fwd.addBranch(macroStates[mid],
+		                                                                bS,
+		                                                                bT,
+		                                                                seriesLike,
+		                                                                PFixedAggMode::Core);
+		                                            entry.rev.addBranch(macroStates[mid],
+		                                                                bT,
+		                                                                bS,
+		                                                                seriesLike,
+		                                                                PFixedAggMode::Core);
+		                                        }
+		                                    }
+		                                    else if (item.flags & SPQRA_MIN_ATOM_ITEM_BEHAVIOR_ATOM)
+		                                    {
+		                                        const EdgeDPState *nested =
+		                                            nestedBehaviorAtomStateForItem(item,
+		                                                                           blk.spqraBehaviorAtomView,
+		                                                                           atomStates->fwd,
+		                                                                           atomStates->rev,
+		                                                                           blk,
+		                                                                           atomId);
+			                                        if (!nested)
+			                                        {
+			                                            continue;
+			                                        }
+		                                        const bool seriesLike =
+		                                            item.child_ref < blk.spqraBehaviorAtomView.atoms_len &&
+		                                            scadKindToSpqrType(blk.spqraBehaviorAtomView.atoms_ptr[item.child_ref].kind) ==
+		                                                SPQR_NODE_TYPE_S;
+		                                        entry.fwd.addBranch(*nested,
+		                                                            bS,
+		                                                            bT,
+		                                                            seriesLike,
+		                                                            PFixedAggMode::Core);
+		                                        entry.rev.addBranch(*nested,
+		                                                            bT,
+		                                                            bS,
+		                                                            seriesLike,
+		                                                            PFixedAggMode::Core);
+		                                    }
+	                                }
+	                                const bool outsideSeriesLike =
+	                                    parentType == SPQR_NODE_TYPE_S;
+	                                entry.fwd.addBranch(outside,
+	                                                    bS,
+	                                                    bT,
+	                                                    outsideSeriesLike,
+	                                                    PFixedAggMode::Core);
+		                                entry.rev.addBranch(outside,
+		                                                    bT,
+		                                                    bS,
+		                                                    outsideSeriesLike,
+		                                                    PFixedAggMode::Core);
+		                                entry.valid = 1;
+		                                emitPFixedAggCandidate(entry.fwd,
+	                                                       bS,
+	                                                       bT,
+	                                                       entry.directST,
+	                                                       entry.directTS,
+	                                                       true,
+	                                                       cc,
+	                                                       blk);
+	                                emitPFixedAggCandidate(entry.rev,
+	                                                       bT,
+	                                                       bS,
+	                                                       entry.directTS,
+	                                                       entry.directST,
+	                                                       true,
+	                                                       cc,
+	                                                       blk);
+	                            }
+	                        }
+	                    }
+	                }
+
+	                if (atomStates && blk.spqraBehaviorAtomView.atoms_ptr)
+	                {
+		                    emitBehaviorAtomInternalCoreEdges(
+		                        blk.spqraBehaviorAtomView,
+		                        *atomStates,
+		                        cc,
+		                        blk,
+		                        nullptr);
+	                }
+
+	                if (atomStates && blk.spqraBehaviorAtomView.atoms_ptr &&
+	                    std::getenv("BF_SPQRA_NESTED_ATOM_OUTSIDE") != nullptr)
+	                {
+		                    for (uint32_t atomId = 0;
+		                         atomId < blk.spqraBehaviorAtomView.atoms_len &&
+		                         atomId < emittedAtomP.size();
+		                         ++atomId)
+		                    {
+		                        if (emittedAtomP[atomId])
+		                            continue;
+		                        if (emitBehaviorAtomPFixedAgg(atomId,
+		                                                      blk.spqraBehaviorAtomView,
+		                                                      *atomStates,
+		                                                      macroStates,
+		                                                      view,
+		                                                      cc,
+		                                                      blk))
+			                        {
+				                            emittedAtomP[atomId] = 1;
+				                        }
+			                    }
+		                }
+
+			                for (uint32_t ci = 0; ci < minView.components_len; ++ci)
+			                {
+	                    const FfiSpqraMinimizerComponent &comp = minView.components_ptr[ci];
+		                    if (scadKindToSpqrType(comp.kind) != SPQR_NODE_TYPE_P)
+		                        continue;
+			                    const uint32_t pole0 = minimizerLocalBlockId(minView, blk, comp, 0);
+		                    const uint32_t pole1 = minimizerLocalBlockId(minView, blk, comp, 1);
+		                    if (pole0 == SPQR_INVALID || pole1 == SPQR_INVALID)
+		                    {
+		                        continue;
+		                    }
+
+	                    PFixedAggEntry entry;
+	                    node bS{pole0};
+	                    node bT{pole1};
+	                    const uint32_t edgeEnd = std::min(comp.edge_end, minView.edges_len);
+	                    for (uint32_t ge = comp.edge_begin; ge < edgeEnd; ++ge)
+	                    {
+	                        const FfiSpqraMinimizerEdge &me = minView.edges_ptr[ge];
+	                        if ((me.flags & SPQRA_MIN_EDGE_HAS_BEHAVIOR_ATOM) && atomStates)
+	                        {
+	                            const uint32_t atomId = me.child_ref;
+		                            if (atomId >= atomStates->fwd.size() ||
+		                                atomId >= blk.spqraBehaviorAtomView.atoms_len)
+		                            {
+		                                continue;
+		                            }
+	                            const EdgeDPState *state =
+	                                behaviorAtomStateForEdge(*atomStates, me, minView, blk, comp);
+		                            if (!state)
+		                            {
+		                                continue;
+		                            }
+	                            const bool seriesLike =
+	                                scadKindToSpqrType(blk.spqraBehaviorAtomView.atoms_ptr[atomId].kind) ==
+	                                SPQR_NODE_TYPE_S;
+	                            entry.fwd.addBranch(*state, bS, bT, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(*state, bT, bS, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            continue;
+	                        }
+		                        if (me.flags & SPQRA_MIN_EDGE_VIRTUAL)
+		                        {
+			                            if (me.twin_component >= minView.components_len)
+		                            {
+		                                continue;
+		                            }
+	                            const FfiSpqraMinimizerComponent &twComp =
+	                                minView.components_ptr[me.twin_component];
+	                            const uint32_t twGe =
+	                                twComp.edge_begin + me.twin_local_edge;
+		                            if (twGe >= minView.edges_len)
+		                            {
+		                                continue;
+		                            }
+	                            const EdgeDPState *state =
+	                                minimizerViewEdgeMessage(me.twin_component,
+	                                                         minView.edges_ptr[twGe],
+	                                                         minView,
+	                                                         down,
+	                                                         up);
+		                            if (!state)
+		                            {
+		                                continue;
+		                            }
+	                            const bool seriesLike =
+	                                scadKindToSpqrType(twComp.kind) == SPQR_NODE_TYPE_S;
+	                            entry.fwd.addBranch(*state, bS, bT, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(*state, bT, bS, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            continue;
+	                        }
+
+		                        if ((me.flags & SPQRA_MIN_EDGE_HAS_CHILD_REF) == 0)
+		                            continue;
+		                        const uint32_t cref = me.child_ref;
+	                        if (SP_COMPRESS_CHILD_IS_EDGE(cref))
+	                        {
+	                            edge e{SP_COMPRESS_CHILD_AS_EDGE(cref)};
+	                            node u = blockEdgeSource(blk, e);
+	                            node v = blockEdgeTarget(blk, e);
+	                            if (u == bS && v == bT)
+	                                ++entry.directST;
+	                            else
+	                                ++entry.directTS;
+	                        }
+	                        else
+	                        {
+	                            const uint32_t mid = SP_COMPRESS_CHILD_AS_MACRO(cref);
+		                            if (mid >= macroStates.size() || mid >= view.macros_len)
+		                            {
+		                                continue;
+		                            }
+	                            const bool seriesLike =
+	                                view.macros_ptr[mid].kind == SP_COMPRESS_KIND_SERIES;
+	                            entry.fwd.addBranch(macroStates[mid], bS, bT, seriesLike,
+	                                                PFixedAggMode::Core);
+	                            entry.rev.addBranch(macroStates[mid], bT, bS, seriesLike,
+	                                                PFixedAggMode::Core);
+	                        }
+	                    }
+	                    entry.valid = 1;
+	                    emitPFixedAggCandidate(entry.fwd,
+	                                           bS,
+	                                           bT,
+	                                           entry.directST,
+	                                           entry.directTS,
+	                                           true,
+	                                           cc,
+	                                           blk);
+	                    emitPFixedAggCandidate(entry.rev,
+	                                           bT,
+	                                           bS,
+	                                           entry.directTS,
+	                                           entry.directST,
+	                                           true,
+		                                           cc,
+		                                           blk);
+		                }
+		                return true;
+		            }
+
+	            inline void collectAQAtomsLiveCoreDirect(const CoreContext &c,
+	                                                     const SpCompressTreeView &view,
+                                                     const std::vector<EdgeDPState> &macroStates,
+                                                     const std::vector<EdgeDPState> &down,
+	                                                     const std::vector<EdgeDPState> &up,
+	                                                     const CcData &cc,
+		                                                     BlockData &blk,
+		                                                     const std::vector<PFixedAggEntry> *corePAgg = nullptr)
+	            {
+		                const bool coreEdgesAlreadyEmitted =
+	                    std::getenv("BF_SPQRA_CORE_EXACT_EMIT_DURING_UP") != nullptr;
+
+                for (uint32_t child = 0; child < c.len; ++child)
+                {
+                    if (child == c.root)
+                        continue;
+	                    uint32_t parent = c.parents[child];
+	                    const EdgeDPState &downSt = down[child];
+	                    const EdgeDPState &upSt = up[child];
+	                    if (!coreEdgesAlreadyEmitted)
+	                    {
+	                        tryCoreTreeEdgeBubbles(child, parent, c, downSt, upSt, cc, blk);
+                    }
+	                    blk.isAcycic &= (downSt.acyclic && upSt.acyclic);
+	                }
+
+	                for (uint32_t tn = 0; tn < c.len; ++tn)
+	                {
+		                    if (c.types[tn] != SPQR_NODE_TYPE_P)
+	                        continue;
+	                    if (tryBubbleCorePNodeGroupingFixed(tn, c, corePAgg, cc, blk))
+	                        continue;
+	                    tryBubbleCorePNodeGrouping(tn, c, view, macroStates, down, up, cc, blk);
+	                }
+	            }
+
+            inline void executeCorePortKernelFromScad(const CoreScadView &scad,
+                                                      const CoreContext &c,
+                                                      const SpCompressTreeView &view,
+                                                      const std::vector<EdgeDPState> &macroStates,
+                                                      const std::vector<EdgeDPState> &down,
+                                                      const std::vector<EdgeDPState> &up,
+                                                      const CcData &cc,
+                                                      BlockData &blk,
+	                                                      bool emitCoreEdges,
+		                                                      bool emitCorePNodes,
+		                                                      const std::vector<PFixedAggEntry> *corePAgg = nullptr)
+	            {
+	                if (emitCoreEdges && scad.incidences_ptr && scad.components_ptr)
+                {
+                    for (uint32_t ii = 0; ii < scad.incidences_len; ++ii)
+                    {
+                        uint32_t twin = SPQR_INVALID;
+                        if (!scadValidTwinPair(scad, ii, twin) || ii > twin)
+                            continue;
+                        const uint32_t a = scad.incidences_ptr[ii].component_id;
+                        const uint32_t b = scad.incidences_ptr[twin].component_id;
+                        uint32_t child = SPQR_INVALID;
+                        uint32_t parent = SPQR_INVALID;
+                        if (a < c.len && b < c.len && a != c.root && c.parents[a] == b)
+                        {
+                            child = a;
+                            parent = b;
+                        }
+                        else if (a < c.len && b < c.len && b != c.root && c.parents[b] == a)
+                        {
+                            child = b;
+                            parent = a;
+                        }
+	                        else
+	                        {
+	                            continue;
+	                        }
+	                        tryCoreTreeEdgeBubbles(child, parent, c, down[child], up[child],
+                                               cc, blk);
+	                        blk.isAcycic &= (down[child].acyclic && up[child].acyclic);
+	                    }
+	                }
+
+	                if (emitCorePNodes)
+                {
+                    for (uint32_t tn = 0; tn < c.len; ++tn)
+                    {
+	                        if (c.types[tn] != SPQR_NODE_TYPE_P)
+	                            continue;
+	                        if (tryBubbleCorePNodeGroupingFixed(tn, c, corePAgg, cc, blk))
+                            continue;
+	                        tryBubbleCorePNodeGrouping(tn, c, view, macroStates, down, up, cc, blk);
+	                    }
+	                }
+	            }
+
             inline bool solveSPQRMacroDirect(BlockData &blk, const CcData &cc)
             {
-                if (!blk.spCompressHandle)
-                    return false;
-                CoreContext core;
-                if (!buildCoreContext(blk, core))
-                    return false;
-                const SpCompressTreeView &view = blk.macroTreeView;
+	                if (!blk.spCompressHandle)
+	                    return false;
+	                const SpCompressTreeView &view = blk.macroTreeView;
+                const bool aqAtoms = spqra_profile::aqAtomsRequested();
+                const bool atomMacroPEnabled = aqAtoms && macroPAtomTracingDisabled();
+                const bool portKernel = spqra_profile::portKernelRequested();
+                const bool directCoreScad =
+                    spqra_profile::aqDirectCoreScadRequested() ||
+                    (aqAtoms && !spqra_profile::aqAtomsUseSpqrTreeFallback());
+	                if (aqAtoms && atomMacroPEnabled &&
+	                    minimizerMessageKernelRequested() &&
+	                    !spqra_profile::aqContextRequested() &&
+	                    blk.spqraMinimizerView.components_ptr &&
+	                    blk.spqraMinimizerView.edges_ptr &&
+	                    blk.spqraMinimizerView.node_mapping_ptr &&
+	                    (minimizerViewCollectRequested() ||
+		                     blk.coreScadView.incidences_ptr))
+		                {
+		                    populateMinimizerLocalBlockIds(blk);
+		                    auto macroStates = computeMacroStates(view, blk, &cc, true);
+		                    SpqraBehaviorAtomStates atomStates =
+		                        computeBehaviorAtomStates(blk.spqraBehaviorAtomView,
+	                                                  macroStates,
+	                                                  blk);
+	                    std::vector<NodeDPState> nodeDp(blk.spqraMinimizerView.components_len);
+                    auto down = computeMinimizerDownStates(blk.spqraMinimizerView,
+                                                           macroStates,
+                                                           blk,
+	                                                           nodeDp,
+	                                                           &atomStates);
+		                    std::vector<EdgeDPState> up(blk.spqraMinimizerView.components_len);
+		                    computeMinimizerUpStates(blk.spqraMinimizerView,
+			                                             macroStates,
+			                                             blk,
+		                                             down,
+		                                             up,
+		                                             nodeDp,
+		                                             &atomStates);
+		                    computeNestedBehaviorAtomOutsideStates(blk.spqraBehaviorAtomView,
+		                                                           macroStates,
+		                                                           blk,
+		                                                           atomStates);
+		                    if (minimizerViewCollectRequested())
+		                    {
+	                        collectAQAtomsFromMinimizerViewMessages(blk.spqraMinimizerView,
+	                                                                view,
+	                                                                macroStates,
+	                                                                down,
+	                                                                up,
+	                                                                cc,
+	                                                                blk,
+	                                                                &atomStates);
+	                    }
+	                    else
+	                    {
+		                        collectAQAtomsFromMinimizerMessages(blk.coreScadView,
+		                                                             blk.spqraMinimizerView,
+		                                                             view,
+		                                                             macroStates,
+		                                                             down,
+		                                                             up,
+			                                                             cc,
+			                                                             blk);
+		                    }
+		                    return true;
+		                }
+                if (!blk.coreSpqrTree &&
+                    (view.stats.fully_sp_reducible != 0 || view.core_edges_len == 0))
+                {
+                    auto macroStates = computeMacroStates(view, blk,
+                                                          atomMacroPEnabled ? &cc : nullptr,
+                                                          atomMacroPEnabled);
+                    if (!atomMacroPEnabled)
+	                    {
+	                        for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+	                            tryBubbleMacroPNodeGrouping(mid, view, macroStates, cc, blk);
+	                    }
+	                    return true;
+	                }
+	                CoreContext core;
+                {
+                    bool builtCore = false;
+                    if (directCoreScad)
+                        builtCore = buildCoreContextFromScadView(blk, core);
+                    if (!builtCore)
+                        builtCore = buildCoreContext(blk, core);
+                    if (!builtCore)
+                        return false;
+                }
                 if (view.macros_len == 0)
                     return false;
-                auto macroStates = computeMacroStates(view, blk);
-                std::vector<NodeDPState> nodeDp(core.len);
-                auto down = computeCoreDownStates(core, view, macroStates, blk, nodeDp);
-                std::vector<EdgeDPState> up(core.len);
-                computeCoreUpStates(core, view, macroStates, blk, down, up, nodeDp);
-                auto macroCtx = computeMacroOutsideStates(core, view, macroStates, down, up, blk);
-                collectCoreSuperbubbles(core, view, macroStates, macroCtx, down, up, cc, blk);
-                return true;
-            }
+                if (!blk.coreSpqrTree && !directCoreScad)
+                {
+                    auto macroStates = computeMacroStates(view, blk,
+                                                          atomMacroPEnabled ? &cc : nullptr,
+                                                          atomMacroPEnabled);
+                    if (!atomMacroPEnabled)
+                    {
+                        for (uint32_t mid = 0; mid < view.macros_len; ++mid)
+                            tryBubbleMacroPNodeGrouping(mid, view, macroStates, cc, blk);
+                    }
+	                    return true;
+	                }
+	                auto macroStates = computeMacroStates(view, blk,
+	                                                      atomMacroPEnabled ? &cc : nullptr,
+	                                                      atomMacroPEnabled);
+		                std::vector<NodeDPState> nodeDp(core.len);
+		                auto down = computeCoreDownStates(core, view, macroStates, blk, nodeDp);
+		                std::vector<EdgeDPState> up(core.len);
+	                std::vector<PFixedAggEntry> corePAgg;
+	                std::vector<PFixedAggEntry> *corePAggPtr =
+	                    corePFixedAggRequested() ? &corePAgg : nullptr;
+		                computeCoreUpStates(core, view, macroStates, blk, down, up, nodeDp,
+		                                    &cc, corePAggPtr);
+                MacroContext macroCtx;
+                if (spqra_profile::aqContextRequested() || directCoreScad || aqAtoms)
+                {
+                    const bool coreEdgesAlreadyEmitted =
+                        std::getenv("BF_SPQRA_CORE_EXACT_EMIT_DURING_UP") != nullptr;
+                    if (portKernel && aqAtoms && atomMacroPEnabled && macroCtx.outside.empty() &&
+                        !spqra_profile::aqContextRequested())
+                    {
+		                        executeCorePortKernelFromScad(blk.coreScadView, core, view,
+		                                                      macroStates, down, up, cc, blk,
+		                                                      !coreEdgesAlreadyEmitted,
+		                                                      true,
+		                                                      corePAggPtr);
+                    }
+	                    else if (aqAtoms && atomMacroPEnabled && macroCtx.outside.empty() &&
+	                        !spqra_profile::aqContextRequested())
+	                    {
+		                        if (!collectAQAtomsFromMinimizerMessages(blk.coreScadView,
+		                                                                  blk.spqraMinimizerView,
+		                                                                  view,
+		                                                                  macroStates,
+		                                                                  down,
+		                                                                  up,
+		                                                                  cc,
+		                                                                  blk))
+		                        {
+			                        collectAQAtomsLiveCoreDirect(core, view, macroStates, down, up, cc, blk,
+			                                                     corePAggPtr);
+		                        }
+	                    }
+                    else
+                    {
+                        const bool streamCoreEdgesFromPorts = portKernel && !coreEdgesAlreadyEmitted;
+                        if (portKernel)
+                        {
+		                            executeCorePortKernelFromScad(blk.coreScadView, core, view,
+		                                                          macroStates, down, up, cc, blk,
+		                                                          streamCoreEdgesFromPorts,
+		                                                          false,
+		                                                          corePAggPtr);
+	                        }
+                        AQContext aq = buildAQContextFromSpqrTree(core, view, macroCtx,
+                                                                  atomMacroPEnabled,
+                                                                  streamCoreEdgesFromPorts);
+		                        executeAQContextFromSpqrTree(aq, core, view, macroStates, macroCtx,
+		                                                     down, up, cc, blk, corePAggPtr);
+	                    }
+	                }
+	                else
+	                {
+		                    collectCoreSuperbubbles(core, view, macroStates, macroCtx, down, up,
+		                                           cc, blk, corePAggPtr);
+		                }
+	                return true;
+	            }
 
 
 
@@ -3098,35 +6615,30 @@ namespace solver
                 state.localInS = 0;
 
                 const Skeleton &skel = spqr.skeleton(B);
-                const auto &skelGraph = skel.getGraph();
-                const uint32_t pe_nSkel = skelGraph.numberOfNodes();
-
-                Graph newGraph;
+                const uint32_t pe_nSkel = skel.numberOfNodes();
+                const uint32_t pe_nSkelEdges = skel.numberOfEdges();
 
                 thread_local std::vector<uint32_t> tls_pe_skelToNew;
-                thread_local std::vector<uint32_t> tls_pe_newToSkel;
                 thread_local std::vector<int> tls_pe_localInDeg;
                 thread_local std::vector<int> tls_pe_localOutDeg;
+                thread_local FlatDigraphScratch tls_pe_graph;
 
                 if (tls_pe_skelToNew.size() < pe_nSkel) tls_pe_skelToNew.resize(pe_nSkel);
-                if (tls_pe_newToSkel.size() < pe_nSkel) tls_pe_newToSkel.resize(pe_nSkel);
                 if (tls_pe_localInDeg.size() < pe_nSkel) tls_pe_localInDeg.resize(pe_nSkel);
                 if (tls_pe_localOutDeg.size() < pe_nSkel) tls_pe_localOutDeg.resize(pe_nSkel);
 
                 std::fill_n(tls_pe_localInDeg.begin(), pe_nSkel, 0);
                 std::fill_n(tls_pe_localOutDeg.begin(), pe_nSkel, 0);
+                tls_pe_graph.reset(pe_nSkel, pe_nSkelEdges);
 
-                for (node v : skelGraph.nodes) {
-                    spqr_compat::node vNew = newGraph.newNode();
-                    tls_pe_skelToNew[v.idx] = vNew.idx;
-                    tls_pe_newToSkel[vNew.idx] = v.idx;
+                for (uint32_t i = 0; i < pe_nSkel; ++i) {
+                    tls_pe_skelToNew[i] = i;
                 }
 
-                {
-                    for (spqr_compat::node h : skelGraph.nodes) {
-                        spqr_compat::node vB = skel.original(h);
-                        blk.blkToSkel[vB] = h;
-                    }
+                for (uint32_t i = 0; i < pe_nSkel; ++i) {
+                    spqr_compat::node h{i};
+                    spqr_compat::node vB = skel.original(h);
+                    blk.blkToSkel[vB] = h;
                 }
 
                 // auto mapGlobalToNew = [&](spqr_compat::node vG) -> spqr_compat::node {
@@ -3162,7 +6674,7 @@ namespace solver
                 // };
 
 
-                spqr_compat::node nS, nT;
+                spqr_compat::node nS{nullptr}, nT{nullptr};
 
                 {
                     BF_INSTR(
@@ -3175,21 +6687,18 @@ namespace solver
                 }
                 BF_INSTR(auto __pe_tB_start = std::chrono::high_resolution_clock::now();)
 
-                for (edge e : skelGraph.edges)
+                skel.forEachEdge([&](edge e, node u, node v)
                 {
-                    node u = skelGraph.source(e);
-                    node v = skelGraph.target(e);
-
                     node nU{tls_pe_skelToNew[u.idx]};
                     node nV{tls_pe_skelToNew[v.idx]};
 
                     if (!skel.isVirtual(e))
                     {
-                        newGraph.newEdge(nU, nV);
+                        tls_pe_graph.addEdge(nU, nV);
                         tls_pe_localOutDeg[nU.idx]++;
                         tls_pe_localInDeg[nV.idx]++;
 
-                        continue;
+                        return;
                     }
 
                     auto D = skel.twinTreeNode(e);
@@ -3208,7 +6717,7 @@ namespace solver
                         nS = nV;
                         nT = nU;
 
-                        continue;
+                        return;
                     }
 
                     edge treeE = blk.skel2tree.at(e);
@@ -3225,11 +6734,11 @@ namespace solver
 
                     if (dir == 1)
                     {
-                        newGraph.newEdge(nA, nB);
+                        tls_pe_graph.addEdge(nA, nB);
                     }
                     else if (dir == -1)
                     {
-                        newGraph.newEdge(nB, nA);
+                        tls_pe_graph.addEdge(nB, nA);
                     }
 
                     if (nA == nU && nB == nV)
@@ -3252,7 +6761,7 @@ namespace solver
                     state.acyclic &= child.acyclic;
                     state.globalSourceSink |= child.globalSourceSink;
                     state.hasLeakage |= child.hasLeakage;
-                }
+                });
 
                 BF_INSTR(
                 auto __pe_tC_start = std::chrono::high_resolution_clock::now();
@@ -3265,12 +6774,10 @@ namespace solver
                 // Direct ST/TS computation(only happens in P nodes)
                 if (spqr.typeOf(B) == SPQRTree::NodeType::PNode)
                 {
-                    for (edge e : skelGraph.edges)
+                    skel.forEachEdge([&](edge e, node u, node v)
                     {
                         if (skel.isVirtual(e))
-                            continue;
-                        node u = skelGraph.source(e);
-                        node v = skelGraph.target(e);
+                            return;
 
                         // node nU = skelToNew[u];
                         // node nV = skelToNew[v];
@@ -3298,7 +6805,7 @@ namespace solver
                         {
                             assert(false);
                         }
-                    }
+                    });
                 }
 
                 // for (spqr_compat::node vN : newGraph.nodes) {
@@ -3325,15 +6832,15 @@ namespace solver
                     std::memory_order_relaxed);
                 )
 
-                for (spqr_compat::node nV : newGraph.nodes)
+                for (uint32_t nV = 0; nV < pe_nSkel; ++nV)
                 {
-                    spqr_compat::node bV = skel.original(spqr_compat::node{tls_pe_newToSkel[nV.idx]});
+                    spqr_compat::node bV = skel.original(spqr_compat::node{nV});
 
                     if (bV == state.s || bV == state.t)
                         continue;
 
-                    if (globIn[bV] != tls_pe_localInDeg[nV.idx] ||
-                        globOut[bV] != tls_pe_localOutDeg[nV.idx])
+                    if (globIn[bV] != tls_pe_localInDeg[nV] ||
+                        globOut[bV] != tls_pe_localOutDeg[nV])
                     {
                         state.hasLeakage = true;
                     }
@@ -3358,6 +6865,7 @@ namespace solver
                 // state.localInT = localInDeg[mapGlobalToNew(state.t)];
                 // state.localOutT = localOutDeg[mapGlobalToNew(state.t)];
 
+                SPQR_RUST_ASSERT(nS != nullptr && nT != nullptr);
                 state.localInS = tls_pe_localInDeg[nS.idx];
                 state.localOutS = tls_pe_localOutDeg[nS.idx];
 
@@ -3370,15 +6878,15 @@ namespace solver
                     {
                         int dir = state.getDirection();
                         if (dir == 1)
-                            state.acyclic &= isAcyclicSkipping(newGraph, nT, nS);
+                            state.acyclic &= tls_pe_graph.isAcyclic(FlatDigraphScratch::invalid, nT.idx, nS.idx);
                         else if (dir == -1)
-                            state.acyclic &= isAcyclicSkipping(newGraph, nS, nT);
+                            state.acyclic &= tls_pe_graph.isAcyclic(FlatDigraphScratch::invalid, nS.idx, nT.idx);
                         else
-                            state.acyclic &= isAcyclic(newGraph);
+                            state.acyclic &= tls_pe_graph.isAcyclic();
                     }
                     else
                     {
-                        state.acyclic &= isAcyclic(newGraph);
+                        state.acyclic &= tls_pe_graph.isAcyclic();
                     }
                 }
 
@@ -3421,36 +6929,29 @@ namespace solver
                 const spqr_compat::NodeArray<int> &globOut = blk.globOut;
 
                 spqr_compat::node A = curr_node;
-                const auto &T = blk.spqr->tree();
                 NodeDPState curr_state = node_dp[A];
 
                 const StaticSPQRTree &spqr = *blk.spqr;
                 const Skeleton &skel = spqr.skeleton(A);
-                const auto &skelGraph = skel.getGraph();
-                const uint32_t nSkel = skelGraph.numberOfNodes();
-                const uint32_t nSkelEdges = skelGraph.numberOfEdges();
-
-                Graph newGraph;
+                const uint32_t nSkel = skel.numberOfNodes();
+                const uint32_t nSkelEdges = skel.numberOfEdges();
 
                 thread_local std::vector<uint32_t> tls_pn_skelToNew;
-                thread_local std::vector<uint32_t> tls_pn_newToSkel;
                 thread_local std::vector<int> tls_pn_localInDeg;
                 thread_local std::vector<int> tls_pn_localOutDeg;
                 thread_local std::vector<char> tls_pn_isSrcSink;
                 thread_local std::vector<char> tls_pn_isLeaking;
-                thread_local std::vector<char> tls_pn_isVirtual;
                 thread_local std::vector<SPQRsolve::EdgeDPState*> tls_pn_edgeToDp;
                 thread_local std::vector<SPQRsolve::EdgeDPState*> tls_pn_edgeToDpR;
                 thread_local std::vector<spqr_compat::node> tls_pn_edgeChild;
                 thread_local std::vector<spqr_compat::edge> tls_pn_virtualEdges;
+                thread_local FlatDigraphScratch tls_pn_graph;
 
                 if (tls_pn_skelToNew.size() < nSkel) tls_pn_skelToNew.resize(nSkel);
-                if (tls_pn_newToSkel.size() < nSkel) tls_pn_newToSkel.resize(nSkel);
                 if (tls_pn_localInDeg.size() < nSkel) tls_pn_localInDeg.resize(nSkel);
                 if (tls_pn_localOutDeg.size() < nSkel) tls_pn_localOutDeg.resize(nSkel);
                 if (tls_pn_isSrcSink.size() < nSkel) tls_pn_isSrcSink.resize(nSkel);
                 if (tls_pn_isLeaking.size() < nSkel) tls_pn_isLeaking.resize(nSkel);
-                if (tls_pn_isVirtual.size() < nSkelEdges) tls_pn_isVirtual.resize(nSkelEdges);
                 if (tls_pn_edgeToDp.size() < nSkelEdges) tls_pn_edgeToDp.resize(nSkelEdges);
                 if (tls_pn_edgeToDpR.size() < nSkelEdges) tls_pn_edgeToDpR.resize(nSkelEdges);
                 if (tls_pn_edgeChild.size() < nSkelEdges) tls_pn_edgeChild.resize(nSkelEdges);
@@ -3459,21 +6960,18 @@ namespace solver
                 std::fill_n(tls_pn_localOutDeg.begin(), nSkel, 0);
                 std::fill_n(tls_pn_isSrcSink.begin(), nSkel, (char)0);
                 std::fill_n(tls_pn_isLeaking.begin(), nSkel, (char)0);
-                std::fill_n(tls_pn_isVirtual.begin(), nSkelEdges, (char)0);
                 std::fill_n(tls_pn_edgeToDp.begin(), nSkelEdges, (SPQRsolve::EdgeDPState*)nullptr);
                 std::fill_n(tls_pn_edgeToDpR.begin(), nSkelEdges, (SPQRsolve::EdgeDPState*)nullptr);
                 std::fill_n(tls_pn_edgeChild.begin(), nSkelEdges, spqr_compat::node{});
                 tls_pn_virtualEdges.clear();
+                tls_pn_graph.reset(nSkel, nSkelEdges);
 
                 for (uint32_t i = 0; i < nSkel; ++i) {
-                    spqr_compat::node vNew = newGraph.newNode();
-                    tls_pn_skelToNew[i] = vNew.idx;
-                }
-                for (uint32_t i = 0; i < nSkel; ++i) {
-                    tls_pn_newToSkel[tls_pn_skelToNew[i]] = i;
+                    tls_pn_skelToNew[i] = i;
                 }
 
-                for (spqr_compat::node h : skelGraph.nodes) {
+                for (uint32_t i = 0; i < nSkel; ++i) {
+                    spqr_compat::node h{i};
                     spqr_compat::node vB = skel.original(h);
                     blk.blkToSkel[vB] = h;
                 }
@@ -3494,18 +6992,15 @@ namespace solver
                 auto __pn_tB_start = __pn_tA_end;
                 )
 
-                for (edge e : skelGraph.edges) {
-                    node u = skelGraph.source(e);
-                    node v = skelGraph.target(e);
-
+                skel.forEachEdge([&](edge e, node u, node v) {
                     spqr_compat::node nU{tls_pn_skelToNew[u.idx]};
                     spqr_compat::node nV{tls_pn_skelToNew[v.idx]};
 
                     if (!skel.isVirtual(e)) {
-                        auto newEdge = newGraph.newEdge(nU, nV);
+                        tls_pn_graph.addEdge(nU, nV);
                         tls_pn_localOutDeg[nU.idx]++;
                         tls_pn_localInDeg[nV.idx]++;
-                        continue;
+                        return;
                     }
 
                     auto B = skel.twinTreeNode(e);
@@ -3523,11 +7018,10 @@ namespace solver
 
                     edge newEdge;
                     if (dir == 1 || dir == 0) {
-                        newEdge = newGraph.newEdge(nS, nT);
+                        newEdge = tls_pn_graph.addEdge(nS, nT);
                     } else /* dir == -1 */ {
-                        newEdge = newGraph.newEdge(nT, nS);
+                        newEdge = tls_pn_graph.addEdge(nT, nS);
                     }
-                    tls_pn_isVirtual[newEdge.idx] = (char)1;
                     tls_pn_edgeToDp[newEdge.idx] = edgeToUpdate;
                     tls_pn_edgeToDpR[newEdge.idx] = child;
                     tls_pn_edgeChild[newEdge.idx] = B;
@@ -3544,7 +7038,7 @@ namespace solver
                         tls_pn_localOutDeg[nS.idx] += child->localOutS;
                         tls_pn_localInDeg[nS.idx] += child->localInS;
                     }
-                }
+                });
 
                 BF_INSTR(
                 auto __pn_tB_end = std::chrono::high_resolution_clock::now();
@@ -3558,17 +7052,17 @@ namespace solver
                     return;
                 }
 
-                for (node vN : newGraph.nodes) {
-                    node vB = skel.original(spqr_compat::node{tls_pn_newToSkel[vN.idx]});
+                for (uint32_t vN = 0; vN < nSkel; ++vN) {
+                    node vB = skel.original(spqr_compat::node{vN});
                     if (globIn[vB] == 0 || globOut[vB] == 0) {
                         localSourceSinkCount++;
-                        tls_pn_isSrcSink[vN.idx] = (char)1;
+                        tls_pn_isSrcSink[vN] = (char)1;
                     }
-                    if (globIn[vB] != tls_pn_localInDeg[vN.idx] ||
-                        globOut[vB] != tls_pn_localOutDeg[vN.idx])
+                    if (globIn[vB] != tls_pn_localInDeg[vN] ||
+                        globOut[vB] != tls_pn_localOutDeg[vN])
                     {
                         localLeakageCount++;
-                        tls_pn_isLeaking[vN.idx] = (char)1;
+                        tls_pn_isLeaking[vN] = (char)1;
                     }
                 }
 
@@ -3599,16 +7093,16 @@ namespace solver
                     }
 
                     int cnt01 = 0, cnt10 = 0;
-                    for (edge e : skelGraph.edges) {
+                    skel.forEachEdge([&](edge e, node u, node v) {
                         if (!skel.isVirtual(e)) {
-                            node bU = skel.original(skelGraph.source(e));
-                            node bV = skel.original(skelGraph.target(e));
+                            node bU = skel.original(u);
+                            node bV = skel.original(v);
                             if      (bU == pole0Blk && bV == pole1Blk) ++cnt01;
                             else if (bU == pole1Blk && bV == pole0Blk) ++cnt10;
                         }
-                    }
+                    });
 
-                    for (edge e : skelGraph.edges) {
+                    skel.forEachEdge([&](edge e, node, node) {
                         if (skel.isVirtual(e)) {
                             node B = skel.twinTreeNode(e);
                             edge treeE = blk.skel2tree.at(e);
@@ -3625,7 +7119,7 @@ namespace solver
                                 st.directTS |= (cnt01 > 0);
                             }
                         }
-                    }
+                    });
                 }
 
                 BF_INSTR(
@@ -3658,36 +7152,13 @@ namespace solver
                             }
                             tls_pn_edgeToDp[e.idx]->acyclic &= false;
                         } else {
-                            node nU = newGraph.source(e);
-                            node nV = newGraph.target(e);
-                            auto *st = tls_pn_edgeToDp[e.idx];
-                            auto *ts = tls_pn_edgeToDpR[e.idx];
-                            auto child = tls_pn_edgeChild[e.idx];
-                            bool acyclic = false;
+                            const bool acyclic = tls_pn_graph.isAcyclic(e.idx);
 
-                            newGraph.delEdge(e);
-                            acyclic = isAcyclic(newGraph);
-
-                            edge eRest = newGraph.newEdge(nU, nV);
-
-                            if (eRest.idx >= tls_pn_isVirtual.size()) {
-                                const uint32_t __pn_newSz = eRest.idx + 1;
-                                tls_pn_isVirtual.resize(__pn_newSz, (char)0);
-                                tls_pn_edgeToDp.resize(__pn_newSz, (SPQRsolve::EdgeDPState*)nullptr);
-                                tls_pn_edgeToDpR.resize(__pn_newSz, (SPQRsolve::EdgeDPState*)nullptr);
-                                tls_pn_edgeChild.resize(__pn_newSz, spqr_compat::node{});
+                            if (tls_pn_edgeToDp[e.idx]->acyclic && !acyclic) {
+                                node_dp[tls_pn_edgeChild[e.idx]].outgoingCyclesCount++;
+                                node_dp[tls_pn_edgeChild[e.idx]].lastCycleNode = curr_node;
                             }
-
-                            tls_pn_isVirtual[eRest.idx] = (char)1;
-                            tls_pn_edgeToDp[eRest.idx] = st;
-                            tls_pn_edgeToDpR[eRest.idx] = ts;
-                            tls_pn_edgeChild[eRest.idx] = child;
-
-                            if (tls_pn_edgeToDp[eRest.idx]->acyclic && !acyclic) {
-                                node_dp[tls_pn_edgeChild[eRest.idx]].outgoingCyclesCount++;
-                                node_dp[tls_pn_edgeChild[eRest.idx]].lastCycleNode = curr_node;
-                            }
-                            tls_pn_edgeToDp[eRest.idx]->acyclic &= acyclic;
+                            tls_pn_edgeToDp[e.idx]->acyclic &= acyclic;
                         }
                     }
                 }
@@ -3695,10 +7166,9 @@ namespace solver
                 {
                     BF_INSTR(profiling_patch::pn_E3_calls.fetch_add(1, std::memory_order_relaxed);)
 
-                    FeedbackArcSet FAS(newGraph);
                     thread_local std::vector<edge> tls_pn_fasResult;
                     tls_pn_fasResult.clear();
-                    const bool __pn_isAcyclic = FAS.run_or_acyclic(tls_pn_fasResult);
+                    const bool __pn_isAcyclic = tls_pn_graph.isAcyclic();
 
                     if (__pn_isAcyclic) {
                         BF_INSTR(
@@ -3706,18 +7176,29 @@ namespace solver
                             1, std::memory_order_relaxed);
                         )
                     } else {
-                        thread_local std::vector<char> tls_pn_isFas;
-                        const uint32_t nNewEdges = newGraph.numberOfEdges();
-                        if (tls_pn_isFas.size() < nNewEdges) tls_pn_isFas.resize(nNewEdges);
-                        std::fill_n(tls_pn_isFas.begin(), nNewEdges, (char)0);
-                        for (edge e : tls_pn_fasResult) tls_pn_isFas[e.idx] = (char)1;
+                        Graph newGraph;
+                        tls_pn_graph.materialize(newGraph);
+                        FeedbackArcSet FAS(newGraph);
+                        const bool __pn_fasAcyclic = FAS.run_or_acyclic(tls_pn_fasResult);
+                        if (__pn_fasAcyclic) {
+                            BF_INSTR(
+                            profiling_patch::pn_E3_fas_dag_skipped.fetch_add(
+                                1, std::memory_order_relaxed);
+                            )
+                        } else {
+                            thread_local std::vector<char> tls_pn_isFas;
+                            const uint32_t nNewEdges = tls_pn_graph.numberOfEdges();
+                            if (tls_pn_isFas.size() < nNewEdges) tls_pn_isFas.resize(nNewEdges);
+                            std::fill_n(tls_pn_isFas.begin(), nNewEdges, (char)0);
+                            for (edge e : tls_pn_fasResult) tls_pn_isFas[e.idx] = (char)1;
 
-                        for (edge e : tls_pn_virtualEdges) {
-                            if (tls_pn_edgeToDp[e.idx]->acyclic && !tls_pn_isFas[e.idx]) {
-                                node_dp[tls_pn_edgeChild[e.idx]].outgoingCyclesCount++;
-                                node_dp[tls_pn_edgeChild[e.idx]].lastCycleNode = curr_node;
+                            for (edge e : tls_pn_virtualEdges) {
+                                if (tls_pn_edgeToDp[e.idx]->acyclic && !tls_pn_isFas[e.idx]) {
+                                    node_dp[tls_pn_edgeChild[e.idx]].outgoingCyclesCount++;
+                                    node_dp[tls_pn_edgeChild[e.idx]].lastCycleNode = curr_node;
+                                }
+                                tls_pn_edgeToDp[e.idx]->acyclic &= (bool)tls_pn_isFas[e.idx];
                             }
-                            tls_pn_edgeToDp[e.idx]->acyclic &= (bool)tls_pn_isFas[e.idx];
                         }
                     }
                 }
@@ -3756,7 +7237,7 @@ namespace solver
                             }
                             tls_pn_edgeToDp[e.idx]->globalSourceSink |= true;
                         } else {
-                            node vN = newGraph.source(e), uN = newGraph.target(e);
+                            node vN{tls_pn_graph.src[e.idx]}, uN{tls_pn_graph.dst[e.idx]};
                             if ((int)tls_pn_isSrcSink[vN.idx] + (int)tls_pn_isSrcSink[uN.idx] < localSourceSinkCount) {
                                 if (!tls_pn_edgeToDp[e.idx]->globalSourceSink) {
                                     node_dp[tls_pn_edgeChild[e.idx]].outgoingSourceSinkCount++;
@@ -3768,7 +7249,7 @@ namespace solver
                     }
                 } else {
                     for (edge e : tls_pn_virtualEdges) {
-                        node vN = newGraph.source(e), uN = newGraph.target(e);
+                        node vN{tls_pn_graph.src[e.idx]}, uN{tls_pn_graph.dst[e.idx]};
                         if ((int)tls_pn_isSrcSink[vN.idx] + (int)tls_pn_isSrcSink[uN.idx] < localSourceSinkCount) {
                             if (!tls_pn_edgeToDp[e.idx]->globalSourceSink) {
                                 node_dp[tls_pn_edgeChild[e.idx]].outgoingSourceSinkCount++;
@@ -3804,7 +7285,7 @@ namespace solver
                             }
                             tls_pn_edgeToDp[e.idx]->hasLeakage |= true;
                         } else {
-                            node vN = newGraph.source(e), uN = newGraph.target(e);
+                            node vN{tls_pn_graph.src[e.idx]}, uN{tls_pn_graph.dst[e.idx]};
                             if ((int)tls_pn_isLeaking[vN.idx] + (int)tls_pn_isLeaking[uN.idx] < localLeakageCount) {
                                 if (!tls_pn_edgeToDp[e.idx]->hasLeakage) {
                                     node_dp[tls_pn_edgeChild[e.idx]].outgoingLeakageCount++;
@@ -3816,7 +7297,7 @@ namespace solver
                     }
                 } else {
                     for (edge e : tls_pn_virtualEdges) {
-                        node vN = newGraph.source(e), uN = newGraph.target(e);
+                        node vN{tls_pn_graph.src[e.idx]}, uN{tls_pn_graph.dst[e.idx]};
                         if ((int)tls_pn_isLeaking[vN.idx] + (int)tls_pn_isLeaking[uN.idx] < localLeakageCount) {
                             if (!tls_pn_edgeToDp[e.idx]->hasLeakage) {
                                 node_dp[tls_pn_edgeChild[e.idx]].outgoingLeakageCount++;
@@ -3888,56 +7369,37 @@ namespace solver
                         directTS++;
                 }
 
-                // printAllEdgeStates(edge_dp, blk.spqr->tree());
-
                 for (int q = 0; q < 2; q++)
                 {
-                    // s -> t
-
-                    // std::cout << "s: " << ctx().node2name[s] << ", t: " << ctx().node2name[t] << std::endl;
                     std::vector<const EdgeDPState *> goodS, goodT;
                     node singleGoodS = nullptr;
 
                     int localOutSSum = directST, localInTSum = directST;
 
-                    // std::cout << " at " << A << std::endl;
-
                     T.forEachAdj(A, [&](node other, edge e) {
-                        // std::cout << T.source(e) << " -> " << T.target(e) << std::endl;
                         const auto &state = stateLeavingNode(edge_dp, T, blk, A, e);
-                        // directST = (state.s == s ? state.directST : state.directTS);
-                        // directTS = (state.s == s ? state.directTS : state.directST);
 
                         int localOutS = (state.s == bS ? state.localOutS : state.localOutT), localInT = (state.t == bT ? state.localInT : state.localInS);
 
                         localOutSSum += localOutS;
                         localInTSum += localInT;
-                        // std::cout << other << " has outS" <<  localOutS << " and outT " << localInT << std::endl;
-
                         if (localOutS > 0)
                         {
-                            // std::cout << "PUSHING TO GOODs" << (T.source(e) == A ? T.target(e): T.source(e)) << std::endl;
                             goodS.push_back(&state);
                             singleGoodS = other;
                         }
 
                         if (localInT > 0)
                         {
-                            // std::cout << "PUSHING TO GOODt" << (T.source(e) == A ? T.target(e): T.source(e)) << std::endl;
                             goodT.push_back(&state);
                         }
                     });
 
-                    // if(q == 1) std::swap(goodS, goodT);
-                    // std::cout << "directST: " << directST << ", directTS: " << directTS << std::endl;
-
-                    // std::cout << ctx().node2name[cc.toOrig[blk.toCc[s]]] << ", " << ctx().node2name[cc.toOrig[blk.toCc[t]]] << " has s:" << goodS.size() << " and t:" << goodT.size() << std::endl;
                     bool good = true;
                     for (auto &state : goodS)
                     {
                         if ((state->s == bS && state->localInS > 0) || (state->s == bT && state->localInT > 0))
                         {
-                            // std::cout << "BAD 1" << std::endl;
                             good = false;
                         }
 
@@ -3950,7 +7412,6 @@ namespace solver
                     {
                         if ((state->t == bT && state->localOutT > 0) || (state->t == bS && state->localOutS > 0))
                         {
-                            // std::cout << "BAD 2" << std::endl;
                             good = false;
                         }
 
@@ -3966,15 +7427,8 @@ namespace solver
 
                     good &= (localOutSSum == blk.globOut[bS] && localInTSum == blk.globIn[bT]);
 
-                    // std::cout << "localOutSSum: " << localOutSSum << ", localInTSum: " << localInTSum << std::endl;
-
-                    // std::cout << ctx().outDeg[cc.toOrig[blk.toCc[s]]] << ", " <<
-
-                    // std::cout << "SETS ARE SAME: " << (goodS == goodT) << std::endl;
-
                     if (good)
                     {
-                        // std::cout << "ADDING SUPERBUBBLE " << ctx().node2name[bS] << ", " << ctx().node2name[bT] << std::endl;
                         addSuperbubble(cc.toOrig[blk.toCc[bS]], cc.toOrig[blk.toCc[bT]]);
                     }
 
@@ -3996,57 +7450,13 @@ namespace solver
                 node S = swap ? blk.toOrig[curr.t] : blk.toOrig[curr.s];
                 node T = swap ? blk.toOrig[curr.s] : blk.toOrig[curr.t];
 
-                // std::cout << ctx().node2name[S] << " " << ctx().node2name[T] << " " << (additionalCheck) << std::endl;
-
-                /* take the counts from the current direction … */
-
                 int outS = swap ? curr.localOutT : curr.localOutS;
                 int outT = swap ? curr.localOutS : curr.localOutT;
                 int inS = swap ? curr.localInT : curr.localInS;
                 int inT = swap ? curr.localInS : curr.localInT;
 
-                // if(curr.s && curr.t) {
-                //     std::cout << "s = " << ctx().node2name[curr.s] << ", ";
-                //     std::cout << "t = " << ctx().node2name[curr.t] << ", ";
-                //     std::cout << "acyclic = " << curr.acyclic << ", ";
-                //     std::cout << "global source = " << curr.globalSourceSink << ", ";
-                //     std::cout << "hasLeakage = " << curr.hasLeakage << ", ";
-                //     std::cout << "localInS = " << curr.localInS << ", ";
-                //     std::cout << "localOutS = " << curr.localOutS << ", ";
-                //     std::cout << "localInT = " << curr.localInT << ", ";
-                //     std::cout << "localOutT = " << curr.localOutT << ", ";
-                //     std::cout << "directST = " << curr.directST << ", ";
-                //     std::cout << "directTS = " << curr.directTS << ", ";
-
-                //     std::cout << std::endl;
-                // }
-
-                // if(back.s && back.t) {
-                //     std::cout << "s = " << ctx().node2name[back.s] << ", ";
-                //     std::cout << "t = " << ctx().node2name[back.t] << ", ";
-                //     std::cout << "acyclic = " << back.acyclic << ", ";
-                //     std::cout << "global source = " << back.globalSourceSink << ", ";
-                //     std::cout << "hasLeakage = " << back.hasLeakage << ", ";
-                //     std::cout << "localInS = " << back.localInS << ", ";
-                //     std::cout << "localOutS = " << back.localOutS << ", ";
-                //     std::cout << "localInT = " << back.localInT << ", ";
-                //     std::cout << "localOutT = " << back.localOutT << ", ";
-                //     std::cout << "directST = " << back.directST << ", ";
-                //     std::cout << "directTS = " << back.directTS << ", ";
-
-                //     std::cout << std::endl;
-                // }
-
-                // int outS = swap ? curr.localOutT + (int)back.directST : curr.localOutS + (int)back.directTS;
-                // int outT = swap ? curr.localOutS + (int)back.directTS : curr.localOutT + (int)back.directST;
-                // int inS  = swap ? curr.localInT + (int)back.directTS : curr.localInS + (int)back.directST;
-                // int inT  = swap ? curr.localInS + (int)back.directST: curr.localInT + (int)back.directTS;
-                // std::cout << "before: " << std::endl;
-                // std::cout << outS << " " << inS << " | " << outT << " " << inT << std::endl;
-
                 if (back.directST)
                 {
-                    // std::cout << " added because back.directST" << std::endl;
                     if (!swap)
                     {
                         outS++;
@@ -4060,7 +7470,6 @@ namespace solver
                 }
                 if (back.directTS)
                 {
-                    // std::cout << " added because back.directTS" << std::endl;
                     if (!swap)
                     {
                         if (!ctx().weakSuperbubbles)
@@ -4075,9 +7484,6 @@ namespace solver
                         inT++;
                     }
                 }
-
-                // std::cout << "after" << std::endl;
-                // std::cout << outS << " " << inS << " | " << outT << " " << inT << std::endl;
 
                 bool backGood = true;
 
@@ -4096,7 +7502,9 @@ namespace solver
                 const int globOutS = swap ? blk.globOut[curr.t] : blk.globOut[curr.s];
                 const int globInT = swap ? blk.globIn[curr.s] : blk.globIn[curr.t];
 
-                if (
+                bool endpointCountsGood = (globOutS == outS && globInT == inT);
+
+                bool pass =
                     acyclic &&
                     noGSource &&
                     noLeakage &&
@@ -4105,13 +7513,18 @@ namespace solver
                     inT > 0 &&
                     inS == 0 &&
                     outT == 0 &&
-                    globOutS == outS &&
-                    globInT == inT &&
+                    endpointCountsGood &&
                     !ctx().isEntry[S] &&
-                    !ctx().isExit[T])
+                    !ctx().isExit[T];
+                bool riskyCleanBackSourceSink =
+                    ctx().weakSuperbubbles && !additionalCheck &&
+                    back.globalSourceSink && back.acyclic && !back.hasLeakage;
+                if (pass)
                 {
                     if (!additionalCheck)
                     {
+                        if (riskyCleanBackSourceSink)
+                            markRiskyWeakSuperbubble(S, T);
                         addSuperbubble(S, T);
                     }
                     else if ((!swap && back.directST) || (swap && back.directTS))
@@ -4123,23 +7536,17 @@ namespace solver
 
             void collectSuperbubbles(const CcData &cc, BlockData &blk, EdgeArray<EdgeDP> &edge_dp, NodeArray<NodeDPState> &node_dp)
             {
-                // PROFILE_FUNCTION();
                 const auto &T = blk.spqr->tree();
-                // printAllStates(edge_dp, node_dp, T);
 
                 for (edge e : T.edges)
                 {
                     const spqr_compat::node parent = parentOnTreeEdge(T, blk, e);
                     const spqr_compat::node child = childOnTreeEdge(T, blk, e);
 
-                    // std::cout << "CHECKING FOR " << T.source(e) << " " << T.target(e) << std::endl;
                     const EdgeDPState &down = edge_dp[e].down;
                     const EdgeDPState &up = edge_dp[e].up;
                     const auto parentType = blk.spqr->typeOf(parent);
                     const auto childType = blk.spqr->typeOf(child);
-
-                    // if(blk.spqr->typeOf(T.target(e)) != SPQRTree::NodeType::SNode) {
-                    //     std::cout << "DOWN" << std::endl;
 
                     if ((childType == SPQRTree::NodeType::RNode && parentType != SPQRTree::NodeType::PNode) ||
                         (childType == SPQRTree::NodeType::PNode &&
@@ -4155,10 +7562,6 @@ namespace solver
                         tryBubble(down, up, blk, cc, false, true);
                         tryBubble(down, up, blk, cc, true, true);
                     }
-                    // }
-
-                    // if(blk.spqr->typeOf(T.source(e)) != SPQRTree::NodeType::SNode) {
-                    // std::cout << "UP" << std::endl;
                     if ((parentType == SPQRTree::NodeType::RNode && childType != SPQRTree::NodeType::PNode) ||
                         (parentType == SPQRTree::NodeType::PNode &&
                          childType == SPQRTree::NodeType::SNode))
@@ -4173,8 +7576,6 @@ namespace solver
                         tryBubble(up, down, blk, cc, false, true);
                         tryBubble(up, down, blk, cc, true, true);
                     }
-                    // }
-
                     blk.isAcycic &= (down.acyclic && up.acyclic);
                 }
                 for (node v : T.nodes)
@@ -4185,8 +7586,183 @@ namespace solver
 
         }
 
-        void checkBlockByCutVertices(const BlockData &blk, const CcData &cc)
+        void checkFlatBlockByCutVertices(const BlockData &blk)
         {
+            const uint32_t n = weakBlockNodeCount(blk);
+            const uint32_t m = weakBlockEdgeCount(blk);
+            if (n == 0 || m == 0 || blk.edgeSrc.size() < m || blk.edgeDst.size() < m)
+                return;
+
+            std::vector<uint32_t> off(n + 1, 0);
+            for (uint32_t i = 0; i < m; ++i)
+                ++off[blk.edgeSrc[i] + 1];
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint32_t count = off[i + 1];
+                off[i] = sum;
+                sum += count;
+            }
+            off[n] = sum;
+
+            std::vector<uint32_t> cursor(off.begin(), off.end());
+            std::vector<uint32_t> adj(m);
+            for (uint32_t i = 0; i < m; ++i)
+                adj[cursor[blk.edgeSrc[i]]++] = blk.edgeDst[i];
+
+            auto reaches = [&](uint32_t src, uint32_t snk) -> bool {
+                std::vector<uint8_t> vis(n, 0);
+                std::vector<uint32_t> stack;
+                stack.push_back(src);
+                vis[src] = 1;
+                while (!stack.empty())
+                {
+                    uint32_t u = stack.back();
+                    stack.pop_back();
+                    for (uint32_t p = off[u]; p < off[u + 1]; ++p)
+                    {
+                        uint32_t v = adj[p];
+                        if (vis[v])
+                            continue;
+                        if (v == snk)
+                            return true;
+                        vis[v] = 1;
+                        stack.push_back(v);
+                    }
+                }
+                return false;
+            };
+
+            auto acyclic_without = [&](uint32_t from, uint32_t to) -> bool {
+                std::vector<int> indeg(n, 0);
+                for (uint32_t i = 0; i < m; ++i)
+                    if (!(blk.edgeSrc[i] == from && blk.edgeDst[i] == to))
+                        ++indeg[blk.edgeDst[i]];
+
+                std::queue<uint32_t> q;
+                for (uint32_t v = 0; v < n; ++v)
+                    if (indeg[v] == 0)
+                        q.push(v);
+
+                uint32_t seen = 0;
+                while (!q.empty())
+                {
+                    uint32_t u = q.front();
+                    q.pop();
+                    ++seen;
+                    for (uint32_t p = off[u]; p < off[u + 1]; ++p)
+                    {
+                        uint32_t v = adj[p];
+                        if (u == from && v == to)
+                            continue;
+                        if (--indeg[v] == 0)
+                            q.push(v);
+                    }
+                }
+                return seen == n;
+            };
+
+            auto try_pair = [&](uint32_t src, uint32_t snk, int backCount) -> bool {
+                if (src == snk || src >= n || snk >= n)
+                    return false;
+
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    node v{i};
+                    int inL = blk.inDeg[v], outL = blk.outDeg[v];
+                    int inG = blk.globIn[v], outG = blk.globOut[v];
+
+                    if (i == src)
+                        inL -= backCount;
+                    if (i == snk)
+                        outL -= backCount;
+
+                    if (i == src)
+                    {
+                        if (!(inL == 0 && outL == outG))
+                            return false;
+                    }
+                    else if (i == snk)
+                    {
+                        if (!(outL == 0 && inL == inG))
+                            return false;
+                    }
+                    else if (!(inL == inG && outL == outG))
+                    {
+                        return false;
+                    }
+                }
+
+                if (backCount == 0)
+                {
+                    if (!acyclic_without(UINT32_MAX, UINT32_MAX))
+                        return false;
+                }
+                else if (!acyclic_without(snk, src))
+                {
+                    return false;
+                }
+
+                if (!reaches(src, snk))
+                    return false;
+
+                addSuperbubble(blk.toOrig[node{src}], blk.toOrig[node{snk}]);
+                return true;
+            };
+
+            uint32_t src = UINT32_MAX, snk = UINT32_MAX;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                node v{i};
+                bool isSrc = (blk.inDeg[v] == 0 && blk.outDeg[v] == blk.globOut[v]);
+                bool isSnk = (blk.outDeg[v] == 0 && blk.inDeg[v] == blk.globIn[v]);
+                if (isSrc ^ isSnk)
+                {
+                    if (isSrc)
+                    {
+                        if (src != UINT32_MAX)
+                            return;
+                        src = i;
+                    }
+                    else
+                    {
+                        if (snk != UINT32_MAX)
+                            return;
+                        snk = i;
+                    }
+                }
+            }
+
+            if (src != UINT32_MAX && snk != UINT32_MAX && try_pair(src, snk, 0))
+                return;
+
+            if (!ctx().weakSuperbubbles)
+                return;
+
+            std::unordered_set<uint64_t> tried;
+            for (uint32_t i = 0; i < m; ++i)
+            {
+                uint32_t s = blk.edgeDst[i], t = blk.edgeSrc[i];
+                uint64_t key = (static_cast<uint64_t>(s) << 32) | t;
+                if (!tried.insert(key).second)
+                    continue;
+                int backCount = 0;
+                for (uint32_t p = off[t]; p < off[t + 1]; ++p)
+                    if (adj[p] == s)
+                        ++backCount;
+                if (backCount > 0 && try_pair(s, t, backCount))
+                    return;
+            }
+        }
+
+        void checkBlockByCutVertices(const BlockData &blk)
+        {
+            if (blk.flatEdgeCount != 0 && blk.Gblk && blk.Gblk->numberOfEdges() == 0)
+            {
+                checkFlatBlockByCutVertices(blk);
+                return;
+            }
+
             const Graph &G = *blk.Gblk;
 
             auto reaches = [&](node src, node snk) -> bool {
@@ -4200,7 +7776,7 @@ namespace solver
                     S.pop();
                     bool found = false;
                     G.forEachAdj(u, [&](node v, edge e) {
-                        if (found || G.source(e) != u)
+                        if (found || blockEdgeSource(blk, e) != u)
                             return;
                         if (!vis[v])
                         {
@@ -4222,8 +7798,8 @@ namespace solver
             auto acyclic_without = [&](node from, node to) -> bool {
                 std::vector<int> indeg(G.numberOfNodes(), 0);
                 for (edge e : G.edges)
-                    if (!(G.source(e) == from && G.target(e) == to))
-                        indeg[G.target(e).idx]++;
+                    if (!(blockEdgeSource(blk, e) == from && blockEdgeTarget(blk, e) == to))
+                        indeg[blockEdgeTarget(blk, e).idx]++;
 
                 std::queue<node> q;
                 for (node v : G.nodes)
@@ -4237,7 +7813,7 @@ namespace solver
                     q.pop();
                     seen++;
                     G.forEachAdj(u, [&](node v, edge e) {
-                        if (G.source(e) != u || (u == from && v == to))
+                        if (blockEdgeSource(blk, e) != u || (u == from && v == to))
                             return;
                         if (--indeg[v.idx] == 0)
                             q.push(v);
@@ -4322,15 +7898,16 @@ namespace solver
             if (!ctx().weakSuperbubbles)
                 return;
 
-            std::set<std::pair<uint32_t, uint32_t>> tried;
+            std::unordered_set<uint64_t> tried;
             for (edge e : G.edges)
             {
-                node s = G.target(e), t = G.source(e);
-                if (!tried.insert({s.idx, t.idx}).second)
+                node s = blockEdgeTarget(blk, e), t = blockEdgeSource(blk, e);
+                uint64_t key = (static_cast<uint64_t>(s.idx) << 32) | t.idx;
+                if (!tried.insert(key).second)
                     continue;
                 int backCount = 0;
                 G.forEachAdj(t, [&](node v, edge h) {
-                    if (G.source(h) == t && v == s)
+                    if (blockEdgeSource(blk, h) == t && v == s)
                         backCount++;
                 });
                 if (backCount > 0 && try_pair(s, t, backCount))
@@ -4574,34 +8151,96 @@ namespace solver
         //     }
         // }
 
-        static bool buildBlockSpqrCompressed(BlockData &blk)
+        static void configureSpqrRustThreads()
         {
-            const uint32_t n_blk = static_cast<uint32_t>(blk.Gblk->numberOfNodes());
-            std::vector<uint8_t> contractible(n_blk, 0);
-            for (node vB : blk.Gblk->nodes)
+            static std::once_flag rustThreadEnvOnce;
+            std::call_once(rustThreadEnvOnce, []() {
+                auto &C = ctx();
+                if (!std::getenv("BF_SPQR_THREADS"))
+                {
+                    std::string threads = std::to_string(C.threads > 0 ? C.threads : 1);
+                    setenv("BF_SPQR_THREADS", threads.c_str(), 0);
+                }
+                if (!std::getenv("BF_SPQR_PAR_COMBINE"))
+                    setenv("BF_SPQR_PAR_COMBINE", "1", 0);
+            });
+        }
+
+        static void buildDegreeTwoContractibleMask(const BlockData &blk,
+                                                   std::vector<uint8_t> &contractible)
+        {
+            const uint32_t n_blk = weakBlockNodeCount(blk);
+            contractible.assign(n_blk, 0);
+            for (uint32_t i = 0; i < n_blk; ++i)
             {
-                if (blk.Gblk->degree(vB) == 2u)
+                node vB{i};
+                const int totalDeg = blk.inDeg[vB] + blk.outDeg[vB];
+                if (totalDeg == 2)
                     contractible[vB.idx] = 1;
             }
+        }
 
+        static bool shouldAttemptWeakMacroDirect(const BlockData &blk)
+        {
+            if (!ctx().weakSuperbubbles || !blk.Gblk)
+                return false;
+
+            const uint64_t n_blk = static_cast<uint64_t>(weakBlockNodeCount(blk));
+            const uint64_t m_blk = static_cast<uint64_t>(weakBlockEdgeCount(blk));
+            if (n_blk < 3 || m_blk < 2)
+                return false;
+
+            return m_blk >= 10000000ull;
+        }
+
+        static bool buildBlockSpqrCompressed(BlockData &blk,
+                                             const std::vector<uint8_t> &contractible)
+        {
+            const uint32_t n_blk = weakBlockNodeCount(blk);
+            const uint32_t edgeCount = weakBlockEdgeCount(blk);
+            const bool haveIndexedEdges =
+                blk.edgeSrc.size() == edgeCount && blk.edgeDst.size() == edgeCount;
             std::vector<SpCompressInputEdge> edges;
-            edges.reserve(blk.Gblk->numberOfEdges());
-            for (edge e : blk.Gblk->edges)
+            if (!haveIndexedEdges)
             {
-                edges.push_back(SpCompressInputEdge{
-                    static_cast<uint32_t>(blk.Gblk->source(e).idx),
-                    static_cast<uint32_t>(blk.Gblk->target(e).idx),
-                    static_cast<uint32_t>(e.idx)});
+                edges.reserve(edgeCount);
+                for (edge e : blk.Gblk->edges)
+                {
+                    edges.push_back(SpCompressInputEdge{
+                        static_cast<uint32_t>(blockEdgeSource(blk, e).idx),
+                        static_cast<uint32_t>(blockEdgeTarget(blk, e).idx),
+                        static_cast<uint32_t>(e.idx)});
+                }
             }
 
-            SpCompressHandle *raw_handle =
-                sp_compress_ffi(
+            const uint8_t buildCoreMode =
+                (spqra_profile::aqDirectCoreScadRequested() ||
+                 (spqra_profile::aqAtomsRequested() &&
+                      !spqra_profile::aqAtomsUseSpqrTreeFallback()))
+                    ? static_cast<uint8_t>(2)
+                    : static_cast<uint8_t>(1);
+            SpCompressHandle *raw_handle = nullptr;
+            if (haveIndexedEdges)
+            {
+                raw_handle = sp_compress_indexed_ffi(
                     n_blk,
-                    edges.empty() ? nullptr : edges.data(),
-                    static_cast<uint32_t>(edges.size()),
+                    blk.edgeSrc.empty() ? nullptr : blk.edgeSrc.data(),
+                    blk.edgeDst.empty() ? nullptr : blk.edgeDst.data(),
+                    edgeCount,
                     contractible.data(),
                     static_cast<uint32_t>(contractible.size()),
-                    1);
+                    buildCoreMode);
+            }
+            else
+            {
+                    raw_handle = sp_compress_ffi(
+                        n_blk,
+                        edges.empty() ? nullptr : edges.data(),
+                        static_cast<uint32_t>(edges.size()),
+	                    contractible.data(),
+                    static_cast<uint32_t>(contractible.size()),
+                    buildCoreMode);
+            }
 
             if (!raw_handle || sp_compress_success(raw_handle) == 0)
             {
@@ -4613,18 +8252,47 @@ namespace solver
             blk.spCompressHandle.reset(raw_handle);
             blk.macroTreeView = sp_compress_get_tree(raw_handle);
             blk.coreSpqrTree = sp_compress_get_core_spqr(raw_handle);
+            blk.coreScadView = sp_compress_get_core_scad_export(raw_handle);
+            blk.spqraMinimizerView = sp_compress_get_spqra_minimizer_view(raw_handle);
+            blk.spqraBehaviorAtomView = sp_compress_get_spqra_behavior_atom_view(raw_handle);
             blk.coreNodeInv = sp_compress_core_node_inv(raw_handle, &blk.coreNodeInvLen);
 
-            if (blk.macroTreeView.macros_len == 0 || !blk.coreSpqrTree || !blk.coreNodeInv || blk.coreNodeInvLen == 0)
+                const bool macroOnlyCore =
+                    blk.macroTreeView.macros_len != 0 &&
+                    (blk.macroTreeView.stats.fully_sp_reducible != 0 ||
+                     blk.macroTreeView.core_edges_len == 0);
+	            const bool usable =
+	                blk.macroTreeView.macros_len != 0 &&
+	                    (macroOnlyCore ||
+	                     ((blk.coreSpqrTree ||
+                       (blk.coreScadView.components_len != 0 && blk.coreScadView.components_ptr != nullptr) ||
+                       (blk.spqraMinimizerView.components_len != 0 &&
+                        blk.spqraMinimizerView.components_ptr != nullptr)) &&
+                      blk.coreNodeInv && blk.coreNodeInvLen != 0));
+
+            if (!usable)
             {
                 blk.spCompressHandle.reset();
                 blk.macroTreeView = SpCompressTreeView{};
                 blk.coreSpqrTree = nullptr;
+                blk.coreScadView = CoreScadView{};
+                blk.spqraMinimizerView = SpqraMinimizerView{};
                 blk.coreNodeInv = nullptr;
                 blk.coreNodeInvLen = 0;
                 return false;
             }
             return true;
+        }
+
+        static void materializeFlatBlockEdges(BlockData &blk)
+        {
+            if (!blk.Gblk || blk.flatEdgeCount == 0 ||
+                blk.Gblk->numberOfEdges() == blk.flatEdgeCount)
+            {
+                return;
+            }
+            for (uint32_t i = 0; i < blk.flatEdgeCount; ++i)
+                blk.Gblk->newEdge(node{blk.edgeSrc[i]}, node{blk.edgeDst[i]});
         }
 
         static void buildBlockDataParallel(const CcData &cc, BlockData &blk)
@@ -4637,13 +8305,75 @@ namespace solver
                 blk.inDeg.init(*blk.Gblk, 0);
                 blk.outDeg.init(*blk.Gblk, 0);
 
-                std::unordered_set<node> verts;
-                for (edge hE : cc.bc->hEdges(blk.bNode))
-                {
-                    edge eC = cc.bc->original(hE);
-                    verts.insert(cc.Gcc->source(eC));
-                    verts.insert(cc.Gcc->target(eC));
-                }
+	                auto hEdges = cc.bc->hEdges(blk.bNode);
+	                size_t hEdgeCount = 0;
+	                for (edge hE : hEdges)
+	                {
+	                    (void)hE;
+	                    ++hEdgeCount;
+	                }
+
+                    const bool flatMacroOnly =
+                        ctx().weakSuperbubbles &&
+                        hEdgeCount >= 10000000ull;
+
+	                if (hEdgeCount >= 1000000)
+	                {
+                        blk.edgeSrc.reserve(hEdgeCount);
+                        blk.edgeDst.reserve(hEdgeCount);
+	                    std::vector<int32_t> ccToBlkIdx(cc.Gcc->numberOfNodes(), -1);
+	                    auto ensureBlockNode = [&](node vCc) -> node {
+	                        int32_t mapped = ccToBlkIdx[vCc.idx];
+	                        if (mapped >= 0)
+	                            return node{static_cast<uint32_t>(mapped)};
+	                        node vB = blk.Gblk->newNode();
+	                        ccToBlkIdx[vCc.idx] = static_cast<int32_t>(vB.idx);
+	                        blk.toCc[vB] = vCc;
+	                        blk.toOrig[vB] = cc.toOrig[vCc];
+	                        blk.inDeg[vB] = 0;
+	                        blk.outDeg[vB] = 0;
+	                        return vB;
+	                    };
+
+	                    for (edge hE : hEdges)
+	                    {
+	                        edge eCc = cc.bc->original(hE);
+	                        node src = ensureBlockNode(cc.Gcc->source(eCc));
+	                        node tgt = ensureBlockNode(cc.Gcc->target(eCc));
+                            if (flatMacroOnly)
+                            {
+                                blk.edgeSrc.push_back(src.idx);
+                                blk.edgeDst.push_back(tgt.idx);
+                            }
+                            else
+	                        {
+	                            edge e = blk.Gblk->newEdge(src, tgt);
+	                            if (e.idx == blk.edgeSrc.size())
+	                            {
+	                                blk.edgeSrc.push_back(src.idx);
+	                                blk.edgeDst.push_back(tgt.idx);
+	                            }
+	                        }
+	                        blk.outDeg[src]++;
+	                        blk.inDeg[tgt]++;
+	                    }
+                        if (flatMacroOnly)
+                        {
+                            blk.flatNodeCount = static_cast<uint32_t>(blk.Gblk->numberOfNodes());
+                            blk.flatEdgeCount = static_cast<uint32_t>(blk.edgeSrc.size());
+                        }
+	                }
+	                else
+	                {
+                        blk.edgeSrc.reserve(hEdgeCount);
+                        blk.edgeDst.reserve(hEdgeCount);
+	                    std::unordered_set<node> verts;
+	                    for (edge hE : hEdges)
+	                    {
+	                        edge eC = cc.bc->original(hE);
+	                        verts.insert(cc.Gcc->source(eC));
+	                        verts.insert(cc.Gcc->target(eC));
+	                    }
 
                 std::unordered_map<node, node> cc_to_blk;
                 cc_to_blk.reserve(verts.size());
@@ -4659,18 +8389,37 @@ namespace solver
                     blk.outDeg[vB] = 0;
                 }
 
-                for (edge hE : cc.bc->hEdges(blk.bNode))
-                {
-                    edge eCc = cc.bc->original(hE);
-                    auto srcIt = cc_to_blk.find(cc.Gcc->source(eCc));
-                    auto tgtIt = cc_to_blk.find(cc.Gcc->target(eCc));
-                    if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end())
-                    {
-                        edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
-                        blk.outDeg[blk.Gblk->source(e)]++;
-                        blk.inDeg[blk.Gblk->target(e)]++;
-                    }
-                }
+	                    for (edge hE : hEdges)
+	                    {
+	                        edge eCc = cc.bc->original(hE);
+	                        auto srcIt = cc_to_blk.find(cc.Gcc->source(eCc));
+	                        auto tgtIt = cc_to_blk.find(cc.Gcc->target(eCc));
+	                        if (srcIt != cc_to_blk.end() && tgtIt != cc_to_blk.end())
+	                        {
+                                if (flatMacroOnly)
+                                {
+                                    blk.edgeSrc.push_back(srcIt->second.idx);
+                                    blk.edgeDst.push_back(tgtIt->second.idx);
+                                }
+                                else
+                                {
+	                                edge e = blk.Gblk->newEdge(srcIt->second, tgtIt->second);
+	                                if (e.idx == blk.edgeSrc.size())
+	                                {
+	                                    blk.edgeSrc.push_back(srcIt->second.idx);
+	                                    blk.edgeDst.push_back(tgtIt->second.idx);
+	                                }
+                                }
+	                            blk.outDeg[srcIt->second]++;
+	                            blk.inDeg[tgtIt->second]++;
+	                        }
+	                    }
+                        if (flatMacroOnly)
+                        {
+                            blk.flatNodeCount = static_cast<uint32_t>(blk.Gblk->numberOfNodes());
+                            blk.flatEdgeCount = static_cast<uint32_t>(blk.edgeSrc.size());
+                        }
+	                }
 
                 blk.globIn.init(*blk.Gblk, 0);
                 blk.globOut.init(*blk.Gblk, 0);
@@ -4682,23 +8431,21 @@ namespace solver
                 }
             }
 
-            if (ctx().weakSuperbubbles && blk.Gblk->numberOfEdges() >= 10000000u && buildBlockSpqrCompressed(blk))
-                return;
+	            std::vector<uint8_t> contractible;
+            buildDegreeTwoContractibleMask(blk, contractible);
 
-            if (blk.Gblk->numberOfNodes() >= 3)
-            {
-                {
-                    std::vector<uint8_t> contractible(blk.Gblk->numberOfNodes(), 0);
-                    for (node vB : blk.Gblk->nodes)
-                    {
-                        if (blk.Gblk->degree(vB) == 2u)
-                        {
-                            contractible[vB.idx] = 1;
-                        }
-                    }
-                    blk.spqr = std::make_unique<StaticSPQRTree>(
-                        *blk.Gblk,
-                        contractible.data(),
+            if (shouldAttemptWeakMacroDirect(blk) &&
+                buildBlockSpqrCompressed(blk, contractible))
+		                return;
+
+                materializeFlatBlockEdges(blk);
+
+	            if (blk.Gblk->numberOfNodes() >= 3)
+	            {
+	                {
+	                    blk.spqr = std::make_unique<StaticSPQRTree>(
+	                        *blk.Gblk,
+	                        contractible.data(),
                         static_cast<uint32_t>(contractible.size()));
                 }
                 const auto &T = blk.spqr->tree();
@@ -4908,7 +8655,7 @@ namespace solver
                 std::vector<std::pair<spqr_compat::node, spqr_compat::node>> local;
                 tls_superbubble_collector = &local;
 
-                if (blk->Gblk && blk->Gblk->numberOfNodes() >= 3)
+                if (blk->Gblk && weakBlockNodeCount(*blk) >= 3)
                 {
                     BF_INSTR(
                     {
@@ -4931,13 +8678,292 @@ namespace solver
                     )
                     solveSPQR(*blk, *w.cc);
                 }
-                checkBlockByCutVertices(*blk, *w.cc);
+                checkBlockByCutVertices(*blk);
 
                 tls_superbubble_collector = nullptr;
                 results[i] = std::move(local);
                 allBlocks[i].reset();
             }
             return nullptr;
+        }
+
+        struct PrecomputedCcInput
+        {
+            std::vector<uint32_t> localToGlobal;
+            std::vector<std::pair<int, int>> edges;
+        };
+
+        static void solvePreparedComponents(std::vector<std::unique_ptr<CcData>> &components)
+        {
+            auto &C = ctx();
+            const int nCC = static_cast<int>(components.size());
+            if (nCC == 0)
+                return;
+
+            std::vector<WorkItem> workItems;
+            std::vector<std::unique_ptr<BlockData>> allBlockData;
+            std::vector<BlockPrep> blockPreps;
+
+            {
+                PROFILE_BLOCK("solve:: building data");
+                MEM_TIME_BLOCK("BUILD: BC+SPQR");
+                ACCUM_BUILD();
+
+                {
+                    MARK_SCOPE_MEM("sb/phase/BCtrees");
+
+                    size_t numThreads = std::thread::hardware_concurrency();
+                    numThreads = std::min({(size_t)C.threads, (size_t)nCC, numThreads});
+                    if (numThreads == 0)
+                        numThreads = 1;
+
+                    std::vector<pthread_t> threads(numThreads);
+                    std::atomic<size_t> nextIndex{0};
+                    std::vector<std::vector<BlockPrep>> perThreadPreps(numThreads);
+
+                    for (size_t tid = 0; tid < numThreads; ++tid)
+                    {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+
+                        if (pthread_attr_setstacksize(&attr, C.stackSize) != 0)
+                            std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+
+                        ThreadBcTreeArgs *args = new ThreadBcTreeArgs{
+                            tid,
+                            numThreads,
+                            nCC,
+                            &nextIndex,
+                            &components,
+                            &perThreadPreps};
+
+                        int ret = pthread_create(&threads[tid], &attr, worker_bcTree, args);
+                        if (ret != 0)
+                        {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
+
+                        pthread_attr_destroy(&attr);
+                    }
+
+                    for (size_t tid = 0; tid < numThreads; ++tid)
+                        pthread_join(threads[tid], nullptr);
+
+                    size_t total = 0;
+                    for (auto &tp : perThreadPreps)
+                        total += tp.size();
+                    blockPreps.reserve(total);
+                    for (auto &tp : perThreadPreps)
+                    {
+                        blockPreps.insert(blockPreps.end(),
+                                          std::make_move_iterator(tp.begin()),
+                                          std::make_move_iterator(tp.end()));
+                    }
+                }
+
+                {
+                    allBlockData.resize(blockPreps.size());
+                }
+
+                if (!blockPreps.empty())
+                {
+                    MARK_SCOPE_MEM("sb/phase/BlockDataBuildAll");
+
+                    size_t numThreads2 = std::thread::hardware_concurrency();
+                    numThreads2 = std::min({(size_t)C.threads, blockPreps.size(), numThreads2});
+                    if (numThreads2 == 0)
+                        numThreads2 = 1;
+
+                    std::vector<pthread_t> threads2(numThreads2);
+                    std::atomic<size_t> nextIndex2{0};
+
+                    for (size_t tid = 0; tid < numThreads2; ++tid)
+                    {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+
+                        if (pthread_attr_setstacksize(&attr, C.stackSize) != 0)
+                            std::cout << "[Error] pthread_attr_setstacksize" << std::endl;
+
+                        ThreadBlockBuildArgs *args = new ThreadBlockBuildArgs{
+                            tid,
+                            numThreads2,
+                            blockPreps.size(),
+                            &nextIndex2,
+                            &blockPreps,
+                            &allBlockData};
+
+                        int ret = pthread_create(&threads2[tid], &attr, worker_buildBlockData, args);
+                        if (ret != 0)
+                        {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
+
+                        pthread_attr_destroy(&attr);
+                    }
+
+                    for (size_t tid = 0; tid < numThreads2; ++tid)
+                        pthread_join(threads2[tid], nullptr);
+                }
+
+                {
+                    workItems.reserve(allBlockData.size());
+                    for (size_t i = 0; i < allBlockData.size(); ++i)
+                        workItems.push_back({blockPreps[i].cc, blockPreps[i].bNode});
+                }
+            }
+
+            {
+                MEM_TIME_BLOCK("LOGIC: solve blocks (pthreads)");
+                ACCUM_LOGIC();
+                PROFILE_BLOCK("solve:: process blocks (pthreads, large stack)");
+                MARK_SCOPE_MEM("sb/phase/SolveBlocks");
+
+                std::vector<std::vector<std::pair<spqr_compat::node, spqr_compat::node>>> blockResults(workItems.size());
+
+                size_t numThreads = std::thread::hardware_concurrency();
+                numThreads = std::min({(size_t)C.threads, workItems.size(), numThreads});
+                if (numThreads == 0)
+                    numThreads = 1;
+
+                std::vector<pthread_t> threads(numThreads);
+                std::atomic<size_t> nextIndex{0};
+
+                {
+                    for (size_t tid = 0; tid < numThreads; ++tid)
+                    {
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+                        pthread_attr_setstacksize(&attr, C.stackSize);
+
+                        ThreadProcessArgs *args = new ThreadProcessArgs{
+                            tid,
+                            numThreads,
+                            workItems.size(),
+                            &nextIndex,
+                            &workItems,
+                            &allBlockData,
+                            &blockResults};
+
+                        int ret = pthread_create(&threads[tid], &attr, worker_processBlocks, args);
+                        if (ret != 0)
+                        {
+                            std::cerr << "Error creating pthread " << tid << ": " << strerror(ret) << std::endl;
+                            delete args;
+                        }
+                        pthread_attr_destroy(&attr);
+                    }
+
+                    for (size_t tid = 0; tid < numThreads; ++tid)
+                        pthread_join(threads[tid], nullptr);
+                }
+
+                {
+                    size_t totalCandidates = 0;
+                    for (const auto &candidates : blockResults)
+                        totalCandidates += candidates.size();
+                    C.superbubbles.reserve(C.superbubbles.size() + totalCandidates);
+                    if (C.weakSuperbubbles)
+                    {
+                        for (const auto &candidates : blockResults)
+                            for (const auto &p : candidates)
+                                if (!isTrashSuperbubbleNode(p.first) &&
+                                    !isTrashSuperbubbleNode(p.second))
+                                    C.superbubbles.emplace_back(p);
+                    }
+                    else
+                    {
+                        for (const auto &candidates : blockResults)
+                            for (const auto &p : candidates)
+                                tryCommitSuperbubble(p.first, p.second);
+                    }
+                }
+            }
+
+            BF_INSTR(
+            {
+                const uint64_t b = tip_diag_spqr_blocks.load();
+                const uint64_t v = tip_diag_spqr_verts.load();
+                const uint64_t ss = tip_diag_internal_ss.load();
+                const uint64_t bs = tip_diag_blocks_with_ss.load();
+                const uint64_t mx = tip_diag_max_ss_one_block.load();
+                std::cout << "\n[tip-diag] SPQR-eligible blocks: " << b
+                          << ", verts: " << v
+                          << ", source/sink verts: " << ss
+                          << " (" << (v ? 100.0 * ss / v : 0.0) << "%)"
+                          << ", blocks with >=1: " << bs
+                          << " (" << (b ? 100.0 * bs / b : 0.0) << "%)"
+                          << ", max in one block: " << mx << "\n";
+            }
+            )
+        }
+
+        void solveStreamingPrecomputed(const std::vector<PrecomputedCcInput> &inputs)
+        {
+            auto &C = ctx();
+            configureSpqrRustThreads();
+            {
+                findMiniSuperbubbles();
+            }
+            std::vector<std::unique_ptr<CcData>> components;
+
+            {
+                MARK_SCOPE_MEM("sb/phase/GccBuildPrecomputed");
+                components.resize(inputs.size());
+                size_t numThreads = std::thread::hardware_concurrency();
+                numThreads = std::min({(size_t)C.threads, inputs.size(), numThreads});
+                if (numThreads == 0)
+                    numThreads = 1;
+
+                std::vector<std::thread> workers;
+                workers.reserve(numThreads);
+                std::atomic<size_t> nextIndex{0};
+
+                for (size_t tid = 0; tid < numThreads; ++tid)
+                {
+                    workers.emplace_back([&]() {
+                        while (true)
+                        {
+                            size_t ci = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                            if (ci >= inputs.size())
+                                break;
+
+                            const PrecomputedCcInput &in = inputs[ci];
+                            if (in.edges.size() < in.localToGlobal.size())
+                                continue;
+
+                            auto cc = std::make_unique<CcData>();
+                            cc->Gcc = std::make_unique<Graph>();
+                            cc->toOrig.init(*cc->Gcc, nullptr);
+
+                            for (uint32_t global : in.localToGlobal)
+                            {
+                                node vC = cc->Gcc->newNode();
+                                cc->toOrig[vC] = node{global};
+                            }
+
+                            for (const auto &e : in.edges)
+                            {
+                                if (e.first < 0 || e.second < 0)
+                                    continue;
+                                uint32_t s = static_cast<uint32_t>(e.first);
+                                uint32_t t = static_cast<uint32_t>(e.second);
+                                if (s < in.localToGlobal.size() && t < in.localToGlobal.size())
+                                    cc->Gcc->newEdge(node{s}, node{t});
+                            }
+
+                            components[ci] = std::move(cc);
+                        }
+                    });
+                }
+
+                for (auto &t : workers)
+                    t.join();
+            }
+
+            solvePreparedComponents(components);
         }
 
         void solveStreaming()
@@ -5222,12 +9248,23 @@ namespace solver
                     pthread_join(threads[tid], nullptr);
                 }
 
+                size_t totalCandidates = 0;
                 for (const auto &candidates : blockResults)
+                    totalCandidates += candidates.size();
+                C.superbubbles.reserve(C.superbubbles.size() + totalCandidates);
+                if (C.weakSuperbubbles)
                 {
-                    for (const auto &p : candidates)
-                    {
-                        tryCommitSuperbubble(p.first, p.second);
-                    }
+                    for (const auto &candidates : blockResults)
+                        for (const auto &p : candidates)
+                            if (!isTrashSuperbubbleNode(p.first) &&
+                                !isTrashSuperbubbleNode(p.second))
+                                C.superbubbles.emplace_back(p);
+                }
+                else
+                {
+                    for (const auto &candidates : blockResults)
+                        for (const auto &p : candidates)
+                            tryCommitSuperbubble(p.first, p.second);
                 }
             }
 
@@ -5400,6 +9437,7 @@ namespace solver
         void solve()
         {
             TIME_BLOCK("Finding superbubbles in blocks");
+            configureSpqrRustThreads();
             findMiniSuperbubbles();
             solveStreaming();
             BF_INSTR(printPatch1Profiling();)
@@ -12268,7 +16306,12 @@ namespace solver
                 "spqr_us={self_loop_scan:%llu,tree_total:%llu,"
                 "precheck:%llu,split_multi:%llu,work_graph:%llu,"
                 "triconn:%llu,relabel:%llu,combine:%llu,"
-                "merge:%llu,assemble:%llu}\n",
+                "merge:%llu,assemble:%llu} "
+                "split_counts={multi:%llu,triconn:%llu,precombine:%llu,"
+                "combined:%llu,merged:%llu,merged_real:%llu,"
+                "merged_virtual_inc:%llu,virtual_id_span:%llu,"
+                "tree_nodes:%llu,tree_edges:%llu,tree_skel_edges:%llu,"
+                "tree_virtual_inc:%llu}\n",
                 n_blk,
                 n_edges,
                 blk.macroTreeView.macros_len,
@@ -12292,7 +16335,19 @@ namespace solver
                 static_cast<unsigned long long>(timings.t_spqr_relabel_us),
                 static_cast<unsigned long long>(timings.t_spqr_combine_us),
                 static_cast<unsigned long long>(timings.t_spqr_merge_us),
-                static_cast<unsigned long long>(timings.t_spqr_assemble_us));
+                static_cast<unsigned long long>(timings.t_spqr_assemble_us),
+                static_cast<unsigned long long>(timings.c_spqr_multi_components),
+                static_cast<unsigned long long>(timings.c_spqr_triconn_components),
+                static_cast<unsigned long long>(timings.c_spqr_precombine_components),
+                static_cast<unsigned long long>(timings.c_spqr_combined_components),
+                static_cast<unsigned long long>(timings.c_spqr_merged_components),
+                static_cast<unsigned long long>(timings.c_spqr_merged_real_edges),
+                static_cast<unsigned long long>(timings.c_spqr_merged_virtual_incidences),
+                static_cast<unsigned long long>(timings.c_spqr_virtual_id_span),
+                static_cast<unsigned long long>(timings.c_spqr_tree_nodes),
+                static_cast<unsigned long long>(timings.c_spqr_tree_edges),
+                static_cast<unsigned long long>(timings.c_spqr_tree_skeleton_edges),
+                static_cast<unsigned long long>(timings.c_spqr_tree_virtual_incidences));
         }
 
         inline bool buildBlockSpqr(BlockData &blk)
@@ -14958,8 +19013,8 @@ namespace solver
 
             if (n_comps <= 1) return true; 
             int plus_count = 0, minus_count = 0;
-            std::vector<bool> plus_seen(n_comps, false);
-            std::vector<bool> minus_seen(n_comps, false);
+            std::vector<uint8_t> plus_seen(n_comps, 0);
+            std::vector<uint8_t> minus_seen(n_comps, 0);
 
             for (const UBEdge *it = C.adjBegin(v), *end = C.adjEnd(v);
                  it != end; ++it)
@@ -15427,6 +19482,7 @@ namespace solver
             std::cout << "Finding ultrabubbles (SPQR weak superbubbles)...\n";
             PROFILE_FUNCTION();
 
+
             const uint32_t N = C.ubNumNodes;
             const auto &names = C.ubNodeNames;
 
@@ -15441,13 +19497,12 @@ namespace solver
                 is_tip[v] = !(saw_plus && saw_minus);
             }
 
-            std::vector<bool> is_cut;
-            ultrabubble::computeCutVertices(C, N, is_cut);
             std::vector<bool> is_tip_saved(is_tip);
             std::vector<bool> &can_start = is_tip;
+            std::vector<bool> is_cut;
+            ultrabubble::computeCutVertices(C, N, is_cut);
             for (uint32_t v = 0; v < N; v++)
                 can_start[v] = is_tip_saved[v] || is_cut[v];
-
             { std::vector<bool>().swap(is_cut); }
 
             std::vector<int> localId(N, -1);
@@ -15493,6 +19548,8 @@ namespace solver
 
             int T = std::min<int>(C.threads, (int)comps.size());
             if (T <= 0) T = 1;
+            const size_t orientChunk =
+                (comps.size() >= static_cast<size_t>(T) * 64u) ? 8u : 1u;
 
             std::vector<std::thread> threads;
             threads.reserve(T);
@@ -15502,32 +19559,42 @@ namespace solver
                     std::vector<uint32_t> cut_q_scratch;
                     try {
                         while (!abort_flag.load(std::memory_order_relaxed)) {
-                            size_t ci = next.fetch_add(1);
-                            if (ci >= comps.size()) break;
+                            const size_t begin = next.fetch_add(orientChunk, std::memory_order_relaxed);
+                            if (begin >= comps.size()) break;
+                            const size_t end = std::min(begin + orientChunk, comps.size());
+                            for (size_t ci = begin; ci < end; ++ci) {
+                                if (abort_flag.load(std::memory_order_relaxed))
+                                    break;
 
-                            auto &cc = comps[ci];
-                            ultrabubble::DirectedEdgeBuilder out((int)cc.size());
-
-                            for (uint32_t v : cc) {
-                                if (!plus_dir[v] && can_start[v]) {
-                                    bool pe = is_tip_saved[v] ? true :
-                                        ultrabubble::choose_cut_vertex_start(v, cc, localId, C,
-                                                                             cut_comp_scratch, cut_q_scratch);
-                                    plus_dir[v] = pe ? 1 : 2;
-                                    ultrabubble::orient(v, pe, plus_dir, localId, C, out);
+                                auto &cc = comps[ci];
+                                size_t reserve_edges = 0;
+                                if (cc.size() >= 16)
+                                {
+                                    for (uint32_t v : cc)
+                                        reserve_edges += static_cast<size_t>(C.ubOffset[v + 1] - C.ubOffset[v]);
                                 }
-                            }
+                                ultrabubble::DirectedEdgeBuilder out((int)cc.size(), reserve_edges);
 
-                            for (uint32_t v : cc) {
-                                if (!plus_dir[v]) {
-                                    throw std::runtime_error(
-                                        "Ultrabubble: orientation failed "
-                                        "(unoriented node: " + names[v] + "). "
-                                        "Each connected component must contain "
-                                        "at least one tip or cut vertex."
-                                    );
+                                for (uint32_t v : cc) {
+                                    if (!plus_dir[v] && can_start[v]) {
+                                        bool pe = is_tip_saved[v] ? true :
+                                            ultrabubble::choose_cut_vertex_start(v, cc, localId, C,
+                                                                                 cut_comp_scratch, cut_q_scratch);
+                                        plus_dir[v] = pe ? 1 : 2;
+                                        ultrabubble::orient(v, pe, plus_dir, localId, C, out);
+                                    }
                                 }
-                            }
+
+                                for (uint32_t v : cc) {
+                                    if (!plus_dir[v]) {
+                                        throw std::runtime_error(
+                                            "Ultrabubble: orientation failed "
+                                            "(unoriented node: " + names[v] + "). "
+                                            "Each connected component must contain "
+                                            "at least one tip or cut vertex."
+                                        );
+                                    }
+                                }
 
                             auto &directed_edges = out.edges;
                             std::sort(directed_edges.begin(), directed_edges.end());
@@ -15535,8 +19602,9 @@ namespace solver
                                 std::unique(directed_edges.begin(), directed_edges.end()),
                                 directed_edges.end());
 
-                            directedByCC[ci].edges = std::move(directed_edges);
-                            directedByCC[ci].nextId = out.nextId;
+                                directedByCC[ci].edges = std::move(directed_edges);
+                                directedByCC[ci].nextId = out.nextId;
+                            }
                         }
                     } catch (...) {
                         abort_flag.store(true);
@@ -15556,86 +19624,498 @@ namespace solver
                 directed_node_count += (uint32_t)(directedByCC[ci].nextId - (int)comps[ci].size());
             }
 
-            std::vector<std::pair<uint32_t, uint32_t>> directed_edges;
-            size_t edge_total = 0;
-            for (auto &d : directedByCC) edge_total += d.edges.size();
-            directed_edges.reserve(edge_total);
-
+            std::vector<superbubble::PrecomputedCcInput> precomputedComponents(comps.size());
             for (size_t ci = 0; ci < comps.size(); ++ci) {
                 const auto &cc = comps[ci];
                 const int k = (int)cc.size();
+                const int nextId = directedByCC[ci].nextId;
                 const uint32_t base = conflict_base[ci];
-                auto map_node = [&](int v) -> uint32_t {
-                    return v < k ? cc[(size_t)v] : base + (uint32_t)(v - k);
-                };
-                for (const auto &e : directedByCC[ci].edges)
-                    directed_edges.emplace_back(map_node(e.first), map_node(e.second));
+                auto &pc = precomputedComponents[ci];
+                pc.localToGlobal.reserve(nextId);
+                for (uint32_t v : cc)
+                    pc.localToGlobal.push_back(v);
+                for (int v = k; v < nextId; ++v)
+                    pc.localToGlobal.push_back(base + (uint32_t)(v - k));
+                pc.edges = std::move(directedByCC[ci].edges);
             }
 
-            std::sort(directed_edges.begin(), directed_edges.end());
-            directed_edges.erase(std::unique(directed_edges.begin(), directed_edges.end()), directed_edges.end());
+            auto forEachGlobalDirectedEdge = [&](auto &&fn) {
+                for (const auto &pc : precomputedComponents) {
+                    const auto &map = pc.localToGlobal;
+                    for (const auto &e : pc.edges) {
+                        const uint32_t s = map[(size_t)e.first];
+                        const uint32_t t = map[(size_t)e.second];
+                        fn(s, t);
+                    }
+                }
+	            };
+            const bool needGlobalGraph = !(C.weakSuperbubbles && !C.includeTrivial);
 
             std::vector<int> odeg(directed_node_count, 0);
-            for (const auto &e : directed_edges) odeg[e.first]++;
+            std::vector<uint32_t> sole_out(directed_node_count, UINT32_MAX);
+            std::vector<std::pair<uint32_t, uint32_t>> directed_edges;
+            size_t edge_total = 0;
+            for (auto &d : precomputedComponents) edge_total += d.edges.size();
+            const bool materializeDirectedEdges =
+                needGlobalGraph && C.includeTrivial;
+            if (materializeDirectedEdges)
+                directed_edges.reserve(edge_total);
+
+            forEachGlobalDirectedEdge([&](uint32_t s, uint32_t t) {
+                if (materializeDirectedEdges)
+                    directed_edges.emplace_back(s, t);
+                if (odeg[s] == 0)
+                    sole_out[s] = t;
+                odeg[s]++;
+            });
 
             C.node2name.clear();
             C.name2node.clear();
             C.superbubbles.clear();
+            C.isTrashNodeByIndex.assign(directed_node_count, 1);
+            for (uint32_t i = 0; i < N && i < directed_node_count; ++i)
+                C.isTrashNodeByIndex[i] = (names[i] == "_trash") ? 1 : 0;
 
-            std::vector<spqr_compat::node> nodes(directed_node_count);
-            for (uint32_t i = 0; i < directed_node_count; ++i) {
-                nodes[i] = C.G.newNode();
-                C.node2name[nodes[i]] = (i < N) ? names[i] : "_trash";
+            spqr_compat::node firstNode = nullptr;
+            if (needGlobalGraph && directed_node_count != 0) {
+                firstNode = C.G.newNodes(directed_node_count);
             }
-
-            if (!directed_edges.empty()) {
-                std::vector<uint32_t> endpoints;
-                endpoints.reserve(directed_edges.size() * 2);
-                for (const auto &e : directed_edges) {
-                    endpoints.push_back(e.first);
-                    endpoints.push_back(e.second);
+            if (needGlobalGraph) {
+                C.isEntry = NodeArray<bool>(C.G, false);
+                C.isExit = NodeArray<bool>(C.G, false);
+                C.inDeg = NodeArray<int>(C.G, 0);
+                C.outDeg = NodeArray<int>(C.G, 0);
+            }
+            if (needGlobalGraph && edge_total != 0) {
+                static_assert(sizeof(std::pair<uint32_t, uint32_t>) == 2 * sizeof(uint32_t),
+                              "directed edge pair layout must be compact");
+                if (materializeDirectedEdges) {
+                    for (const auto &e : directed_edges) {
+                        C.outDeg[node{e.first}]++;
+                        C.inDeg[node{e.second}]++;
+                    }
+                } else {
+                    forEachGlobalDirectedEdge([&](uint32_t s, uint32_t t) {
+                        C.outDeg[node{s}]++;
+                        C.inDeg[node{t}]++;
+                    });
                 }
-                C.G.newEdgesBatchFlat(endpoints.data(), (uint32_t)directed_edges.size());
-            }
-
-            C.isEntry = NodeArray<bool>(C.G, false);
-            C.isExit = NodeArray<bool>(C.G, false);
-            C.inDeg = NodeArray<int>(C.G, 0);
-            C.outDeg = NodeArray<int>(C.G, 0);
-            for (edge e : C.G.edges) {
-                C.outDeg[C.G.source(e)]++;
-                C.inDeg[C.G.target(e)]++;
+                if (C.includeTrivial) {
+                    C.G.newEdgesBatchFlat(
+                        reinterpret_cast<const uint32_t *>(directed_edges.data()),
+                        (uint32_t)directed_edges.size());
+                }
             }
 
             const bool oldWeak = C.weakSuperbubbles;
             C.weakSuperbubbles = true;
-            superbubble::solve();
+            superbubble::clearRiskyWeakSuperbubbles();
+            superbubble::solveStreamingPrecomputed(precomputedComponents);
             C.weakSuperbubbles = oldWeak;
 
-            C.ultrabubbleIncPacked.clear();
-            C.ultrabubbleIncPacked.reserve(C.superbubbles.size());
-            for (const auto &sb : C.superbubbles) {
+            std::vector<std::pair<uint32_t, uint32_t>> riskyPairs;
+            {
+                auto risky = superbubble::getRiskyWeakSuperbubbles();
+                riskyPairs.reserve(risky.size());
+                for (const auto &p : risky)
+                {
+                    uint32_t s = p.first.index();
+                    uint32_t t = p.second.index();
+                    if (s < directed_node_count && t < directed_node_count)
+                        riskyPairs.emplace_back(s, t);
+                }
+                std::sort(riskyPairs.begin(), riskyPairs.end());
+                riskyPairs.erase(std::unique(riskyPairs.begin(), riskyPairs.end()),
+                                 riskyPairs.end());
+            }
+
+            bool validationBuilt = false;
+            std::vector<uint64_t> outOff, inOff;
+            std::vector<uint32_t> outTo, inFrom;
+            struct ValidationScratch
+            {
+                std::vector<uint8_t> fwd;
+                std::vector<uint8_t> canReachT;
+                std::vector<int> indeg;
+                std::vector<uint32_t> q;
+                std::vector<uint32_t> seenF;
+                std::vector<uint32_t> seenB;
+                std::vector<uint32_t> region;
+
+                void ensure(uint32_t n)
+                {
+                    if (fwd.size() != n)
+                    {
+                        fwd.assign(n, 0);
+                        canReachT.assign(n, 0);
+                        indeg.assign(n, 0);
+                    }
+                }
+            };
+            ValidationScratch validationScratch;
+
+            auto ensureValidationIndex = [&]() {
+                if (validationBuilt)
+                    return;
+                const size_t nDir = static_cast<size_t>(directed_node_count);
+                outOff.assign(nDir + 1, 0);
+                inOff.assign(nDir + 1, 0);
+                if (materializeDirectedEdges) {
+                    for (const auto &e : directed_edges)
+                    {
+                        outOff[static_cast<size_t>(e.first) + 1]++;
+                        inOff[static_cast<size_t>(e.second) + 1]++;
+                    }
+                } else {
+                    forEachGlobalDirectedEdge([&](uint32_t s, uint32_t t) {
+                        outOff[static_cast<size_t>(s) + 1]++;
+                        inOff[static_cast<size_t>(t) + 1]++;
+                    });
+                }
+                for (uint32_t i = 1; i <= directed_node_count; ++i)
+                {
+                    outOff[i] += outOff[i - 1];
+                    inOff[i] += inOff[i - 1];
+                }
+
+                outTo.resize(edge_total);
+                inFrom.resize(edge_total);
+                std::vector<uint64_t> outCursor = outOff;
+                std::vector<uint64_t> inCursor = inOff;
+                if (materializeDirectedEdges) {
+                    for (const auto &e : directed_edges)
+                    {
+                        outTo[outCursor[e.first]++] = e.second;
+                        inFrom[inCursor[e.second]++] = e.first;
+                    }
+                } else {
+                    forEachGlobalDirectedEdge([&](uint32_t s, uint32_t t) {
+                        outTo[outCursor[s]++] = t;
+                        inFrom[inCursor[t]++] = s;
+                    });
+                }
+
+		                validationBuilt = true;
+		            };
+	            auto hasDirectValidationEdge = [&](uint32_t s, uint32_t t) {
+	                for (uint64_t ei = outOff[s]; ei < outOff[s + 1]; ++ei)
+	                    if (outTo[ei] == t)
+	                        return true;
+	                return false;
+	            };
+
+	            auto rejectsClosedCyclicRegion = [&](uint32_t s,
+	                                                 uint32_t t,
+	                                                 ValidationScratch &scratch) -> bool {
+	                if (s >= directed_node_count || t >= directed_node_count)
+	                    return false;
+	                ensureValidationIndex();
+	                if (hasDirectValidationEdge(t, s))
+	                    return false;
+	                scratch.ensure(directed_node_count);
+
+                auto &fwd = scratch.fwd;
+                auto &canReachT = scratch.canReachT;
+                auto &indeg = scratch.indeg;
+                auto &q = scratch.q;
+                auto &seenF = scratch.seenF;
+                auto &seenB = scratch.seenB;
+                auto &region = scratch.region;
+
+                seenF.clear();
+                seenB.clear();
+                region.clear();
+                q.clear();
+
+                fwd[s] = 1;
+                q.push_back(s);
+                seenF.push_back(s);
+                for (size_t qi = 0; qi < q.size(); ++qi)
+                {
+                    uint32_t u = q[qi];
+                    if (u == t)
+                        continue;
+                    for (uint64_t ei = outOff[u]; ei < outOff[u + 1]; ++ei)
+                    {
+                        uint32_t v = outTo[ei];
+                        if (!fwd[v])
+                        {
+                            fwd[v] = 1;
+                            q.push_back(v);
+                            seenF.push_back(v);
+                        }
+                    }
+                }
+
+                q.clear();
+                canReachT[t] = 1;
+                q.push_back(t);
+                seenB.push_back(t);
+                for (size_t qi = 0; qi < q.size(); ++qi)
+                {
+                    uint32_t u = q[qi];
+                    if (u == s)
+                        continue;
+                    for (uint64_t ei = inOff[u]; ei < inOff[u + 1]; ++ei)
+                    {
+                        uint32_t v = inFrom[ei];
+                        if (!canReachT[v])
+                        {
+                            canReachT[v] = 1;
+                            q.push_back(v);
+                            seenB.push_back(v);
+                        }
+                    }
+                }
+
+                for (uint32_t u : seenF)
+                {
+                    if (canReachT[u])
+                        region.push_back(u);
+                }
+
+	                uint64_t badOut = 0, badIn = 0, weakBackEdges = 0;
+	                bool decided = false;
+	                bool reject = false;
+	                for (uint32_t u : region)
+	                {
+	                    for (uint64_t ei = outOff[u]; ei < outOff[u + 1]; ++ei)
+	                    {
+	                        uint32_t v = outTo[ei];
+	                        if (u == t && v == s)
+	                            weakBackEdges++;
+	                        if (!(fwd[v] && canReachT[v]) && u != t)
+	                            badOut++;
+	                        if (badOut != 0 || weakBackEdges != 0)
+	                        {
+	                            decided = true;
+	                            reject = false;
+	                            break;
+	                        }
+	                    }
+	                    if (decided)
+	                        break;
+	                    for (uint64_t ei = inOff[u]; ei < inOff[u + 1]; ++ei)
+	                    {
+	                        uint32_t v = inFrom[ei];
+	                        if (!(fwd[v] && canReachT[v]) && u != s)
+	                            badIn++;
+	                        if (badIn != 0)
+	                        {
+	                            decided = true;
+	                            reject = false;
+	                            break;
+	                        }
+	                    }
+	                    if (decided)
+	                        break;
+	                }
+
+	                if (!decided)
+	                {
+	                    for (uint32_t u : region)
+	                        indeg[u] = 0;
+	                    for (uint32_t u : region)
+	                    {
+	                        for (uint64_t ei = outOff[u]; ei < outOff[u + 1]; ++ei)
+	                        {
+	                            uint32_t v = outTo[ei];
+	                            if (!(fwd[v] && canReachT[v]))
+	                                continue;
+	                            if (u == t && v == s)
+	                                continue;
+	                            indeg[v]++;
+	                        }
+	                    }
+
+	                    q.clear();
+	                    for (uint32_t u : region)
+	                    {
+	                        if (indeg[u] == 0)
+	                            q.push_back(u);
+	                    }
+	                    uint64_t seenTopo = 0;
+	                    for (size_t qi = 0; qi < q.size(); ++qi)
+	                    {
+	                        uint32_t u = q[qi];
+	                        seenTopo++;
+	                        for (uint64_t ei = outOff[u]; ei < outOff[u + 1]; ++ei)
+	                        {
+	                            uint32_t v = outTo[ei];
+	                            if (!(fwd[v] && canReachT[v]))
+	                                continue;
+	                            if (u == t && v == s)
+	                                continue;
+	                            if (--indeg[v] == 0)
+	                                q.push_back(v);
+	                        }
+	                    }
+
+	                    reject = (badOut == 0 && badIn == 0 &&
+	                              weakBackEdges == 0 && seenTopo != region.size());
+	                }
+
+	                for (uint32_t u : seenF)
+	                    fwd[u] = 0;
+	                for (uint32_t u : seenB)
+	                    canReachT[u] = 0;
+	                if (!decided)
+	                    for (uint32_t u : region)
+	                        indeg[u] = 0;
+
+                return reject;
+            };
+
+	            const bool checkRiskyRegions = !riskyPairs.empty();
+	            auto packRaw = [&](uint32_t x, uint32_t y) {
+	                const bool xplus = (plus_dir[x] == 1);
+	                const bool yplus = (plus_dir[y] != 1);
+	                uint32_t a = (x << 1) | (xplus ? 1u : 0u);
+	                uint32_t b = (y << 1) | (yplus ? 1u : 0u);
+	                uint32_t ar = a >> 1;
+	                uint32_t br = b >> 1;
+	                PackedInc p1 = (ar <= br) ? PackedInc{a, b} : PackedInc{b, a};
+	                PackedInc p2 = (ar <= br) ? PackedInc{a ^ 1u, b ^ 1u} : PackedInc{b ^ 1u, a ^ 1u};
+	                return (p2.first < p1.first ||
+	                        (p2.first == p1.first && p2.second < p1.second)) ? p2 : p1;
+	            };
+	            std::vector<PackedInc> rejectedRiskyPacked;
+	            if (checkRiskyRegions)
+	            {
+	                const int riskyThreadCap = (directed_node_count >= 10000000u) ? 2 : 4;
+	                const int riskyThreads =
+		                    (C.threads > 1 && riskyPairs.size() >= 1024)
+	                        ? std::min({static_cast<int>(C.threads),
+	                                    riskyThreadCap,
+	                                    static_cast<int>((riskyPairs.size() + 1023) / 1024)})
+	                        : 1;
+	                if (riskyThreads <= 1)
+	                {
+	                    for (const auto &p : riskyPairs)
+	                    {
+	                        if (rejectsClosedCyclicRegion(p.first, p.second, validationScratch))
+	                        {
+	                            PackedInc packed = packRaw(p.first, p.second);
+	                            rejectedRiskyPacked.push_back(packed);
+	                        }
+	                    }
+	                }
+	                else
+	                {
+	                    ensureValidationIndex();
+	                    std::atomic<size_t> nextRisky{0};
+	                    std::vector<std::vector<PackedInc>> rejectedByThread(riskyThreads);
+	                    std::vector<std::thread> riskyWorkers;
+	                    riskyWorkers.reserve(riskyThreads);
+	                    for (int tid = 0; tid < riskyThreads; ++tid)
+	                    {
+	                        riskyWorkers.emplace_back([&, tid]() {
+	                            ValidationScratch localScratch;
+	                            auto &localRejected = rejectedByThread[tid];
+	                            while (true)
+	                            {
+	                                const size_t i = nextRisky.fetch_add(1, std::memory_order_relaxed);
+	                                if (i >= riskyPairs.size())
+	                                    break;
+	                                const auto &p = riskyPairs[i];
+	                                if (rejectsClosedCyclicRegion(p.first, p.second, localScratch))
+	                                    localRejected.push_back(packRaw(p.first, p.second));
+	                            }
+	                        });
+	                    }
+	                    for (auto &th : riskyWorkers)
+	                        th.join();
+	                    size_t rejectedTotal = 0;
+	                    for (const auto &local : rejectedByThread)
+	                        rejectedTotal += local.size();
+	                    rejectedRiskyPacked.reserve(rejectedTotal);
+	                    for (auto &local : rejectedByThread)
+	                        rejectedRiskyPacked.insert(rejectedRiskyPacked.end(),
+	                                                   std::make_move_iterator(local.begin()),
+	                                                   std::make_move_iterator(local.end()));
+	                }
+	                std::sort(rejectedRiskyPacked.begin(), rejectedRiskyPacked.end());
+	                rejectedRiskyPacked.erase(std::unique(rejectedRiskyPacked.begin(), rejectedRiskyPacked.end()),
+	                                          rejectedRiskyPacked.end());
+	            }
+            auto packOne = [&](const std::pair<spqr_compat::node, spqr_compat::node> &sb,
+                               std::vector<PackedInc> &out) {
                 uint32_t x = sb.first.index();
                 uint32_t y = sb.second.index();
-                if (x >= N || y >= N) continue;
-                if (names[x] == "_trash" || names[y] == "_trash") continue;
+                if (x >= N || y >= N) return;
+                if (x < C.isTrashNodeByIndex.size() && C.isTrashNodeByIndex[x]) return;
+                if (y < C.isTrashNodeByIndex.size() && C.isTrashNodeByIndex[y]) return;
                 if (!C.includeTrivial &&
                     x < odeg.size() &&
                     odeg[x] == 1 &&
-                    std::binary_search(directed_edges.begin(), directed_edges.end(), std::make_pair(x, y))) {
-                    continue;
+                    x < sole_out.size() &&
+                    sole_out[x] == y) {
+                    return;
                 }
-                const bool xplus = (plus_dir[x] == 1);
-                const bool yplus = (plus_dir[y] != 1);
-                add_packed_raw(C.ultrabubbleIncPacked,
-                               (x << 1) | (xplus ? 1u : 0u),
-                               (y << 1) | (yplus ? 1u : 0u));
+		                out.emplace_back(packRaw(x, y));
+	            };
+
+	            C.ultrabubbleIncPacked.clear();
+	            const size_t nSuperbubbles = C.superbubbles.size();
+	            int packThreads = (C.threads > 1 && nSuperbubbles >= 100000)
+	                ? std::min<int>(C.threads, static_cast<int>((nSuperbubbles + 99999) / 100000))
+	                : 1;
+	            if (packThreads <= 1) {
+	                C.ultrabubbleIncPacked.reserve(nSuperbubbles);
+	                for (const auto &sb : C.superbubbles)
+	                    packOne(sb, C.ultrabubbleIncPacked);
+	            } else {
+                std::vector<std::vector<PackedInc>> packedByThread(packThreads);
+                std::vector<std::thread> packWorkers;
+                packWorkers.reserve(packThreads);
+                for (int tid = 0; tid < packThreads; ++tid) {
+                    const size_t begin = (nSuperbubbles * static_cast<size_t>(tid)) / packThreads;
+                    const size_t end = (nSuperbubbles * static_cast<size_t>(tid + 1)) / packThreads;
+                    packWorkers.emplace_back([&, tid, begin, end]() {
+                        auto &local = packedByThread[tid];
+                        local.reserve(end - begin);
+                        for (size_t i = begin; i < end; ++i)
+                            packOne(C.superbubbles[i], local);
+                    });
+                }
+                for (auto &th : packWorkers)
+                    th.join();
+                size_t packedTotal = 0;
+                for (const auto &local : packedByThread)
+                    packedTotal += local.size();
+                C.ultrabubbleIncPacked.reserve(packedTotal);
+                for (auto &local : packedByThread) {
+                    C.ultrabubbleIncPacked.insert(C.ultrabubbleIncPacked.end(),
+                                                  std::make_move_iterator(local.begin()),
+                                                  std::make_move_iterator(local.end()));
+                }
             }
 
             std::sort(C.ultrabubbleIncPacked.begin(), C.ultrabubbleIncPacked.end());
             C.ultrabubbleIncPacked.erase(
                 std::unique(C.ultrabubbleIncPacked.begin(), C.ultrabubbleIncPacked.end()),
                 C.ultrabubbleIncPacked.end());
+            if (!rejectedRiskyPacked.empty())
+            {
+                size_t write = 0;
+                size_t rejectedIdx = 0;
+                for (size_t i = 0; i < C.ultrabubbleIncPacked.size(); ++i)
+                {
+                    const PackedInc &p = C.ultrabubbleIncPacked[i];
+                    while (rejectedIdx < rejectedRiskyPacked.size() &&
+                           rejectedRiskyPacked[rejectedIdx] < p)
+                    {
+                        rejectedIdx++;
+                    }
+                    if (rejectedIdx < rejectedRiskyPacked.size() &&
+                        rejectedRiskyPacked[rejectedIdx] == p)
+                    {
+                        continue;
+                    }
+                    C.ultrabubbleIncPacked[write++] = p;
+                }
+                C.ultrabubbleIncPacked.resize(write);
+            }
 
             std::cout << "ULTRABUBBLES found: "
                       << C.ultrabubbleIncPacked.size()
@@ -15944,38 +20424,40 @@ int main(int argc, char **argv)
         perror("setrlimit");
     }
 
-    TIME_BLOCK("Starting graph reading...");
-    logger::init();
-
-    readArgs(argc, argv);
-
     {
-        std::string err;
+        TIME_BLOCK("Starting graph reading...");
+        logger::init();
 
-        if (!inputFileReadable(ctx().graphPath, err))
-        {
-            std::cerr << "Error: cannot open input graph file '"
-                      << ctx().graphPath << "' for reading: "
-                      << err << "\n";
-            return 1;
-        }
+        readArgs(argc, argv);
 
-        if (!outputParentDirWritable(ctx().outputPath, err))
         {
-            std::cerr << "Error: cannot write output file '"
-                      << ctx().outputPath << "': "
-                      << err << "\n";
-            return 1;
-        }
+            std::string err;
 
-        if (ctx().clsdTrees)
-        {
-            if (!outputParentDirWritable(ctx().clsdTreesPath, err))
+            if (!inputFileReadable(ctx().graphPath, err))
             {
-                std::cerr << "Error: cannot write CLSD trees file '"
-                          << ctx().clsdTreesPath << "': "
+                std::cerr << "Error: cannot open input graph file '"
+                          << ctx().graphPath << "' for reading: "
                           << err << "\n";
                 return 1;
+            }
+
+            if (!outputParentDirWritable(ctx().outputPath, err))
+            {
+                std::cerr << "Error: cannot write output file '"
+                          << ctx().outputPath << "': "
+                          << err << "\n";
+                return 1;
+            }
+
+            if (ctx().clsdTrees)
+            {
+                if (!outputParentDirWritable(ctx().clsdTreesPath, err))
+                {
+                    std::cerr << "Error: cannot write CLSD trees file '"
+                              << ctx().clsdTreesPath << "': "
+                              << err << "\n";
+                    return 1;
+                }
             }
         }
     }
@@ -15986,38 +20468,40 @@ int main(int argc, char **argv)
         ::GraphIO::readGraph();
     }
 
-    if (ctx().bubbleType == Context::BubbleType::SUPERBUBBLE)
     {
-        solver::superbubble::solve();
-        VLOG << "[main] Superbubble solve finished. Superbubbles: "
-             << ctx().superbubbles.size() << std::endl;
-    }
-    else if (ctx().bubbleType == Context::BubbleType::SNARL)
-    {
-        solver::snarls::solve();
-        VLOG << "[main] Snarl solve finished. Snarls: "
-             << ctx().snarls.size() << std::endl;
-    }
-    else if (ctx().bubbleType == Context::BubbleType::ULTRABUBBLE)
-    {
-        if (ctx().doubledUltrabubbles)
+        if (ctx().bubbleType == Context::BubbleType::SUPERBUBBLE)
         {
-            solver::ultrabubble_doubled::solve();
-            ctx().bubbleType = Context::BubbleType::SUPERBUBBLE;
+            solver::superbubble::solve();
+            VLOG << "[main] Superbubble solve finished. Superbubbles: "
+                 << ctx().superbubbles.size() << std::endl;
         }
-        else if (ctx().spqrWeakUltrabubbles)
+        else if (ctx().bubbleType == Context::BubbleType::SNARL)
         {
-            solver::ultrabubble_spqr::solve();
+            solver::snarls::solve();
+            VLOG << "[main] Snarl solve finished. Snarls: "
+                 << ctx().snarls.size() << std::endl;
         }
-        else
+        else if (ctx().bubbleType == Context::BubbleType::ULTRABUBBLE)
         {
-            solver::ultrabubble::solve();
+            if (ctx().doubledUltrabubbles)
+            {
+                solver::ultrabubble_doubled::solve();
+                ctx().bubbleType = Context::BubbleType::SUPERBUBBLE;
+            }
+            else if (ctx().spqrWeakUltrabubbles)
+            {
+                solver::ultrabubble_spqr::solve();
+            }
+            else
+            {
+                solver::ultrabubble::solve();
+            }
         }
-    }
-    else if (ctx().bubbleType == Context::BubbleType::SPQR_TREE_ONLY)
-    {
-        solver::snarls::output_spqr_tree_only();
-        VLOG << "[main] SPQR tree solve finished." << std::endl;
+        else if (ctx().bubbleType == Context::BubbleType::SPQR_TREE_ONLY)
+        {
+            solver::snarls::output_spqr_tree_only();
+            VLOG << "[main] SPQR tree solve finished." << std::endl;
+        }
     }
 
     {
@@ -16040,15 +20524,17 @@ int main(int argc, char **argv)
                   << std::endl;
     }
 
-    PROFILING_REPORT();
+    {
+        PROFILING_REPORT();
 
     logger::info("Process PeakRSS: {:.2f} GiB",
                  memtime::peakRSSBytes() / (1024.0 * 1024.0 * 1024.0));
 
-    mark::report();
-    if (!g_report_json_path.empty())
-    {
-        mark::report_to_json(g_report_json_path);
+        mark::report();
+        if (!g_report_json_path.empty())
+        {
+            mark::report_to_json(g_report_json_path);
+        }
     }
 
     return 0;

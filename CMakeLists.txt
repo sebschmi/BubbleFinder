@@ -277,6 +277,7 @@ add_custom_command(
     COMMAND ${CARGO} build --release --manifest-path ${SPQR_RUST_DIR}/Cargo.toml
     WORKING_DIRECTORY ${SPQR_RUST_DIR}
     DEPENDS ${SPQR_RUST_DIR}/Cargo.toml
+            ${SPQR_RUST_DIR}/Cargo.lock
             ${SPQR_RUST_DIR}/src/lib.rs
             ${SPQR_RUST_DIR}/src/biconnected.rs
             ${SPQR_RUST_DIR}/src/connected.rs
@@ -286,6 +287,7 @@ add_custom_command(
             ${SPQR_RUST_DIR}/src/sp_compress/mod.rs
             ${SPQR_RUST_DIR}/src/sp_compress/adj.rs
             ${SPQR_RUST_DIR}/src/sp_compress/arena.rs
+            ${SPQR_RUST_DIR}/src/sp_compress/direct.rs
             ${SPQR_RUST_DIR}/src/sp_compress/ffi.rs
             ${SPQR_RUST_DIR}/src/sp_compress/integration.rs
             ${SPQR_RUST_DIR}/src/sp_compress/iso.rs
