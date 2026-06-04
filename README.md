@@ -58,6 +58,7 @@ Download the latest release:
 https://github.com/algbio/BubbleFinder/releases/latest
 
 ```bash
+./BubbleFinder --version
 ./BubbleFinder --help
 ./BubbleFinder snarls -g example/tiny1.gfa -o tiny1.snarls
 ```

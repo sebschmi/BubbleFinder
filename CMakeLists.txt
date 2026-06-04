@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(sbSPQRnew LANGUAGES CXX C VERSION 1.0)
+project(sbSPQRnew LANGUAGES CXX C VERSION 1.0.5)
 
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -305,6 +305,7 @@ target_link_libraries(BubbleFinder PRIVATE
     sbio sbutil
     ${SPQR_RUST_LIB}
     spdlog::spdlog_header_only)
+target_compile_definitions(BubbleFinder PRIVATE BUBBLEFINDER_VERSION="${PROJECT_VERSION}")
 
 # Link OpenMP if available; the snarls solver uses #pragma omp for intra-block
 # parallelism (taskloops). When OpenMP is not found, the pragmas degrade to

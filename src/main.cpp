@@ -213,6 +213,15 @@ using namespace spqr_compat;
 
 static std::string g_report_json_path;
 
+#ifndef BUBBLEFINDER_VERSION
+#define BUBBLEFINDER_VERSION "unknown"
+#endif
+
+static void printVersion()
+{
+    std::cout << "BubbleFinder " << BUBBLEFINDER_VERSION << "\n";
+}
+
 
 static void usage(const char *prog, int exitCode)
 {
@@ -276,6 +285,7 @@ static void usage(const char *prog, int exitCode)
           "Run SPQR root canonicalization even for snarls" },
 
         { "--report-json", "<file>", "Write JSON metrics report" },
+        { "--version", nullptr,       "Show version and exit" },
         { "-m", "<bytes>",           "Stack size in bytes" },
         { "-h, --help", nullptr,     "Show this help message and exit" }
     };
@@ -489,6 +499,12 @@ void readArgs(int argc, char **argv)
     auto &C = ctx();
 
     std::vector<std::string> args(argv, argv + argc);
+    if (args.size() == 2 && args[1] == "--version")
+    {
+        printVersion();
+        std::exit(0);
+    }
+
     if (args.size() < 2)
     {
         usage(args[0].c_str(), 1);
