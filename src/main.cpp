@@ -18180,6 +18180,7 @@ namespace solver
 
         void output_spqr_tree_only()
         {
+            const bool EXTRA_DEBUG_OUTPUT = true;
             std::cerr << "[spqr-tree] Writing SPQR-tree representation of the graph\n";
 
             auto &C = ctx();
@@ -18306,6 +18307,9 @@ namespace solver
                 ccNodes[component[v]].push_back(v);
             }
             
+            // Track which edges were output already to avoid duplicating self-loops
+            std::unordered_set<spqr_compat::edge> edges_output;
+
             const int kBlockProgressStep = 256;
             const int kLogEachBlockIfLeq = 50;
             const int kLargeBlockNodes = 200000; 
@@ -18340,12 +18344,23 @@ namespace solver
 
                 for (spqr_compat::node vOrig : ccNodes[ccIdx])
                 {
-                    C.G.forEachAdj(vOrig, [&](node /*neighbor*/, edge e) {
+                    edges_output.clear();
+                    C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
                         if (C.G.source(e) != vOrig) // Only process from source side
                             return;
 
                         spqr_compat::node src = C.G.source(e);
                         spqr_compat::node tgt = C.G.target(e);
+                        
+                        // Self-loops cannot be deduplicated by the above condition about the source side.
+                        // Hence, we deduplicate them by counting.
+                        if (src == tgt) {
+                            if (edges_output.count(e)) {
+                                return;
+                            } else {
+                                edges_output.insert(e);
+                            }
+                        }
 
                         spqr_compat::node srcCc = origToCc[src];
                         spqr_compat::node tgtCc = origToCc[tgt];
@@ -18391,6 +18406,10 @@ namespace solver
                 int stampCc = 1;
                 std::vector<spqr_compat::node> tmpNodes;
                 tmpNodes.reserve(1024);
+
+                // We use this to track which self-loops have been output.
+                // We want to output each self-loop exactly once, assigned to an arbitrary block or SPQR node.
+                edges_output.clear();
 
                 for (spqr_compat::node bNode : bc.bcTree().nodes)
                 {
@@ -18530,6 +18549,30 @@ namespace solver
                             std::string eName = makeId("E", edgeCtr++);
                             writeE(eName, blockName, C.node2name[uOrig], C.node2name[vOrig]);
                         }
+
+                        // The BC tree contains no self-loops, hence we need to output self-loops manually.
+                        for (spqr_compat::node vCc : tmpNodes) {
+                            spqr_compat::node vOrig = ccToOrig[vCc];
+                            
+                            C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
+                                spqr_compat::node src = C.G.source(e);
+                                spqr_compat::node tgt = C.G.target(e);
+                                if (src != tgt) // Only process self loops
+                                    return;
+
+                                // Self-loops are yielded twice by the iterator and may occur in multiple blocks and SPQR nodes,
+                                // hence we need to deduplicate them manually.
+                                if (edges_output.count(e)) {
+                                    return;
+                                } else {
+                                    edges_output.insert(e);
+                                }
+
+                                std::string eName = makeId("E", edgeCtr++);
+                                writeE(eName, blockName, C.node2name[vOrig], C.node2name[vOrig]);
+                            });
+                        }
+
                         continue;
                     }
 
@@ -18730,6 +18773,31 @@ namespace solver
                                     spqrNodeNames[treeNode],
                                     C.node2name[uOrig],
                                     C.node2name[vOrig]);
+                            }
+
+                            // The SPQR tree contains no self-loops, hence we need to output self-loops manually.
+                            for (spqr_compat::node skelNode : skel.getGraph().nodes) {
+                                spqr_compat::node vB = skel.original(skelNode);
+                                spqr_compat::node vCc = blockToCC[vB];
+                                spqr_compat::node vOrig = ccToOrig[vCc];
+
+                                C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
+                                    spqr_compat::node src = C.G.source(e);
+                                    spqr_compat::node tgt = C.G.target(e);
+                                    if (src != tgt) // Only process self loops
+                                        return;
+
+                                    // Self-loops are yielded twice by the iterator and may occur in multiple blocks and SPQR nodes,
+                                    // hence we need to deduplicate them manually.
+                                    if (edges_output.count(e)) {
+                                        return;
+                                    } else {
+                                        edges_output.insert(e);
+                                    }
+
+                                    std::string eName = makeId("E", edgeCtr++);
+                                    writeE(eName, spqrNodeNames[treeNode], C.node2name[vOrig], C.node2name[vOrig]);
+                                });
                             }
                         }
 
