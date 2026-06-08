@@ -18180,7 +18180,6 @@ namespace solver
 
         void output_spqr_tree_only()
         {
-            const bool EXTRA_DEBUG_OUTPUT = true;
             std::cerr << "[spqr-tree] Writing SPQR-tree representation of the graph\n";
 
             auto &C = ctx();
