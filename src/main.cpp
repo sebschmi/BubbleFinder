@@ -18307,7 +18307,7 @@ namespace solver
             }
             
             // Track which edges were output already to avoid duplicating self-loops
-            std::unordered_set<spqr_compat::edge> edges_output;
+            std::unordered_set<spqr_compat::edge> self_loops_output;
 
             const int kBlockProgressStep = 256;
             const int kLogEachBlockIfLeq = 50;
@@ -18343,8 +18343,8 @@ namespace solver
 
                 for (spqr_compat::node vOrig : ccNodes[ccIdx])
                 {
-                    edges_output.clear();
-                    C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
+                    self_loops_output.clear();
+                    C.G.forEachAdj(vOrig, [&](node /*neighbor*/, edge e) {
                         if (C.G.source(e) != vOrig) // Only process from source side
                             return;
 
@@ -18352,12 +18352,12 @@ namespace solver
                         spqr_compat::node tgt = C.G.target(e);
                         
                         // Self-loops cannot be deduplicated by the above condition about the source side.
-                        // Hence, we deduplicate them by counting.
+                        // Hence, we deduplicate them via a set.
                         if (src == tgt) {
-                            if (edges_output.count(e)) {
+                            if (self_loops_output.count(e)) {
                                 return;
                             } else {
-                                edges_output.insert(e);
+                                self_loops_output.insert(e);
                             }
                         }
 
@@ -18408,7 +18408,7 @@ namespace solver
 
                 // We use this to track which self-loops have been output.
                 // We want to output each self-loop exactly once, assigned to an arbitrary block or SPQR node.
-                edges_output.clear();
+                self_loops_output.clear();
 
                 for (spqr_compat::node bNode : bc.bcTree().nodes)
                 {
@@ -18553,7 +18553,7 @@ namespace solver
                         for (spqr_compat::node vCc : tmpNodes) {
                             spqr_compat::node vOrig = ccToOrig[vCc];
                             
-                            C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
+                            C.G.forEachAdj(vOrig, [&](node /*neighbor*/, edge e) {
                                 spqr_compat::node src = C.G.source(e);
                                 spqr_compat::node tgt = C.G.target(e);
                                 if (src != tgt) // Only process self loops
@@ -18561,10 +18561,10 @@ namespace solver
 
                                 // Self-loops are yielded twice by the iterator and may occur in multiple blocks and SPQR nodes,
                                 // hence we need to deduplicate them manually.
-                                if (edges_output.count(e)) {
+                                if (self_loops_output.count(e)) {
                                     return;
                                 } else {
-                                    edges_output.insert(e);
+                                    self_loops_output.insert(e);
                                 }
 
                                 std::string eName = makeId("E", edgeCtr++);
@@ -18780,7 +18780,7 @@ namespace solver
                                 spqr_compat::node vCc = blockToCC[vB];
                                 spqr_compat::node vOrig = ccToOrig[vCc];
 
-                                C.G.forEachAdj(vOrig, [&](node neighbor, edge e) {
+                                C.G.forEachAdj(vOrig, [&](node /*neighbor*/, edge e) {
                                     spqr_compat::node src = C.G.source(e);
                                     spqr_compat::node tgt = C.G.target(e);
                                     if (src != tgt) // Only process self loops
@@ -18788,10 +18788,10 @@ namespace solver
 
                                     // Self-loops are yielded twice by the iterator and may occur in multiple blocks and SPQR nodes,
                                     // hence we need to deduplicate them manually.
-                                    if (edges_output.count(e)) {
+                                    if (self_loops_output.count(e)) {
                                         return;
                                     } else {
-                                        edges_output.insert(e);
+                                        self_loops_output.insert(e);
                                     }
 
                                     std::string eName = makeId("E", edgeCtr++);
